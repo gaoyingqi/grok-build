@@ -19,26 +19,75 @@ pub const SIDECAR_BIN: &str = env!("CARGO_BIN_EXE_efflab-agent-sidecar");
 
 /// 测试用的 BYOK 假 key（P3 链路不依赖真实模型调用；仅证明启动/握手不触网）。
 pub const FAKE_XAI_API_KEY: &str = "efflab-test-fake-key";
+/// 优雅终止 sidecar 的最长等待时间，超时后升级为强制杀死。
+const TERMINATE_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
-/// 受控环境：删除一切可能污染隔离的全局变量，注入 BYOK key。
+/// 返回经过显式白名单筛选的子进程环境。
+///
+/// 调用方必须先执行 `Command::env_clear()`；这里仅保留 sidecar 运行所需的平台
+/// 变量及假 BYOK key，绝不继承调用测试进程中未登记的父环境。
 pub fn isolated_env() -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> = Vec::new();
-    for key in [
-        "GROK_HOME",
-        "GROK_AGENT",
-        "EFFLAB_GROK_HOME",
-        "GROK_STORAGE_MODE",
-        "GROK_SUBAGENTS",
-        "GROK_MANAGED_MCPS_ENABLED",
-        "GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED",
-        "GROK_EXTERNAL_OTEL",
-        "XAI_API_KEY",
-        "GROK_CODE_XAI_API_KEY",
-    ] {
-        env.push((key.to_string(), String::new())); // 空串占位，spawn 时表示"删除"
+    let mut env = Vec::new();
+    for key in platform_environment_allowlist() {
+        if let Some(value) = std::env::var_os(key) {
+            env.push((key.to_string(), value.to_string_lossy().into_owned()));
+        }
     }
     env.push(("XAI_API_KEY".to_string(), FAKE_XAI_API_KEY.to_string()));
     env
+}
+
+/// 返回各平台 `env_clear` 后仍可能被动态链接器或运行时需要的变量白名单。
+fn platform_environment_allowlist() -> &'static [&'static str] {
+    #[cfg(target_os = "macos")]
+    {
+        &[
+            "PATH",
+            "HOME",
+            "TMPDIR",
+            "LANG",
+            "LC_ALL",
+            "DYLD_LIBRARY_PATH",
+        ]
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        &[
+            "PATH",
+            "HOME",
+            "TMPDIR",
+            "LANG",
+            "LC_ALL",
+            "LD_LIBRARY_PATH",
+        ]
+    }
+    #[cfg(windows)]
+    {
+        &[
+            "PATH",
+            "HOME",
+            "USERPROFILE",
+            "TMP",
+            "TEMP",
+            "SystemRoot",
+            "WINDIR",
+            "ComSpec",
+            "PATHEXT",
+        ]
+    }
+}
+
+/// 对命令应用全量清空后的隔离环境，额外变量最后覆盖基线。
+pub fn apply_isolated_env(cmd: &mut Command, extra_env: &[(String, String)]) {
+    cmd.env_clear();
+    cmd.envs(isolated_env());
+    for (name, value) in extra_env {
+        if value.is_empty() {
+            cmd.env_remove(name);
+        } else {
+            cmd.env(name, value);
+        }
+    }
 }
 
 /// 运行中的 sidecar 进程句柄。
@@ -46,8 +95,10 @@ pub struct SidecarProcess {
     child: Child,
     /// stderr 后台 drain 线程，防止管道写满阻塞子进程。
     _stderr_drain: Option<JoinHandle<()>>,
-    /// 供测试读取已 drain 的 stderr 文本。
+    /// drain 线程结束后一次性送达的 stderr 字节。
     stderr_rx: Receiver<Vec<u8>>,
+    /// 已获取的 stderr 文本缓存，使诊断可重复读取而不丢失首个结果。
+    stderr_cache: std::sync::Mutex<Option<String>>,
 }
 
 impl SidecarProcess {
@@ -68,21 +119,8 @@ impl SidecarProcess {
         for arg in extra_args {
             cmd.arg(arg);
         }
-        // 先清理全局污染变量，再应用额外 env。
-        for (name, value) in isolated_env() {
-            if value.is_empty() {
-                cmd.env_remove(&name);
-            } else {
-                cmd.env(name, value);
-            }
-        }
-        for (name, value) in extra_env {
-            if value.is_empty() {
-                cmd.env_remove(name);
-            } else {
-                cmd.env(name, value);
-            }
-        }
+        // 先完全清空父环境，再仅注入白名单和测试显式覆盖项。
+        apply_isolated_env(&mut cmd, extra_env);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -105,6 +143,7 @@ impl SidecarProcess {
             child,
             _stderr_drain: Some(handle),
             stderr_rx: rx,
+            stderr_cache: std::sync::Mutex::new(None),
         }
     }
 
@@ -123,6 +162,7 @@ impl SidecarProcess {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(status) = self.child.try_wait().expect("try_wait") {
+                self.join_stderr_drain();
                 return Some(status);
             }
             if Instant::now() >= deadline {
@@ -132,29 +172,87 @@ impl SidecarProcess {
         }
     }
 
-    /// 强制终止并回收（幂等）。
+    /// 先发送 SIGTERM，等待有限时间；未退出时升级 SIGKILL 并回收。
+    ///
+    /// 返回 `Some(status)` 表示已经回收；`None` 仅表示底层终止/回收异常，
+    /// 调用方仍可调用 [`Self::kill`] 进行最后兜底。
+    pub fn terminate(&mut self) -> Option<ExitStatus> {
+        if let Some(status) = self.child.try_wait().ok().flatten() {
+            self.join_stderr_drain();
+            return Some(status);
+        }
+
+        #[cfg(unix)]
+        {
+            // 本 crate 未直接依赖 libc/nix；使用 macOS/Unix 提供的 kill 工具请求 SIGTERM。
+            let signal_status = Command::new("/bin/kill")
+                .arg("-TERM")
+                .arg(self.child.id().to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            if !matches!(signal_status, Ok(status) if status.success()) {
+                if let Some(status) = self.child.try_wait().ok().flatten() {
+                    self.join_stderr_drain();
+                    return Some(status);
+                }
+                self.kill();
+                return None;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            self.kill();
+            return None;
+        }
+
+        if let Some(status) = self.wait_timeout(TERMINATE_GRACE_PERIOD) {
+            self.join_stderr_drain();
+            return Some(status);
+        }
+
+        self.kill();
+        self.child.try_wait().ok().flatten()
+    }
+
+    /// 强制终止并回收（幂等，作为 `terminate` 的升级兜底）。
     pub fn kill(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        self.join_stderr_drain();
+    }
+
+    /// 等待 stderr drain 线程结束并缓存输出，确保进程回收后诊断可重复读取。
+    fn join_stderr_drain(&mut self) {
         if let Some(handle) = self._stderr_drain.take() {
             let _ = handle.join();
         }
+        let mut cache = self.stderr_cache.lock().expect("stderr 缓存锁不应中毒");
+        if cache.is_none()
+            && let Ok(bytes) = self.stderr_rx.try_recv()
+        {
+            *cache = Some(String::from_utf8_lossy(&bytes).into_owned());
+        }
     }
 
-    /// 已 drain 的 stderr 内容（进程退出后完整可用）。
+    /// 已 drain 的 stderr 内容（进程退出后完整可用，可重复读取）。
     pub fn stderr_text(&self) -> String {
-        match self.stderr_rx.try_recv() {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            Err(_) => String::new(),
+        let mut cache = self.stderr_cache.lock().expect("stderr 缓存锁不应中毒");
+        if cache.is_none()
+            && let Ok(bytes) = self.stderr_rx.try_recv()
+        {
+            *cache = Some(String::from_utf8_lossy(&bytes).into_owned());
         }
+        cache.clone().unwrap_or_default()
     }
 }
 
 impl Drop for SidecarProcess {
-    /// 兜底：测试失败/panic 时也回收子进程，避免僵尸。
+    /// 兜底：测试失败/panic 时先请求优雅退出，再在有限时间后强制回收子进程。
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {
-            self.kill();
+            let _ = self.terminate();
         }
     }
 }

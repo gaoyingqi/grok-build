@@ -1,19 +1,246 @@
 [
-  { "name": "initialize ok", "method": "initialize", "params": { "protocolVersion": 1, "capabilities": { "terminal": false, "fs": false }, "client": { "mcpServers": [] }, "_meta": { "modelId": "grok-code-fast" } }, "expect": "allow" },
-  { "name": "initialize terminal capability", "method": "initialize", "params": { "capabilities": { "terminal": true, "fs": false } }, "expect": "reject" },
-  { "name": "initialize fs capability", "method": "initialize", "params": { "capabilities": { "terminal": false, "fs": true } }, "expect": "reject" },
-  { "name": "initialize client mcpServers", "method": "initialize", "params": { "client": { "mcpServers": [{ "name": "evil" }] } }, "expect": "reject" },
-  { "name": "initialize unknown meta key", "method": "initialize", "params": { "_meta": { "sneaky": 1 } }, "expect": "reject" },
-  { "name": "session/new ok", "method": "session/new", "params": { "cwd": "{{CWD}}", "mcpServers": [], "_meta": { "modelId": "grok-code-fast" } }, "expect": "allow" },
-  { "name": "session/new cwd mismatch", "method": "session/new", "params": { "cwd": "{{OTHER}}", "mcpServers": [] }, "expect": "reject" },
-  { "name": "session/new agentProfile", "method": "session/new", "params": { "cwd": "{{CWD}}", "agentProfile": { "name": "evil" } }, "expect": "reject" },
-  { "name": "session/new pluginDirs", "method": "session/new", "params": { "cwd": "{{CWD}}", "pluginDirs": ["/tmp/evil"] }, "expect": "reject" },
-  { "name": "session/new hooks", "method": "session/new", "params": { "cwd": "{{CWD}}", "x.ai/hooks": { "hooks": [] } }, "expect": "reject" },
-  { "name": "session/new yolo", "method": "session/new", "params": { "cwd": "{{CWD}}", "yoloMode": true }, "expect": "reject" },
-  { "name": "session/new mcpServers nonempty", "method": "session/new", "params": { "cwd": "{{CWD}}", "mcpServers": [{ "name": "evil" }] }, "expect": "reject" },
-  { "name": "session/load ok", "method": "session/load", "params": { "sessionId": "s1", "cwd": "{{CWD}}", "mcpServers": [] }, "expect": "allow" },
-  { "name": "session/load unknown meta", "method": "session/load", "params": { "sessionId": "s1", "cwd": "{{CWD}}", "_meta": { "sneaky": 1 } }, "expect": "reject" },
-  { "name": "x.ai/mcp/list ok", "method": "x.ai/mcp/list", "params": {}, "expect": "allow" },
-  { "name": "unknown method", "method": "session/steal", "params": {}, "expect": "reject" },
-  { "name": "modelId not allowed", "method": "session/new", "params": { "cwd": "{{CWD}}", "_meta": { "modelId": "grok-code-evil" } }, "expect": "reject" }
+  {
+    "name": "initialize ok",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "capabilities": { "terminal": false, "fs": false },
+      "client": { "mcpServers": [] },
+      "_meta": { "modelId": "grok-code-fast" }
+    },
+    "expect": "allow"
+  },
+  {
+    "name": "initialize terminal capability",
+    "method": "initialize",
+    "params": { "capabilities": { "terminal": true, "fs": false } },
+    "expect": "reject",
+    "rejection": "TerminalCapabilityEnabled"
+  },
+  {
+    "name": "initialize fs capability",
+    "method": "initialize",
+    "params": { "capabilities": { "terminal": false, "fs": true } },
+    "expect": "reject",
+    "rejection": "FsCapabilityEnabled"
+  },
+  {
+    "name": "initialize client mcpServers",
+    "method": "initialize",
+    "params": { "client": { "mcpServers": [{ "name": "evil" }] } },
+    "expect": "reject",
+    "rejection": "ClientMcpServersNotAllowed"
+  },
+  {
+    "name": "initialize unknown meta key",
+    "method": "initialize",
+    "params": { "_meta": { "sneaky": 1 } },
+    "expect": "reject",
+    "rejection": "UnknownMetaKey"
+  },
+  {
+    "name": "initialize unknown top-level field",
+    "method": "initialize",
+    "params": { "sneakyField": 1 },
+    "expect": "reject",
+    "rejection": "UnknownField"
+  },
+  {
+    "name": "initialize capabilities non-object",
+    "method": "initialize",
+    "params": { "capabilities": [] },
+    "expect": "reject",
+    "rejection": "InvalidFieldType"
+  },
+  {
+    "name": "initialize client non-object",
+    "method": "initialize",
+    "params": { "client": "invalid" },
+    "expect": "reject",
+    "rejection": "InvalidFieldType"
+  },
+  {
+    "name": "initialize terminal wrong type",
+    "method": "initialize",
+    "params": { "capabilities": { "terminal": "false" } },
+    "expect": "reject",
+    "rejection": "InvalidFieldType"
+  },
+  {
+    "name": "session/new ok",
+    "method": "session/new",
+    "params": {
+      "cwd": "{{CWD}}",
+      "mcpServers": [],
+      "_meta": { "modelId": "grok-code-fast" }
+    },
+    "expect": "allow"
+  },
+  {
+    "name": "session/new cwd mismatch",
+    "method": "session/new",
+    "params": { "cwd": "{{OTHER}}", "mcpServers": [] },
+    "expect": "reject",
+    "rejection": "CwdMismatch"
+  },
+  {
+    "name": "session/new missing cwd",
+    "method": "session/new",
+    "params": { "mcpServers": [] },
+    "expect": "reject",
+    "rejection": "CwdMismatch"
+  },
+  {
+    "name": "session/new agentProfile",
+    "method": "session/new",
+    "params": { "cwd": "{{CWD}}", "agentProfile": { "name": "evil" } },
+    "expect": "reject",
+    "rejection": "UnknownField"
+  },
+  {
+    "name": "session/new pluginDirs",
+    "method": "session/new",
+    "params": { "cwd": "{{CWD}}", "pluginDirs": ["/tmp/evil"] },
+    "expect": "reject",
+    "rejection": "UnknownField"
+  },
+  {
+    "name": "session/new hooks",
+    "method": "session/new",
+    "params": { "cwd": "{{CWD}}", "x.ai/hooks": { "hooks": [] } },
+    "expect": "reject",
+    "rejection": "UnknownField"
+  },
+  {
+    "name": "session/new yolo",
+    "method": "session/new",
+    "params": { "cwd": "{{CWD}}", "yoloMode": true },
+    "expect": "reject",
+    "rejection": "UnknownField"
+  },
+  {
+    "name": "session/new permissionMode",
+    "method": "session/new",
+    "params": { "cwd": "{{CWD}}", "permissionMode": "yolo" },
+    "expect": "reject",
+    "rejection": "UnknownField"
+  },
+  {
+    "name": "session/new capability",
+    "method": "session/new",
+    "params": { "cwd": "{{CWD}}", "capability": "terminal" },
+    "expect": "reject",
+    "rejection": "UnknownField"
+  },
+  {
+    "name": "session/new unknown top-level field",
+    "method": "session/new",
+    "params": { "cwd": "{{CWD}}", "sneakyField": 1 },
+    "expect": "reject",
+    "rejection": "UnknownField"
+  },
+  {
+    "name": "session/new mcpServers nonempty",
+    "method": "session/new",
+    "params": { "cwd": "{{CWD}}", "mcpServers": [{ "name": "evil" }] },
+    "expect": "reject",
+    "rejection": "ClientMcpServersNotAllowed"
+  },
+  {
+    "name": "session/new top-level modelId",
+    "method": "session/new",
+    "params": { "cwd": "{{CWD}}", "modelId": "grok-code-fast" },
+    "expect": "reject",
+    "rejection": "UnknownField"
+  },
+  {
+    "name": "session/new meta array",
+    "method": "session/new",
+    "params": { "cwd": "{{CWD}}", "_meta": [] },
+    "expect": "reject",
+    "rejection": "ForbiddenField"
+  },
+  {
+    "name": "session/load ok",
+    "method": "session/load",
+    "params": { "sessionId": "s1", "cwd": "{{CWD}}", "mcpServers": [] },
+    "expect": "allow"
+  },
+  {
+    "name": "session/load missing sessionId",
+    "method": "session/load",
+    "params": { "cwd": "{{CWD}}", "mcpServers": [] },
+    "expect": "reject",
+    "rejection": "MissingRequiredField"
+  },
+  {
+    "name": "session/load unknown top-level field",
+    "method": "session/load",
+    "params": { "sessionId": "s1", "cwd": "{{CWD}}", "sneakyField": 1 },
+    "expect": "reject",
+    "rejection": "UnknownField"
+  },
+  {
+    "name": "session/load mcpServers nonempty",
+    "method": "session/load",
+    "params": {
+      "sessionId": "s1",
+      "cwd": "{{CWD}}",
+      "mcpServers": [{ "name": "evil" }]
+    },
+    "expect": "reject",
+    "rejection": "ClientMcpServersNotAllowed"
+  },
+  {
+    "name": "session/load unknown meta",
+    "method": "session/load",
+    "params": {
+      "sessionId": "s1",
+      "cwd": "{{CWD}}",
+      "_meta": { "sneaky": 1 }
+    },
+    "expect": "reject",
+    "rejection": "UnknownMetaKey"
+  },
+  {
+    "name": "x.ai/mcp/list ok",
+    "method": "x.ai/mcp/list",
+    "params": {},
+    "expect": "allow"
+  },
+  {
+    "name": "x.ai/mcp/list unknown meta",
+    "method": "x.ai/mcp/list",
+    "params": { "_meta": { "sneaky": 1 } },
+    "expect": "reject",
+    "rejection": "UnknownMetaKey"
+  },
+  {
+    "name": "x.ai/mcp/list meta null",
+    "method": "x.ai/mcp/list",
+    "params": { "_meta": null },
+    "expect": "reject",
+    "rejection": "ForbiddenField"
+  },
+  {
+    "name": "x.ai/mcp/list top-level modelId",
+    "method": "x.ai/mcp/list",
+    "params": { "modelId": "grok-code-fast" },
+    "expect": "reject",
+    "rejection": "UnknownField"
+  },
+  {
+    "name": "unknown method",
+    "method": "session/steal",
+    "params": {},
+    "expect": "reject",
+    "rejection": "UnknownMethod"
+  },
+  {
+    "name": "modelId not allowed",
+    "method": "session/new",
+    "params": { "cwd": "{{CWD}}", "_meta": { "modelId": "grok-code-evil" } },
+    "expect": "reject",
+    "rejection": "ModelIdNotAllowed"
+  }
 ]

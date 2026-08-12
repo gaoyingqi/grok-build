@@ -183,47 +183,134 @@ async fn run(sidecar: SidecarConfig) -> anyhow::Result<()> {
     .await
 }
 
+/// 每项硬化断言的固定错误上下文；运行时与纯校验测试共用，避免二者漂移。
+const HARDENED_CHECK_MESSAGES: [&str; 7] = [
+    "resolve_remote_fetch_enabled() 必须为 false（私有 GROK_HOME config.toml 需含 [features] remote_fetch=false）",
+    "storage_mode 必须为 Local",
+    "subagents_enabled 必须为 false",
+    "managed_mcps.enabled / gateway_tools_enabled 必须为 false",
+    "memory_config 必须为 None",
+    "disable_web_search 必须为 true",
+    "agent_profile_path 必须指向物化 AgentDefinition",
+];
+
 /// 硬化断言（P1.4）：resolve 后逐项核对安全字段，任何一项失败即启动失败。
 fn assert_hardened(
     config: &xai_grok_shell::agent::config::Config,
     agent_def_path: &Path,
 ) -> anyhow::Result<()> {
+    assert_hardened_conditions(hardened_check_conditions(config, agent_def_path))
+}
+
+/// 从运行时配置计算七项已判定的硬化条件。
+///
+/// 将条件计算与失败传播分离，使测试可在不构造上游复杂 `Config` 的情况下，
+/// 逐项验证 fail-closed 错误边界。
+fn hardened_check_conditions(
+    config: &xai_grok_shell::agent::config::Config,
+    agent_def_path: &Path,
+) -> Vec<(&'static str, bool)> {
     use xai_grok_shell::config::StorageMode;
 
-    macro_rules! check {
-        ($cond:expr, $msg:expr) => {
-            if !$cond {
-                anyhow::bail!("硬化断言失败: {}", $msg);
-            }
-        };
+    vec![
+        // 1) remote_fetch 必须为 false（从磁盘 config layers 重读，无 env 覆盖）。
+        (
+            HARDENED_CHECK_MESSAGES[0],
+            !xai_grok_shell::util::config::resolve_remote_fetch_enabled(),
+        ),
+        // 2) storage_mode 必须为 Local（B3：仅经 RuntimeResolutionContext 注入）。
+        (
+            HARDENED_CHECK_MESSAGES[1],
+            config.storage_mode == StorageMode::Local,
+        ),
+        // 3) subagents 必须关闭。
+        (HARDENED_CHECK_MESSAGES[2], !config.subagents_enabled),
+        // 4) managed MCP 必须关闭（enabled 与 gateway_tools 均 false）。
+        (
+            HARDENED_CHECK_MESSAGES[3],
+            !config.managed_mcps.enabled && !config.managed_mcps.gateway_tools_enabled,
+        ),
+        // 5) memory 必须关闭（resolve 后 memory_config 为 None）。
+        (HARDENED_CHECK_MESSAGES[4], config.memory_config.is_none()),
+        // 6) web search 必须关闭。
+        (HARDENED_CHECK_MESSAGES[5], config.disable_web_search),
+        // 7) agent_profile_path 必须指向物化文件（B1 三处指向之一）。
+        (
+            HARDENED_CHECK_MESSAGES[6],
+            agent_profile_path_matches(config.agent_profile_path.as_deref(), agent_def_path),
+        ),
+    ]
+}
+
+/// 校验运行时 AgentDefinition 路径是否仍精确指向 sidecar 物化文件。
+fn agent_profile_path_matches(configured_path: Option<&Path>, agent_def_path: &Path) -> bool {
+    configured_path == Some(agent_def_path)
+}
+
+/// 对已经判定的硬化条件执行统一的 fail-closed 错误传播。
+fn assert_hardened_conditions(
+    conditions: impl IntoIterator<Item = (&'static str, bool)>,
+) -> anyhow::Result<()> {
+    for (message, condition) in conditions {
+        if !condition {
+            anyhow::bail!("硬化断言失败: {message}");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{HARDENED_CHECK_MESSAGES, agent_profile_path_matches, assert_hardened_conditions};
+
+    /// 逐项构造仅一个失败条件，验证每个断言均以原始上下文 fail-closed。
+    #[test]
+    fn each_hardening_condition_failure_is_propagated() {
+        for (failed_index, &expected_message) in HARDENED_CHECK_MESSAGES.iter().enumerate() {
+            let conditions = HARDENED_CHECK_MESSAGES
+                .iter()
+                .enumerate()
+                .map(|(index, &message)| (message, index != failed_index));
+
+            let error = assert_hardened_conditions(conditions)
+                .expect_err("任一硬化条件为 false 时必须拒绝启动");
+            assert_eq!(
+                error.to_string(),
+                format!("硬化断言失败: {expected_message}"),
+                "第 {} 项硬化断言应保留准确错误上下文",
+                failed_index + 1
+            );
+        }
     }
 
-    // 1) remote_fetch 必须为 false（从磁盘 config layers 重读，无 env 覆盖）。
-    check!(
-        !xai_grok_shell::util::config::resolve_remote_fetch_enabled(),
-        "resolve_remote_fetch_enabled() 必须为 false（私有 GROK_HOME config.toml 需含 [features] remote_fetch=false）"
-    );
-    // 2) storage_mode 必须为 Local（B3：仅经 RuntimeResolutionContext 注入）。
-    check!(
-        config.storage_mode == StorageMode::Local,
-        "storage_mode 必须为 Local"
-    );
-    // 3) subagents 必须关闭。
-    check!(!config.subagents_enabled, "subagents_enabled 必须为 false");
-    // 4) managed MCP 必须关闭（enabled 与 gateway_tools 均 false）。
-    check!(
-        !config.managed_mcps.enabled && !config.managed_mcps.gateway_tools_enabled,
-        "managed_mcps.enabled / gateway_tools_enabled 必须为 false"
-    );
-    // 5) memory 必须关闭（resolve 后 memory_config 为 None）。
-    check!(config.memory_config.is_none(), "memory_config 必须为 None");
-    // 6) web search 必须关闭。
-    check!(config.disable_web_search, "disable_web_search 必须为 true");
-    // 7) agent_profile_path 必须指向物化文件（B1 三处指向之一）。
-    check!(
-        config.agent_profile_path.as_deref() == Some(agent_def_path),
-        "agent_profile_path 必须指向物化 AgentDefinition"
-    );
+    /// 七项条件均满足时，纯错误传播边界必须允许继续运行。
+    #[test]
+    fn all_hardening_conditions_true_is_ok() {
+        let conditions = HARDENED_CHECK_MESSAGES
+            .iter()
+            .map(|&message| (message, true));
 
-    Ok(())
+        assert!(
+            assert_hardened_conditions(conditions).is_ok(),
+            "全部硬化条件为 true 时必须成功"
+        );
+    }
+
+    /// 物化路径被其他 AgentDefinition 替换时，路径条件必须失败并传播第七项错误。
+    #[test]
+    fn mismatched_agent_definition_path_is_rejected() {
+        let materialized = Path::new("/private/home/agents/efflab-default.md");
+        let unexpected = Path::new("/private/home/agents/other.md");
+        let condition = agent_profile_path_matches(Some(unexpected), materialized);
+
+        assert!(!condition, "不匹配的 AgentDefinition 路径必须判定为 false");
+        let error = assert_hardened_conditions([(HARDENED_CHECK_MESSAGES[6], condition)])
+            .expect_err("不匹配的 AgentDefinition 路径必须拒绝启动");
+        assert_eq!(
+            error.to_string(),
+            format!("硬化断言失败: {}", HARDENED_CHECK_MESSAGES[6])
+        );
+    }
 }

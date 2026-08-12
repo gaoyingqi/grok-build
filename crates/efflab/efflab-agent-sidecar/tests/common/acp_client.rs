@@ -6,7 +6,10 @@
 
 use std::io::Write;
 use std::process::ChildStdin;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{
+    Arc, Mutex,
+    mpsc::{self, Receiver, RecvTimeoutError},
+};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -42,6 +45,8 @@ impl std::error::Error for AcpError {}
 pub struct AcpClient {
     stdin: Option<ChildStdin>,
     rx: Receiver<Value>,
+    /// 所有非空 stdout 原始行（包含无法解析为 JSON 的污染内容）。
+    raw_lines: Arc<Mutex<Vec<String>>>,
     /// stdout 读线程句柄（join 兜底）。
     _reader: Option<JoinHandle<()>>,
     next_id: u64,
@@ -51,6 +56,8 @@ impl AcpClient {
     /// 从 sidecar 进程构造客户端；`stdout` 为已 take 的 ChildStdout。
     pub fn new(stdin: ChildStdin, stdout: std::process::ChildStdout) -> Self {
         let (tx, rx) = mpsc::channel();
+        let raw_lines = Arc::new(Mutex::new(Vec::new()));
+        let reader_raw_lines = Arc::clone(&raw_lines);
         let reader = std::thread::spawn(move || {
             use std::io::BufRead;
             let mut reader = std::io::BufReader::new(stdout);
@@ -61,8 +68,15 @@ impl AcpClient {
                     Ok(0) => break, // EOF
                     Ok(_) => {
                         let trimmed = line.trim();
-                        if !trimmed.is_empty()
-                            && let Ok(value) = serde_json::from_str::<Value>(trimmed)
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        // 无论该行能否解析为 JSON，均保留以供 stdout 纯净性断言。
+                        reader_raw_lines
+                            .lock()
+                            .expect("stdout 原始行锁不应中毒")
+                            .push(trimmed.to_string());
+                        if let Ok(value) = serde_json::from_str::<Value>(trimmed)
                             && tx.send(value).is_err()
                         {
                             break;
@@ -75,9 +89,18 @@ impl AcpClient {
         Self {
             stdin: Some(stdin),
             rx,
+            raw_lines,
             _reader: Some(reader),
             next_id: 1,
         }
+    }
+
+    /// 返回目前收到的全部非空 stdout 原始行，包含无法解析为 JSON 的行。
+    pub fn raw_lines(&self) -> Vec<String> {
+        self.raw_lines
+            .lock()
+            .expect("stdout 原始行锁不应中毒")
+            .clone()
     }
 
     /// 关闭 stdin（drop 句柄 → 管道关闭 → sidecar 读到 EOF 走正常关闭）。

@@ -2948,6 +2948,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "efflab-agent-sidecar"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dirs 5.0.1",
+ "dunce",
+ "fs2",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "xai-grok-agent",
+ "xai-grok-config-types",
+ "xai-grok-shell",
+ "xai-grok-tools",
+ "xai-tool-protocol",
+ "xai-tool-runtime",
+ "xai-tool-types",
+]
+
+[[package]]
 name = "ego-tree"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

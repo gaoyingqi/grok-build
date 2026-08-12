@@ -1,0 +1,38 @@
+# efflab-agent-sidecar：复用 xai-grok-shell 运行时的薄 ACP stdio sidecar。
+# 里程碑：macOS isolated runtime integration POC。
+# 注意：本文件是 crate 级 manifest；根 Cargo.toml 为生成物，member 注册由 scripts/fork-sync-apply.sh 维护。
+[package]
+name = "efflab-agent-sidecar"
+version = "0.1.0"
+description = "Efflab thin ACP stdio sidecar reusing the xai-grok-shell runtime (macOS isolated runtime POC)"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# 内部 workspace crate：全部按 path 依赖复用，禁止改动核心源码
+xai-grok-agent = { workspace = true }
+xai-grok-config-types = { workspace = true }
+xai-grok-shell = { workspace = true }
+xai-grok-tools = { workspace = true }
+xai-tool-protocol = { workspace = true }
+xai-tool-runtime = { workspace = true }
+xai-tool-types = { workspace = true }
+# 第三方依赖：统一走 workspace.dependencies（版本/feature 单一来源）
+anyhow = { workspace = true }
+clap = { workspace = true }
+dirs = { workspace = true }
+dunce = { workspace = true }
+fs2 = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

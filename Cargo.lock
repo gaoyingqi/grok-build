@@ -2948,6 +2948,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "efflab-agent-contract"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dunce",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
+name = "efflab-agent-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "efflab-agent-contract",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "efflab-agent-sidecar"
 version = "0.1.0"
 dependencies = [
@@ -2955,6 +2978,7 @@ dependencies = [
  "clap",
  "dirs 5.0.1",
  "dunce",
+ "efflab-agent-contract",
  "fs2",
  "schemars 1.0.4",
  "serde",

@@ -10,6 +10,8 @@ license.workspace = true
 publish = false
 
 [dependencies]
+# Efflab 共享契约：Host 与 sidecar 仅通过该无 grok runtime crate 共享 DTO / 校验。
+efflab-agent-contract = { path = "../efflab-agent-contract" }
 # 内部 workspace crate：全部按 path 依赖复用，禁止改动核心源码
 xai-grok-agent = { workspace = true }
 xai-grok-config-types = { workspace = true }

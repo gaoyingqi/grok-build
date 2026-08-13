@@ -3,7 +3,7 @@
 # fork-sync-apply.sh — 把 lab_main 的 fork 改动重放到上游同步后的 workspace。
 #
 # 背景：根 Cargo.toml 是上游生成物（README 明示只读），上游同步会覆盖我们新增的
-# workspace member。本脚本在每次同步后把 `crates/efflab/efflab-agent-sidecar`
+# workspace member。本脚本在每次同步后把 Efflab Agent Kit 的三个 crate
 # 重新注册进 workspace，并跟踪 FORK_BASE_REV（上次成功 apply 的上游基线）。
 #
 # 用法：
@@ -11,8 +11,8 @@
 #   scripts/fork-sync-apply.sh --apply   # 幂等插入 member + 按需推进 FORK_BASE_REV
 #
 # 行为约束：
-#   - 只新增一个 member 行，绝不触碰 `crates/efflab/` 内任何文件
-#   - 检测到 member 重复出现（异常状态）时报错退出
+#   - 只新增缺失的 Efflab member 行，绝不触碰 `crates/efflab/` 内任何文件
+#   - 检测到任一 member 重复出现（异常状态）时报错退出
 #   - 打印根 SOURCE_REV；SOURCE_REV 与 FORK_BASE_REV 不一致时提示必须跑 contract tests
 #   - 不自动 merge / rebase / push
 set -euo pipefail
@@ -20,7 +20,11 @@ set -euo pipefail
 # 解析仓库根目录（脚本固定位于根 scripts/ 下）
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MANIFEST="$ROOT/Cargo.toml"
-MEMBER="crates/efflab/efflab-agent-sidecar"
+MEMBERS=(
+  "crates/efflab/efflab-agent-contract"
+  "crates/efflab/efflab-agent-host"
+  "crates/efflab/efflab-agent-sidecar"
+)
 FORK_BASE_REV_FILE="$ROOT/FORK_BASE_REV"
 
 # 模式参数
@@ -39,15 +43,17 @@ else
   exit 2
 fi
 
-# 前置校验：根 manifest 与 member manifest 必须存在
+# 前置校验：根 manifest 与全部 member manifest 必须存在。
 if [[ ! -f "$MANIFEST" ]]; then
   echo "error: root manifest not found: $MANIFEST" >&2
   exit 2
 fi
-if [[ ! -f "$ROOT/$MEMBER/Cargo.toml" ]]; then
-  echo "error: member manifest not found: $ROOT/$MEMBER/Cargo.toml" >&2
-  exit 2
-fi
+for member in "${MEMBERS[@]}"; do
+  if [[ ! -f "$ROOT/$member/Cargo.toml" ]]; then
+    echo "error: member manifest not found: $ROOT/$member/Cargo.toml" >&2
+    exit 2
+  fi
+done
 
 # FORK_BASE_REV 管理：缺失时 --apply 创建；--check 报告缺失
 if [[ ! -f "$FORK_BASE_REV_FILE" ]]; then
@@ -66,15 +72,22 @@ else
   fi
 fi
 
-# 统计 member 当前出现次数（异常重复 → 失败）
-COUNT="$(grep -c "\"$MEMBER\"" "$MANIFEST" || true)"
-if [[ "$COUNT" -gt 1 ]]; then
-  echo "error: member '$MEMBER' appears $COUNT times in $MANIFEST (corrupt state)" >&2
-  exit 2
-fi
+# 统计 member 当前出现次数（异常重复 → 失败），并收集缺失项。
+MISSING=()
+for member in "${MEMBERS[@]}"; do
+  count="$(grep -c "\"$member\"" "$MANIFEST" || true)"
+  if [[ "$count" -gt 1 ]]; then
+    echo "error: member '$member' appears $count times in $MANIFEST (corrupt state)" >&2
+    exit 2
+  fi
+  if [[ "$count" -eq 0 ]]; then
+    MISSING+=("$member")
+  else
+    echo "member already present: $member"
+  fi
+done
 
-if [[ "$COUNT" -eq 1 ]]; then
-  echo "member already present: $MEMBER"
+if [[ "${#MISSING[@]}" -eq 0 ]]; then
   # member 已就位：若 SOURCE_REV 变化，--apply 推进 FORK_BASE_REV（本地记录）。
   if [[ "$MODE" == "--apply" && -f "$FORK_BASE_REV_FILE" ]]; then
     BASE="$(cat "$FORK_BASE_REV_FILE")"
@@ -87,18 +100,25 @@ if [[ "$COUNT" -eq 1 ]]; then
 fi
 
 if [[ "$MODE" == "--check" ]]; then
-  echo "check: member missing: $MEMBER (would add)"
+  printf 'check: member missing: %s (would add)\n' "${MISSING[@]}"
   exit 1
 fi
 
-# --apply：在 members 数组的字母序位置（"prod/mc/..." 之前）插入 member 行。
-# 幂等：下次再跑会命中 COUNT=1 分支直接退出。
+# --apply：在 members 数组的字母序位置（"prod/mc/..." 之前）插入全部缺失行。
+# 幂等：下次再跑会命中全部 member 已存在的分支直接退出。
 TMP="$MANIFEST.tmp.$$"
 trap 'rm -f "$TMP"' EXIT
-awk -v member="    \"$MEMBER\"," '
-  BEGIN { inserted = 0 }
+awk -v members="$(IFS=:; echo "${MISSING[*]}")" '
+  BEGIN {
+    count = split(members, member, ":")
+    inserted = 0
+  }
   /^    "prod\/mc\/cli-chat-proxy-types",$/ && !inserted {
-    print member
+    for (i = 1; i <= count; i++) {
+      if (member[i] != "") {
+        print "    \"" member[i] "\","
+      }
+    }
     inserted = 1
   }
   { print }
@@ -106,7 +126,7 @@ awk -v member="    \"$MEMBER\"," '
 mv "$TMP" "$MANIFEST"
 trap - EXIT
 
-echo "applied: added member '$MEMBER'"
+printf 'applied: added member %s\n' "${MISSING[@]}"
 # 首次 apply 成功后推进 FORK_BASE_REV（若尚未创建/已过期）。
 if [[ -f "$FORK_BASE_REV_FILE" ]]; then
   BASE="$(cat "$FORK_BASE_REV_FILE")"

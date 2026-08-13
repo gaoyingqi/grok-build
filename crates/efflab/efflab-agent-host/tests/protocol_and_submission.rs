@@ -1,0 +1,351 @@
+//! Kit 线协议与提交幂等的冻结测试。
+//!
+//! 本文件先于 host crate 实现创建，以锁定 M0 协议形状和最小 dispatch 行为。
+
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::Duration;
+
+use anyhow::Result;
+use efflab_agent_host::{
+    ApprovedMcpSpec, HostApp, HostRuntime, HostRuntimeConfig, KitBlock, KitCommand, KitError,
+    KitEventSink, KitProductEvent, KitReply, LlmChannelConfig, LlmChannelView, MentionId,
+    ResolvedMention, ScopeId, SealedSecret, SecretGuard,
+};
+
+/// 构造仅供协议测试使用的运行时配置；骨架阶段不会访问这些路径。
+fn runtime_config() -> HostRuntimeConfig {
+    HostRuntimeConfig {
+        home_root: PathBuf::from("/tmp/efflab-agent-host-test/home"),
+        sidecar_bin: PathBuf::from("/tmp/efflab-agent-host-test/sidecar"),
+        mcp_exec_root: PathBuf::from("/tmp/efflab-agent-host-test/mcp"),
+        idle_after: Duration::from_secs(60),
+    }
+}
+
+/// 最小 HostApp 假实现，确保 HostRuntime 的端口可在不连接产品的情况下构造。
+struct FakeApp;
+
+impl HostApp for FakeApp {
+    fn app_id(&self) -> &str {
+        "test-app"
+    }
+
+    fn persist_llm_channel(&self, _cfg: &LlmChannelConfig) -> Result<()> {
+        Ok(())
+    }
+
+    fn load_llm_channel(&self) -> Result<LlmChannelConfig> {
+        Ok(LlmChannelConfig::default())
+    }
+
+    fn seal_secret(&self, plain: &[u8]) -> Result<SealedSecret> {
+        Ok(SealedSecret::new(plain.to_vec()))
+    }
+
+    fn unseal_secret(&self, sealed: &SealedSecret) -> Result<SecretGuard> {
+        Ok(SecretGuard::new(sealed.as_bytes().to_vec()))
+    }
+
+    fn mcp_for_scope(&self, _scope: &ScopeId) -> Result<ApprovedMcpSpec> {
+        Ok(ApprovedMcpSpec::default())
+    }
+}
+
+/// 内存事件 sink；本任务不发射事件，但保留端口的真实构造路径。
+#[derive(Default)]
+struct MemorySink {
+    events: Mutex<Vec<KitProductEvent>>,
+}
+
+impl KitEventSink for MemorySink {
+    fn emit(&self, ev: KitProductEvent) -> Result<()> {
+        self.events.lock().expect("事件锁必须可用").push(ev);
+        Ok(())
+    }
+}
+
+/// 构造 host skeleton，避免每个测试重复端口接线。
+fn runtime() -> HostRuntime {
+    HostRuntime::new(FakeApp, MemorySink::default(), runtime_config())
+}
+
+/// KitCommand 必须使用邻接 `cmd` 标签和 snake_case 字段。
+#[test]
+fn kit_command_serde_is_adjacent_cmd_snake_case() {
+    let cmd = KitCommand::Send {
+        scope_id: "scope".to_string(),
+        session_id: "session".to_string(),
+        submission_id: "submission".to_string(),
+        text: "hello".to_string(),
+        mentions: None,
+    };
+
+    let value = serde_json::to_value(&cmd).expect("Send 必须可序列化");
+    assert_eq!(value["cmd"], "send");
+    assert_eq!(value["scope_id"], "scope");
+    assert!(value.get("Send").is_none());
+}
+
+/// Capability reply 必须保持协议规定的扁平字段形状，而非嵌套 `capability` 对象。
+#[test]
+fn kit_reply_capability_is_flattened_under_kind() {
+    let reply = KitReply::Capability(efflab_agent_host::Capability {
+        sidecar: "available".to_string(),
+        reason: None,
+        kit_version: "0.1.0".to_string(),
+        schema_version: 1,
+        features: vec!["send".to_string()],
+        channel: LlmChannelView::default(),
+        limits: efflab_agent_host::CapabilityLimits {
+            max_prompt_chars: 32_000,
+        },
+    });
+
+    let value = serde_json::to_value(reply).expect("Capability reply 必须可序列化");
+    assert_eq!(value["kind"], "capability");
+    assert_eq!(value["sidecar"], "available");
+    assert!(value.get("capability").is_none());
+}
+
+/// Send reply 必须携带重复位，方便调用方区分首次投递和幂等命中。
+#[test]
+fn kit_reply_send_has_duplicate_bit() {
+    let reply = KitReply::Send {
+        accepted: true,
+        duplicate: false,
+        session_id: "session".to_string(),
+        turn_id: "submission".to_string(),
+        submission_id: "submission".to_string(),
+    };
+
+    let value = serde_json::to_value(reply).expect("Send reply 必须可序列化");
+    assert_eq!(value["kind"], "send");
+    assert_eq!(value["accepted"], true);
+    assert_eq!(value["duplicate"], false);
+}
+
+/// 未知命令必须保留 cmd，随后由 dispatch 返回结构化 KitError。
+#[test]
+fn unknown_cmd_reaches_structured_unsupported() {
+    let raw = serde_json::json!({ "cmd": "future_command", "scope_id": "scope" });
+    let cmd = KitCommand::from_json_value(raw).expect("未知 cmd 不得在 JSON 层失败");
+    assert!(matches!(cmd, KitCommand::Unknown { ref cmd } if cmd == "future_command"));
+
+    let error = runtime()
+        .dispatch(cmd)
+        .expect_err("未知 cmd 必须由 dispatch 拒绝");
+    assert_eq!(error.code, "unsupported");
+    assert!(!error.retryable);
+}
+
+/// 错误码在线上是开放字符串，未知码仍必须携带可展示消息。
+#[test]
+fn unknown_error_code_keeps_message() {
+    let raw = include_str!("fixtures/kit_wire/unknown_error.json");
+    let error: KitError = serde_json::from_str(raw).expect("未知错误码必须能解码");
+
+    assert_eq!(error.code, "future_error");
+    assert_eq!(error.message, "future failure");
+    assert!(!error.retryable);
+}
+
+/// 未知 block kind 要降级为固定 unknown 形状，且有意丢弃未知原 payload。
+#[test]
+fn kit_block_unknown_kind_round_trips_to_unknown_shape() {
+    let raw = include_str!("fixtures/kit_wire/unknown_block_event.json");
+    let event: KitProductEvent = serde_json::from_str(raw).expect("未知 block 不得丢弃整条事件");
+    assert!(
+        matches!(event.block, KitBlock::Unknown { ref unknown_kind } if unknown_kind == "plan")
+    );
+
+    let round_trip = serde_json::to_value(event).expect("未知 block 必须可重序列化");
+    assert_eq!(
+        round_trip["block"],
+        serde_json::json!({ "kind": "unknown", "unknown_kind": "plan" })
+    );
+}
+
+/// session 级状态事件可没有 turn/submission，并按 Host 事件 ID 合成规则编码。
+#[test]
+fn session_level_status_allows_null_turn_id() {
+    let raw = include_str!("fixtures/kit_wire/session_status_event.json");
+    let event: KitProductEvent = serde_json::from_str(raw).expect("session 级状态事件必须可解码");
+
+    assert_eq!(event.turn_id, None);
+    assert_eq!(event.submission_id, None);
+    assert_eq!(event.event_id, "sid:host:replay_complete:0");
+    assert_eq!(event.block_id, event.event_id);
+}
+
+/// Kit 事件是产品协议，不能混入 ACP 的 method 包装。
+#[test]
+fn kit_event_json_has_no_acp_method() {
+    let raw = include_str!("fixtures/kit_wire/session_status_event.json");
+    let value: serde_json::Value = serde_json::from_str(raw).expect("golden 必须是 JSON");
+
+    assert!(value.get("method").is_none());
+    assert_eq!(value["block"]["kind"], "status");
+}
+
+/// LLM channel view 的 reply 标签在外层，通道字段只嵌套在 channel 内。
+#[test]
+fn llm_channel_view_is_nested_and_never_serializes_credentials() {
+    let raw = include_str!("fixtures/kit_wire/llm_channel_view_empty.json");
+    let expected: serde_json::Value = serde_json::from_str(raw).expect("golden 必须是 JSON");
+    let reply = KitReply::LlmChannelView {
+        channel: LlmChannelView::default(),
+    };
+    let value = serde_json::to_value(reply).expect("view reply 必须可序列化");
+
+    assert_eq!(value, expected);
+    assert!(value.get("api_key").is_none());
+    assert!(value.get("access_token").is_none());
+}
+
+/// Get/Set channel 命令必须使用固定 snake_case `cmd` wire；仅 Set 请求本身可携带一次性秘密。
+#[test]
+fn llm_channel_commands_have_frozen_wire_shapes() {
+    let get = serde_json::to_value(KitCommand::GetLlmChannelView)
+        .expect("GetLlmChannelView 必须可序列化");
+    assert_eq!(get, serde_json::json!({ "cmd": "get_llm_channel_view" }));
+
+    let raw = include_str!("fixtures/kit_wire/set_llm_channel.json");
+    let expected: serde_json::Value = serde_json::from_str(raw).expect("golden 必须是 JSON");
+    let set = KitCommand::from_json_value(expected.clone()).expect("Set wire 必须可解码");
+    assert_eq!(
+        serde_json::to_value(set).expect("Set wire 必须可重序列化"),
+        expected
+    );
+}
+
+/// Set channel 请求可携带一次性秘密，但回传线协议不能泄露其明文。
+#[test]
+fn set_llm_channel_wire_keeps_secret_out_of_responses() {
+    let raw = include_str!("fixtures/kit_wire/set_llm_channel.json");
+    let command =
+        KitCommand::from_json_value(serde_json::from_str(raw).expect("golden 必须是 JSON"))
+            .expect("SetLlmChannel wire 必须可解码");
+    assert!(matches!(
+        command,
+        KitCommand::SetLlmChannel {
+            ref api_key,
+            ref access_token,
+            ..
+        } if api_key.as_deref() == Some("test-api-key") && access_token.is_none()
+    ));
+
+    let error = runtime()
+        .dispatch(command)
+        .expect_err("SetLlmChannel 在 skeleton 阶段必须 unsupported");
+    let value = serde_json::to_value(error).expect("错误必须可序列化");
+    let rendered = value.to_string();
+    assert!(!rendered.contains("test-api-key"));
+    assert!(!rendered.contains("access_token"));
+}
+
+/// 同一 key 与同一稳定指纹应回同一 turn，且第二次标记 duplicate。
+#[test]
+fn same_submission_id_same_fingerprint_is_duplicate_reply() {
+    let runtime = runtime();
+    let first = runtime
+        .dispatch(send("same text", vec![]))
+        .expect("首次 Send 必须被接受");
+    let second = runtime
+        .dispatch(send("same text", vec![]))
+        .expect("同指纹 Send 必须幂等成功");
+
+    assert_send_reply(&first, false, "submission");
+    assert_send_reply(&second, true, "submission");
+}
+
+/// 同一 submission key 的文本字节变化必须 fail-closed，禁止重复投递为新 turn。
+#[test]
+fn same_submission_id_different_bytes_fail_closed() {
+    let runtime = runtime();
+    runtime
+        .dispatch(send("first text", vec![]))
+        .expect("首次 Send 必须被接受");
+
+    let error = runtime
+        .dispatch(send("second text", vec![]))
+        .expect_err("同 submission 的不同文本必须冲突");
+    assert_eq!(error.code, "fingerprint_conflict");
+}
+
+/// mentions 必须按 (kind, id) 排序计算指纹；集合变化则同 submission 冲突。
+#[test]
+fn same_submission_and_text_with_different_mentions_conflicts() {
+    let runtime = runtime();
+    runtime
+        .dispatch(send(
+            "same text",
+            vec![mention("album", "2"), mention("track", "1")],
+        ))
+        .expect("首次 Send 必须被接受");
+
+    let same_mentions_different_order = runtime
+        .dispatch(send(
+            "same text",
+            vec![mention("track", "1"), mention("album", "2")],
+        ))
+        .expect("排序变化不得影响稳定指纹");
+    assert_send_reply(&same_mentions_different_order, true, "submission");
+
+    let error = runtime
+        .dispatch(send("same text", vec![mention("track", "different")]))
+        .expect_err("mentions 集合变化必须冲突");
+    assert_eq!(error.code, "fingerprint_conflict");
+}
+
+/// host 只能依赖 contract 与小依赖，禁止反向链接 sidecar 或 grok shell。
+#[test]
+fn host_crate_does_not_depend_on_sidecar_or_grok_shell() {
+    let manifest = include_str!("../Cargo.toml");
+    assert!(!manifest.contains("efflab-agent-sidecar"));
+    assert!(!manifest.contains("xai-grok-shell"));
+    assert!(!manifest.contains("xai-grok-tools"));
+}
+
+/// 构造固定 key 的 Send 命令，便于覆盖 SubmissionMap 的幂等边界。
+fn send(text: &str, mentions: Vec<MentionId>) -> KitCommand {
+    KitCommand::Send {
+        scope_id: "scope".to_string(),
+        session_id: "session".to_string(),
+        submission_id: "submission".to_string(),
+        text: text.to_string(),
+        mentions: (!mentions.is_empty()).then_some(mentions),
+    }
+}
+
+/// 构造最小 mention 标识；解析与业务扩展属于后续任务。
+fn mention(kind: &str, id: &str) -> MentionId {
+    MentionId {
+        kind: kind.to_string(),
+        id: id.to_string(),
+    }
+}
+
+/// 收束 Send reply 的协议断言，避免测试只检查某一个字段。
+fn assert_send_reply(reply: &KitReply, expected_duplicate: bool, expected_turn_id: &str) {
+    match reply {
+        KitReply::Send {
+            accepted,
+            duplicate,
+            session_id,
+            turn_id,
+            submission_id,
+        } => {
+            assert!(*accepted);
+            assert_eq!(*duplicate, expected_duplicate);
+            assert_eq!(session_id, "session");
+            assert_eq!(turn_id, expected_turn_id);
+            assert_eq!(submission_id, "submission");
+        }
+        other => panic!("期望 Send reply，实际为 {other:?}"),
+    }
+}
+
+/// 将 trait 导入保持在测试编译时可见，避免未来端口签名悄然漂移。
+#[allow(dead_code)]
+fn _resolved_mention_type_marker(_: ResolvedMention) {}

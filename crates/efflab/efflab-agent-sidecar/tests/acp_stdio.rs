@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use common::acp_client::AcpClient;
 use common::process::SidecarProcess;
-use efflab_agent_sidecar::host_contract::{validate_host_request, HostPolicy, HostRejection};
+use efflab_agent_sidecar::host_contract::{HostPolicy, HostRejection, validate_host_request};
 use serde_json::Value;
 
 /// 所有 ACP 请求的默认超时。

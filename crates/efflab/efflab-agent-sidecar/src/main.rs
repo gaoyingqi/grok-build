@@ -18,6 +18,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::Context;
+use efflab_agent_contract::render_authoritative_config;
 use efflab_agent_sidecar::hardening;
 use efflab_agent_sidecar::sidecar_config::SidecarConfig;
 use efflab_agent_sidecar::toolset::register_efflab_tool_pack;
@@ -58,7 +59,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let config_toml = match hardening::render_authoritative_config(
+    let config_toml = match render_authoritative_config(
         &sidecar.grok_home,
         &agent_def_path,
         Some(&sidecar.mcp_config),

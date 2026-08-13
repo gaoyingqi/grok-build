@@ -1,0 +1,22 @@
+# Efflab Agent Kit 无运行时依赖的共享契约与 DTO。
+[package]
+name = "efflab-agent-contract"
+version = "0.1.0"
+description = "Shared validation and DTO contract for the Efflab Agent Kit"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+dunce = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

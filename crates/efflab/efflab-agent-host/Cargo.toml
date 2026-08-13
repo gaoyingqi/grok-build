@@ -1,0 +1,17 @@
+# Efflab Agent Kit 通用 Host Runtime 骨架；不得链接 sidecar 库或 grok shell。
+[package]
+name = "efflab-agent-host"
+version = "0.1.0"
+description = "Embeddable Efflab Agent Kit Host Runtime"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+efflab-agent-contract = { path = "../efflab-agent-contract" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

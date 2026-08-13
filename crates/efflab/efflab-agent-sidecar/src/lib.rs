@@ -11,6 +11,7 @@
 //! 设计约束：不修改任何 `xai-grok-*` 核心 crate；stdout 仅承载 ACP JSON-RPC。
 
 pub mod hardening;
+/// 向下兼容既有 sidecar 测试与调用方的 Host 合同模块路径。
 pub mod host_contract;
 pub mod sidecar_config;
 pub mod toolset;

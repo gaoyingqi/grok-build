@@ -12,8 +12,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 
-use crate::sidecar_config::{ApprovedMcpConfig, McpServerSpec};
-
 /// 私有目录的 Unix 权限：仅当前用户可访问。
 const DIRECTORY_MODE: u32 = 0o700;
 /// 私有文件的 Unix 权限：仅当前用户可读写。
@@ -24,15 +22,8 @@ const HOME_LOCK_FILENAME: &str = ".efflab-sidecar.lock";
 const FORBIDDEN_PRIVATE_POLICY_FILES: [&str; 2] = ["managed_config.toml", "requirements.toml"];
 /// 物化后的固定 AgentDefinition 文件名。
 const DEFAULT_AGENT_FILENAME: &str = "efflab-default.md";
-/// 物化 AgentDefinition 与权威配置中使用的固定 agent 名称。
-const DEFAULT_AGENT_NAME: &str = "efflab-default";
 /// 编译期嵌入的密封默认 AgentDefinition，运行时绝不从用户目录读取它。
 const DEFAULT_AGENT_DEFINITION: &str = include_str!("../assets/efflab-default-agent.md");
-
-/// `VendorCompat` 的全部供应商字段，必须与上游 compat 类型保持同步。
-const COMPAT_VENDORS: [&str; 3] = ["claude", "cursor", "codex"];
-/// `VendorCompat` 的全部 surface 字段，默认均为开启，故必须逐项显式关闭。
-const COMPAT_SURFACES: [&str; 6] = ["skills", "rules", "agents", "mcps", "hooks", "sessions"];
 
 /// 不允许继承的非 compat 环境变量。
 const SANITIZED_ENV_VARS: [&str; 5] = [
@@ -169,89 +160,6 @@ pub fn materialize_agent_definition(grok_home: &Path) -> Result<PathBuf> {
     atomic_write_private(&agent_definition_path, DEFAULT_AGENT_DEFINITION.as_bytes())?;
 
     Ok(agent_definition_path)
-}
-
-/// 完整渲染 sidecar 唯一权威的 `config.toml` 文本。
-///
-/// 函数不读取旧配置，因此调用方每次都可使用 [`atomic_write_private`] 覆盖
-/// `GROK_HOME/config.toml`，不会继承任意旧字段。`mcp` 只能传入
-/// `crate::sidecar_config::ApprovedMcpConfig`：其 `servers` 中每个条目必须已经由
-/// sidecar 配置边界校验；stdio 条目写入 `command` 和 `args`，HTTP 条目写入 `url`。
-pub fn render_authoritative_config(
-    grok_home: &Path,
-    agent_def_path: &Path,
-    mcp: Option<&ApprovedMcpConfig>,
-) -> Result<String> {
-    require_absolute_path(grok_home, "私有 GROK_HOME")?;
-    require_absolute_path(agent_def_path, "物化 AgentDefinition")?;
-    let agent_definition = path_to_utf8(agent_def_path, "物化 AgentDefinition")?;
-
-    // 所有默认开启的 compat cell 均在同一 `[compat]` 表中逐项关闭。
-    let mut rendered = String::from("[features]\nremote_fetch = false\n\n[compat]\n");
-    for vendor in COMPAT_VENDORS {
-        for surface in COMPAT_SURFACES {
-            rendered.push_str(vendor);
-            rendered.push('.');
-            rendered.push_str(surface);
-            rendered.push_str(" = false\n");
-        }
-    }
-
-    rendered.push_str("\n[subagents]\nenabled = false\n");
-    rendered.push_str("\n[managed_mcps]\nenabled = false\ngateway_tools_enabled = false\n");
-    rendered.push_str("\n[memory]\nenabled = false\n");
-    rendered.push_str("\n[skills]\npaths = []\n");
-    rendered.push_str("\n[agent]\nname = ");
-    rendered.push_str(&toml_string_literal(DEFAULT_AGENT_NAME));
-    rendered.push_str("\ndefinition = ");
-    rendered.push_str(&toml_string_literal(&agent_definition));
-    rendered.push_str("\n\n[mcp_servers]\n");
-
-    if let Some(approved_mcp) = mcp {
-        for (name, server) in &approved_mcp.servers {
-            if name.trim().is_empty() {
-                bail!("受控 MCP server 名称不能为空");
-            }
-
-            rendered.push('\n');
-            rendered.push_str("[mcp_servers.");
-            rendered.push_str(&toml_key_literal(name));
-            rendered.push_str("]\n");
-
-            match server {
-                McpServerSpec::Stdio { command, args } => {
-                    if !command.is_absolute() {
-                        bail!(
-                            "受控 stdio MCP server '{name}' 的 command 必须为绝对路径: {}",
-                            command.display()
-                        );
-                    }
-
-                    let command = path_to_utf8(command, "受控 stdio MCP command")?;
-                    rendered.push_str("command = ");
-                    rendered.push_str(&toml_string_literal(&command));
-                    rendered.push_str("\nargs = ");
-                    rendered.push_str(&toml_string_array_literal(args));
-                    rendered.push('\n');
-                }
-                McpServerSpec::Http { url } => {
-                    if url.trim().is_empty() {
-                        bail!("受控 HTTP MCP server '{name}' 的 url 不能为空");
-                    }
-
-                    rendered.push_str("url = ");
-                    rendered.push_str(&toml_string_literal(url));
-                    rendered.push('\n');
-                }
-            }
-        }
-    }
-
-    // 在写盘前先验证生成文本自身可被 TOML 解析，避免落盘无效权威配置。
-    toml::from_str::<toml::Value>(&rendered)
-        .context("内部错误：生成的权威 sidecar config.toml 不是合法 TOML")?;
-
-    Ok(rendered)
 }
 
 /// 清除能够重新打开外部网络、compat、subagent、存储或 managed MCP 能力的环境变量。
@@ -427,35 +335,6 @@ fn sync_parent_directory(parent: &Path) -> Result<()> {
         .with_context(|| format!("同步原子写父目录失败: {}", parent.display()))
 }
 
-/// 将路径转换为可安全写入 TOML 的 Unicode 字符串；非 Unicode 路径 fail-closed。
-fn path_to_utf8(path: &Path, description: &str) -> Result<String> {
-    path.to_str().map(str::to_owned).with_context(|| {
-        format!(
-            "{description} 不是可写入 TOML 的 UTF-8 路径: {}",
-            path.display()
-        )
-    })
-}
-
-/// 渲染 TOML 字符串值，同时屏蔽配置层对 `$VAR` 的二次环境展开。
-fn toml_string_literal(value: &str) -> String {
-    toml::Value::String(value.replace('$', "$$")).to_string()
-}
-
-/// 渲染 TOML table key；table key 不经过配置值的环境展开，因此保留原始名称。
-fn toml_key_literal(value: &str) -> String {
-    toml::Value::String(value.to_owned()).to_string()
-}
-
-/// 渲染 MCP stdio 参数数组，并对每个参数屏蔽配置层环境展开。
-fn toml_string_array_literal(values: &[String]) -> String {
-    let values = values
-        .iter()
-        .map(|value| toml::Value::String(value.replace('$', "$$")))
-        .collect();
-    toml::Value::Array(values).to_string()
-}
-
 /// 判断环境变量名是否匹配要求清除的 `OTEL_` ASCII 前缀。
 fn is_otel_environment_key(key: &std::ffi::OsStr) -> bool {
     key.to_string_lossy().starts_with("OTEL_")
@@ -483,7 +362,16 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
+    use efflab_agent_contract::{ApprovedMcpConfig, McpServerSpec, render_authoritative_config};
+
     use super::*;
+
+    /// 渲染器的固定 agent 名称属于共享 contract，而 sidecar 测试仅验证其输出。
+    const DEFAULT_AGENT_NAME: &str = "efflab-default";
+    /// compat 全量显式关闭的供应商集合。
+    const COMPAT_VENDORS: [&str; 3] = ["claude", "cursor", "codex"];
+    /// compat 全量显式关闭的 surface 集合。
+    const COMPAT_SURFACES: [&str; 6] = ["skills", "rules", "agents", "mcps", "hooks", "sessions"];
 
     /// 本 crate 的环境变量测试共享同一把锁，避免相互污染进程全局状态。
     static ENVIRONMENT_TEST_LOCK: Mutex<()> = Mutex::new(());

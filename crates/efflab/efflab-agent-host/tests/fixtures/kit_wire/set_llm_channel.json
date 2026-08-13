@@ -1,0 +1,1 @@
+{"cmd":"set_llm_channel","kind":"byok","base_url":"https://example.invalid/v1","model_id":"model-id","api_key":"test-api-key","client_request_id":"request-1"}

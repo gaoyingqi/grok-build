@@ -29,6 +29,7 @@ enum Rejection {
     ClientMcpServersNotAllowed,
     ForbiddenField,
     UnknownField,
+    UnknownNestedField,
     InvalidFieldType,
     MissingRequiredField,
     TerminalCapabilityEnabled,
@@ -115,6 +116,7 @@ fn rejection_matches(actual: &HostRejection, expected: &Rejection) -> bool {
         }
         Rejection::ForbiddenField => matches!(actual, HostRejection::ForbiddenField(..)),
         Rejection::UnknownField => matches!(actual, HostRejection::UnknownField { .. }),
+        Rejection::UnknownNestedField => matches!(actual, HostRejection::UnknownNestedField { .. }),
         Rejection::InvalidFieldType => matches!(actual, HostRejection::InvalidFieldType { .. }),
         Rejection::MissingRequiredField => {
             matches!(actual, HostRejection::MissingRequiredField { .. })

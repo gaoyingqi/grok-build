@@ -13,28 +13,88 @@
   {
     "name": "initialize terminal capability",
     "method": "initialize",
-    "params": { "capabilities": { "terminal": true, "fs": false } },
+    "params": {
+      "capabilities": { "terminal": true, "fs": false },
+      "client": { "mcpServers": [] }
+    },
     "expect": "reject",
     "rejection": "TerminalCapabilityEnabled"
   },
   {
     "name": "initialize fs capability",
     "method": "initialize",
-    "params": { "capabilities": { "terminal": false, "fs": true } },
+    "params": {
+      "capabilities": { "terminal": false, "fs": true },
+      "client": { "mcpServers": [] }
+    },
     "expect": "reject",
     "rejection": "FsCapabilityEnabled"
   },
   {
     "name": "initialize client mcpServers",
     "method": "initialize",
-    "params": { "client": { "mcpServers": [{ "name": "evil" }] } },
+    "params": {
+      "capabilities": { "terminal": false, "fs": false },
+      "client": { "mcpServers": [{ "name": "evil" }] }
+    },
     "expect": "reject",
     "rejection": "ClientMcpServersNotAllowed"
   },
   {
+    "name": "initialize rejects empty params because security fields are required",
+    "method": "initialize",
+    "params": {},
+    "expect": "reject",
+    "rejection": "MissingRequiredField"
+  },
+  {
+    "name": "initialize rejects empty capabilities",
+    "method": "initialize",
+    "params": {
+      "capabilities": {},
+      "client": { "mcpServers": [] }
+    },
+    "expect": "reject",
+    "rejection": "MissingRequiredField"
+  },
+  {
+    "name": "initialize rejects empty client",
+    "method": "initialize",
+    "params": {
+      "capabilities": { "terminal": false, "fs": false },
+      "client": {}
+    },
+    "expect": "reject",
+    "rejection": "MissingRequiredField"
+  },
+  {
+    "name": "initialize rejects unknown capabilities key",
+    "method": "initialize",
+    "params": {
+      "capabilities": { "terminal": false, "fs": false, "network": false },
+      "client": { "mcpServers": [] }
+    },
+    "expect": "reject",
+    "rejection": "UnknownNestedField"
+  },
+  {
+    "name": "initialize rejects unknown client key",
+    "method": "initialize",
+    "params": {
+      "capabilities": { "terminal": false, "fs": false },
+      "client": { "mcpServers": [], "plugins": [] }
+    },
+    "expect": "reject",
+    "rejection": "UnknownNestedField"
+  },
+  {
     "name": "initialize unknown meta key",
     "method": "initialize",
-    "params": { "_meta": { "sneaky": 1 } },
+    "params": {
+      "capabilities": { "terminal": false, "fs": false },
+      "client": { "mcpServers": [] },
+      "_meta": { "sneaky": 1 }
+    },
     "expect": "reject",
     "rejection": "UnknownMetaKey"
   },
@@ -48,21 +108,30 @@
   {
     "name": "initialize capabilities non-object",
     "method": "initialize",
-    "params": { "capabilities": [] },
+    "params": {
+      "capabilities": [],
+      "client": { "mcpServers": [] }
+    },
     "expect": "reject",
     "rejection": "InvalidFieldType"
   },
   {
     "name": "initialize client non-object",
     "method": "initialize",
-    "params": { "client": "invalid" },
+    "params": {
+      "capabilities": { "terminal": false, "fs": false },
+      "client": "invalid"
+    },
     "expect": "reject",
     "rejection": "InvalidFieldType"
   },
   {
     "name": "initialize terminal wrong type",
     "method": "initialize",
-    "params": { "capabilities": { "terminal": "false" } },
+    "params": {
+      "capabilities": { "terminal": "false", "fs": false },
+      "client": { "mcpServers": [] }
+    },
     "expect": "reject",
     "rejection": "InvalidFieldType"
   },
@@ -147,6 +216,13 @@
     "rejection": "ClientMcpServersNotAllowed"
   },
   {
+    "name": "session/new missing mcpServers",
+    "method": "session/new",
+    "params": { "cwd": "{{CWD}}" },
+    "expect": "reject",
+    "rejection": "MissingRequiredField"
+  },
+  {
     "name": "session/new top-level modelId",
     "method": "session/new",
     "params": { "cwd": "{{CWD}}", "modelId": "grok-code-fast" },
@@ -197,6 +273,7 @@
     "params": {
       "sessionId": "s1",
       "cwd": "{{CWD}}",
+      "mcpServers": [],
       "_meta": { "sneaky": 1 }
     },
     "expect": "reject",
@@ -239,7 +316,11 @@
   {
     "name": "modelId not allowed",
     "method": "session/new",
-    "params": { "cwd": "{{CWD}}", "_meta": { "modelId": "grok-code-evil" } },
+    "params": {
+      "cwd": "{{CWD}}",
+      "mcpServers": [],
+      "_meta": { "modelId": "grok-code-evil" }
+    },
     "expect": "reject",
     "rejection": "ModelIdNotAllowed"
   }

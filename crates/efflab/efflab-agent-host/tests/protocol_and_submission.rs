@@ -244,6 +244,141 @@ fn set_llm_channel_wire_keeps_secret_out_of_responses() {
     assert!(!rendered.contains("access_token"));
 }
 
+/// 全空 Set 请求是未来 Channel 语义的合法 no-op，M0 仍必须走 structured unsupported。
+#[test]
+fn empty_set_llm_channel_decodes_and_reaches_unsupported_dispatch() {
+    let command = KitCommand::from_json_value(serde_json::json!({ "cmd": "set_llm_channel" }))
+        .expect("全空 SetLlmChannel 必须能解码");
+    assert!(matches!(
+        command,
+        KitCommand::SetLlmChannel {
+            kind: None,
+            client_request_id: None,
+            ..
+        }
+    ));
+
+    let error = runtime()
+        .dispatch(command)
+        .expect_err("全空 SetLlmChannel 在 skeleton 阶段必须 unsupported");
+    assert_eq!(error.code, "unsupported");
+}
+
+/// 仅带请求幂等标识的 Set 请求也是合法 no-op，不能在 serde 边界失败。
+#[test]
+fn request_id_only_set_llm_channel_decodes_and_reaches_unsupported_dispatch() {
+    let command = KitCommand::from_json_value(serde_json::json!({
+        "cmd": "set_llm_channel",
+        "client_request_id": "request-1"
+    }))
+    .expect("仅 client_request_id 的 SetLlmChannel 必须能解码");
+    assert!(matches!(
+        command,
+        KitCommand::SetLlmChannel {
+            kind: None,
+            client_request_id: Some(ref request_id),
+            ..
+        } if request_id == "request-1"
+    ));
+
+    let error = runtime()
+        .dispatch(command)
+        .expect_err("仅 client_request_id 的 SetLlmChannel 在 skeleton 阶段必须 unsupported");
+    assert_eq!(error.code, "unsupported");
+}
+
+/// 命令调试输出是潜在日志路径，必须对请求中所有一次性秘密脱敏。
+#[test]
+fn set_llm_channel_debug_redacts_credentials() {
+    let command = KitCommand::from_json_value(serde_json::json!({
+        "cmd": "set_llm_channel",
+        "kind": "byok",
+        "api_key": "debug-api-key-secret",
+        "access_token": "debug-access-token-secret"
+    }))
+    .expect("携带秘密的 SetLlmChannel 必须能解码");
+
+    let rendered = format!("{command:?}");
+    assert!(!rendered.contains("debug-api-key-secret"));
+    assert!(!rendered.contains("debug-access-token-secret"));
+}
+
+/// 事件在输入 serde 层应保持宽容；Host 出站边界再拒绝回合标识不变量违例。
+#[test]
+fn kit_product_event_validate_rejects_invalid_turn_and_session_id_combinations() {
+    let cases = [
+        (
+            "turn 级 user 缺少标识",
+            event(
+                KitBlock::User {
+                    text: "hello".to_string(),
+                },
+                None,
+                None,
+            ),
+        ),
+        (
+            "turn 级 assistant 标识不相等",
+            event(
+                KitBlock::Assistant {
+                    markdown: "hello".to_string(),
+                    streaming: false,
+                },
+                Some("turn"),
+                Some("submission"),
+            ),
+        ),
+        (
+            "turn 终态缺少 submission_id",
+            event(
+                KitBlock::Status {
+                    code: "turn_completed".to_string(),
+                    message: "done".to_string(),
+                },
+                Some("turn"),
+                None,
+            ),
+        ),
+        (
+            "session 状态不得携带 synthetic turn id",
+            event(
+                KitBlock::Status {
+                    code: "replay_complete".to_string(),
+                    message: "0".to_string(),
+                },
+                Some("synthetic"),
+                Some("synthetic"),
+            ),
+        ),
+        (
+            "prompt 无关 skipped_update 不得携带 synthetic turn id",
+            event(
+                KitBlock::Status {
+                    code: "skipped_update".to_string(),
+                    message: "1".to_string(),
+                },
+                Some("synthetic"),
+                Some("synthetic"),
+            ),
+        ),
+    ];
+
+    for (name, event) in cases {
+        assert!(event.validate().is_err(), "{name} 必须被 Host 出站边界拒绝");
+    }
+}
+
+/// 合法 session/process Status 保持 null 标识，既有 golden 也须通过显式边界校验。
+#[test]
+fn kit_product_event_validate_allows_session_status_with_null_ids() {
+    let raw = include_str!("fixtures/kit_wire/session_status_event.json");
+    let event: KitProductEvent = serde_json::from_str(raw).expect("session 状态 golden 必须能解码");
+
+    event
+        .validate()
+        .expect("session/process Status 的 null turn/submission 必须通过 Host 出站校验");
+}
+
 /// 同一 key 与同一稳定指纹应回同一 turn，且第二次标记 duplicate。
 #[test]
 fn same_submission_id_same_fingerprint_is_duplicate_reply() {
@@ -305,6 +440,22 @@ fn host_crate_does_not_depend_on_sidecar_or_grok_shell() {
     assert!(!manifest.contains("efflab-agent-sidecar"));
     assert!(!manifest.contains("xai-grok-shell"));
     assert!(!manifest.contains("xai-grok-tools"));
+}
+
+/// 构造最小事件，专门覆盖 Host 出站前的回合/会话标识校验。
+fn event(block: KitBlock, turn_id: Option<&str>, submission_id: Option<&str>) -> KitProductEvent {
+    KitProductEvent {
+        schema_version: 1,
+        scope_id: "scope".to_string(),
+        session_id: "session".to_string(),
+        turn_id: turn_id.map(str::to_string),
+        submission_id: submission_id.map(str::to_string),
+        event_id: "event".to_string(),
+        sequence: 0,
+        origin: efflab_agent_host::Origin::Live,
+        block_id: "block".to_string(),
+        block,
+    }
 }
 
 /// 构造固定 key 的 Send 命令，便于覆盖 SubmissionMap 的幂等边界。

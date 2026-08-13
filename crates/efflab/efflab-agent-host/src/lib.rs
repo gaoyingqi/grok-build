@@ -18,6 +18,7 @@ pub use config::HostRuntimeConfig;
 pub use event_sink::KitEventSink;
 pub use protocol::{
     Capability, CapabilityLimits, KIT_SCHEMA_VERSION, KitBlock, KitCommand, KitError,
-    KitProductEvent, KitReply, LlmChannelKind, LlmChannelView, Origin, SessionSummary, ToolStatus,
+    KitProductEvent, KitProductEventValidationError, KitReply, LlmChannelKind, LlmChannelView,
+    Origin, SessionSummary, ToolStatus,
 };
 pub use runtime::HostRuntime;

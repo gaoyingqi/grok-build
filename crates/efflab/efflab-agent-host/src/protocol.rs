@@ -3,6 +3,8 @@
 //! 本模块只描述与运输无关的 serde 形状。所有字段采用 snake_case；未知 command
 //! 和 block 必须被保留为显式降级形状，而不能让整条产品请求或事件解析失败。
 
+use std::fmt;
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
@@ -12,7 +14,7 @@ use crate::MentionId;
 pub const KIT_SCHEMA_VERSION: u32 = 1;
 
 /// Kit 命令。标准命令采用内标 `cmd`，未知命令显式保存其原始命令名。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum KitCommand {
     /// 查询 Kit 能力。
     GetCapability,
@@ -48,7 +50,7 @@ pub enum KitCommand {
     GetLlmChannelView,
     /// 设置产品全局 Channel；秘密只允许存在于该请求内。
     SetLlmChannel {
-        kind: LlmChannelKind,
+        kind: Option<LlmChannelKind>,
         base_url: Option<String>,
         model_id: Option<String>,
         relay_base_url: Option<String>,
@@ -59,6 +61,80 @@ pub enum KitCommand {
     },
     /// 未知命令的兼容降级形状。
     Unknown { cmd: String },
+}
+
+impl fmt::Debug for KitCommand {
+    /// 手写调试格式，确保 Set 请求中的一次性秘密不会进入日志。
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::GetCapability => formatter.write_str("GetCapability"),
+            Self::Send {
+                scope_id,
+                session_id,
+                submission_id,
+                text,
+                mentions,
+            } => formatter
+                .debug_struct("Send")
+                .field("scope_id", scope_id)
+                .field("session_id", session_id)
+                .field("submission_id", submission_id)
+                .field("text", text)
+                .field("mentions", mentions)
+                .finish(),
+            Self::Cancel {
+                scope_id,
+                session_id,
+            } => formatter
+                .debug_struct("Cancel")
+                .field("scope_id", scope_id)
+                .field("session_id", session_id)
+                .finish(),
+            Self::NewSession {
+                scope_id,
+                client_request_id,
+            } => formatter
+                .debug_struct("NewSession")
+                .field("scope_id", scope_id)
+                .field("client_request_id", client_request_id)
+                .finish(),
+            Self::ListSessions { scope_id, cursor } => formatter
+                .debug_struct("ListSessions")
+                .field("scope_id", scope_id)
+                .field("cursor", cursor)
+                .finish(),
+            Self::ResumeSession {
+                scope_id,
+                session_id,
+            } => formatter
+                .debug_struct("ResumeSession")
+                .field("scope_id", scope_id)
+                .field("session_id", session_id)
+                .finish(),
+            Self::GetLlmChannelView => formatter.write_str("GetLlmChannelView"),
+            Self::SetLlmChannel {
+                kind,
+                base_url,
+                model_id,
+                relay_base_url,
+                app_key,
+                api_key,
+                access_token,
+                client_request_id,
+            } => formatter
+                .debug_struct("SetLlmChannel")
+                .field("kind", kind)
+                .field("base_url", base_url)
+                .field("model_id", model_id)
+                .field("relay_base_url", relay_base_url)
+                .field("app_key", app_key)
+                .field("api_key", &api_key.as_ref().map(|_| "[REDACTED]"))
+                .field("access_token", &access_token.as_ref().map(|_| "[REDACTED]"))
+                .field("client_request_id", client_request_id)
+                .finish(),
+            Self::Unknown { cmd } => formatter.debug_struct("Unknown").field("cmd", cmd).finish(),
+        }
+    }
 }
 
 impl KitCommand {
@@ -491,6 +567,67 @@ pub struct KitProductEvent {
     pub block: KitBlock,
 }
 
+impl KitProductEvent {
+    /// 在 Host 构造或向产品运输前校验回合与会话事件的标识不变量。
+    ///
+    /// 入站 serde 故意不调用此方法：未知或被禁用的 sidecar update 必须能够被后续
+    /// projector 跳过或计数，而不是因一条异常事件中止整批处理。
+    pub fn validate(&self) -> Result<(), KitProductEventValidationError> {
+        match &self.block {
+            KitBlock::User { .. }
+            | KitBlock::Assistant { .. }
+            | KitBlock::Thinking { .. }
+            | KitBlock::Tool { .. } => self.validate_turn_identifiers(),
+            KitBlock::Status { code, .. } if is_turn_terminal_status(code) => {
+                self.validate_turn_identifiers()
+            }
+            KitBlock::Status { code, .. } if is_session_status(code) => {
+                self.validate_session_identifiers()
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// turn 级 block 必须携带相同的 turn_id 与 submission_id。
+    fn validate_turn_identifiers(&self) -> Result<(), KitProductEventValidationError> {
+        match (&self.turn_id, &self.submission_id) {
+            (Some(turn_id), Some(submission_id)) if turn_id == submission_id => Ok(()),
+            _ => Err(KitProductEventValidationError::TurnIdentifiersMustMatch),
+        }
+    }
+
+    /// session/process 级 Status 不得伪造任何回合标识。
+    fn validate_session_identifiers(&self) -> Result<(), KitProductEventValidationError> {
+        if self.turn_id.is_none() && self.submission_id.is_none() {
+            Ok(())
+        } else {
+            Err(KitProductEventValidationError::SessionIdentifiersMustBeNull)
+        }
+    }
+}
+
+/// 事件交给产品前的回合/会话标识不变量错误。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KitProductEventValidationError {
+    /// turn 级 block 缺少标识，或 turn_id 与 submission_id 不相等。
+    TurnIdentifiersMustMatch,
+    /// session/process 级 Status 携带了不应存在的标识。
+    SessionIdentifiersMustBeNull,
+}
+
+/// 判断 Status 是否结束一个具体 turn。
+fn is_turn_terminal_status(code: &str) -> bool {
+    matches!(code, "turn_completed" | "cancelled" | "error")
+}
+
+/// 判断 Status 是否属于会话/进程而不关联具体 prompt。
+fn is_session_status(code: &str) -> bool {
+    matches!(
+        code,
+        "replay_complete" | "replay_skipped" | "mcp_failed" | "skipped_update"
+    )
+}
+
 /// `get_capability` 命令的 wire 形状。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GetCapabilityCommand {
@@ -570,10 +707,11 @@ impl Default for GetLlmChannelViewCommand {
 }
 
 /// `set_llm_channel` 命令的 wire 形状。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct SetLlmChannelCommand {
     cmd: String,
-    kind: LlmChannelKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kind: Option<LlmChannelKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -588,6 +726,27 @@ struct SetLlmChannelCommand {
     access_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     client_request_id: Option<String>,
+}
+
+impl fmt::Debug for SetLlmChannelCommand {
+    /// DTO 也可能被内部错误路径格式化，必须与公开命令一致地脱敏。
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SetLlmChannelCommand")
+            .field("cmd", &self.cmd)
+            .field("kind", &self.kind)
+            .field("base_url", &self.base_url)
+            .field("model_id", &self.model_id)
+            .field("relay_base_url", &self.relay_base_url)
+            .field("app_key", &self.app_key)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("client_request_id", &self.client_request_id)
+            .finish()
+    }
 }
 
 /// 未知命令的最小安全 wire 形状。

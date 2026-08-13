@@ -97,6 +97,8 @@ pub enum HostRejection {
     ForbiddenField(String, String),
     #[error("method {method}: unknown top-level field {field}")]
     UnknownField { method: String, field: String },
+    #[error("method {method}: unknown nested field {field}")]
+    UnknownNestedField { method: String, field: String },
     #[error("method {method}: field {field} has an invalid type")]
     InvalidFieldType { method: String, field: String },
     #[error("method {method}: missing required field {field}")]
@@ -174,65 +176,101 @@ fn validate_meta_field_type(method: &str, params: &Value) -> Result<(), HostReje
     Ok(())
 }
 
-/// `initialize`：terminal/fs capability 必须为 false；client mcpServers 为空。
+/// `initialize`：安全能力与 MCP 字段必须完整且精确，遗漏即 fail-closed。
 fn validate_initialize(params: &Value, policy: &HostPolicy) -> Result<(), HostRejection> {
     let method = "initialize";
 
-    // capabilities 必须是对象；terminal 与 fs 一旦出现必须是 false 布尔值。
-    if let Some(caps) = params.get("capabilities") {
-        let caps = caps
-            .as_object()
-            .ok_or_else(|| HostRejection::InvalidFieldType {
-                method: method.to_string(),
-                field: "capabilities".to_string(),
-            })?;
-        if let Some(terminal) = caps.get("terminal") {
-            match terminal.as_bool() {
-                Some(false) => {}
-                Some(true) => {
-                    return Err(HostRejection::TerminalCapabilityEnabled(method.to_string()));
-                }
-                None => {
-                    return Err(HostRejection::InvalidFieldType {
-                        method: method.to_string(),
-                        field: "capabilities.terminal".to_string(),
-                    });
-                }
-            }
-        }
-        if let Some(fs) = caps.get("fs") {
-            match fs.as_bool() {
-                Some(false) => {}
-                Some(true) => return Err(HostRejection::FsCapabilityEnabled(method.to_string())),
-                None => {
-                    return Err(HostRejection::InvalidFieldType {
-                        method: method.to_string(),
-                        field: "capabilities.fs".to_string(),
-                    });
-                }
-            }
-        }
-    }
+    // `capabilities` 是安全边界：必须存在、为对象，且只含 terminal/fs 两个显式关闭项。
+    // client 的标准 `name` 为描述性字段，除此和 `mcpServers` 外的嵌套键均拒绝。
+    let capabilities = params
+        .get("capabilities")
+        .ok_or_else(|| HostRejection::MissingRequiredField {
+            method: method.to_string(),
+            field: "capabilities".to_string(),
+        })?
+        .as_object()
+        .ok_or_else(|| HostRejection::InvalidFieldType {
+            method: method.to_string(),
+            field: "capabilities".to_string(),
+        })?;
+    validate_nested_fields(method, capabilities, "capabilities", &["terminal", "fs"])?;
+    validate_disabled_capability(method, capabilities, "terminal")?;
+    validate_disabled_capability(method, capabilities, "fs")?;
 
-    // client 必须是对象，且其 mcpServers 一旦出现必须为空数组。
-    if let Some(client) = params.get("client") {
-        let client = client
-            .as_object()
-            .ok_or_else(|| HostRejection::InvalidFieldType {
-                method: method.to_string(),
-                field: "client".to_string(),
-            })?;
-        if let Some(servers) = client.get("mcpServers")
-            && !servers.as_array().is_some_and(|arr| arr.is_empty())
-        {
-            return Err(HostRejection::ClientMcpServersNotAllowed(
-                method.to_string(),
-            ));
-        }
+    // `client` 是 MCP 注入边界：必须存在、为对象，且只允许固定空 server 数组。
+    let client = params
+        .get("client")
+        .ok_or_else(|| HostRejection::MissingRequiredField {
+            method: method.to_string(),
+            field: "client".to_string(),
+        })?
+        .as_object()
+        .ok_or_else(|| HostRejection::InvalidFieldType {
+            method: method.to_string(),
+            field: "client".to_string(),
+        })?;
+    validate_nested_fields(method, client, "client", &["name", "mcpServers"])?;
+    let servers = client
+        .get("mcpServers")
+        .ok_or_else(|| HostRejection::MissingRequiredField {
+            method: method.to_string(),
+            field: "client.mcpServers".to_string(),
+        })?;
+    if !servers.as_array().is_some_and(|array| array.is_empty()) {
+        return Err(HostRejection::ClientMcpServersNotAllowed(
+            method.to_string(),
+        ));
     }
 
     // _meta 白名单 + modelId 校验。
     validate_meta_and_model(method, params, policy)
+}
+
+/// 校验固定安全对象的嵌套白名单，防止未来新能力字段被静默透传。
+fn validate_nested_fields(
+    method: &str,
+    object: &serde_json::Map<String, Value>,
+    prefix: &str,
+    allowed_fields: &[&str],
+) -> Result<(), HostRejection> {
+    for field in object.keys() {
+        if !allowed_fields.contains(&field.as_str()) {
+            return Err(HostRejection::UnknownNestedField {
+                method: method.to_string(),
+                field: format!("{prefix}.{field}"),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// 校验 terminal/fs 必须存在且为 false；true 使用既有精确拒绝类型。
+fn validate_disabled_capability(
+    method: &str,
+    capabilities: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<(), HostRejection> {
+    let field = format!("capabilities.{name}");
+    let value = capabilities
+        .get(name)
+        .ok_or_else(|| HostRejection::MissingRequiredField {
+            method: method.to_string(),
+            field: field.clone(),
+        })?;
+
+    match value.as_bool() {
+        Some(false) => Ok(()),
+        Some(true) if name == "terminal" => {
+            Err(HostRejection::TerminalCapabilityEnabled(method.to_string()))
+        }
+        Some(true) if name == "fs" => Err(HostRejection::FsCapabilityEnabled(method.to_string())),
+        Some(true) => unreachable!("capability 白名单仅允许 terminal 或 fs"),
+        None => Err(HostRejection::InvalidFieldType {
+            method: method.to_string(),
+            field,
+        }),
+    }
 }
 
 /// `session/new` / `session/load`：cwd 精确匹配、mcpServers 空、_meta 合规。
@@ -267,10 +305,14 @@ fn validate_session_request(
         });
     }
 
-    // session 级 mcpServers 一旦出现必须为空数组。
-    if let Some(servers) = params.get("mcpServers")
-        && !servers.as_array().is_some_and(|arr| arr.is_empty())
-    {
+    // session 级 MCP 是同一安全边界：字段必须存在且精确为空数组，不能靠缺省透传。
+    let servers = params
+        .get("mcpServers")
+        .ok_or_else(|| HostRejection::MissingRequiredField {
+            method: method.to_string(),
+            field: "mcpServers".to_string(),
+        })?;
+    if !servers.as_array().is_some_and(|array| array.is_empty()) {
         return Err(HostRejection::ClientMcpServersNotAllowed(
             method.to_string(),
         ));
@@ -414,7 +456,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let p = policy_with(dir.path());
         let params = serde_json::json!({
-            "capabilities": { "terminal": true, "fs": false }
+            "capabilities": { "terminal": true, "fs": false },
+            "client": { "mcpServers": [] }
         });
         assert_eq!(
             validate_host_request("initialize", &params, &p),
@@ -429,7 +472,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let p = policy_with(dir.path());
         let params = serde_json::json!({
-            "capabilities": { "terminal": false, "fs": true }
+            "capabilities": { "terminal": false, "fs": true },
+            "client": { "mcpServers": [] }
         });
         assert_eq!(
             validate_host_request("initialize", &params, &p),
@@ -442,6 +486,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let p = policy_with(dir.path());
         let params = serde_json::json!({
+            "capabilities": { "terminal": false, "fs": false },
             "client": { "mcpServers": [{ "name": "evil" }] }
         });
         assert_eq!(
@@ -536,6 +581,7 @@ mod tests {
         let p = policy_with(dir.path());
         let params = serde_json::json!({
             "cwd": dir.path().to_str().unwrap(),
+            "mcpServers": [],
             "_meta": { "modelId": "grok-code-fast", "sneaky": 1 }
         });
         assert_eq!(
@@ -553,6 +599,7 @@ mod tests {
         let p = policy_with(dir.path());
         let params = serde_json::json!({
             "cwd": dir.path().to_str().unwrap(),
+            "mcpServers": [],
             "_meta": { "modelId": "grok-code-evil" }
         });
         assert_eq!(
@@ -629,7 +676,10 @@ mod tests {
             (
                 "capabilities 非对象",
                 "initialize",
-                serde_json::json!({ "capabilities": [] }),
+                serde_json::json!({
+                    "capabilities": [],
+                    "client": { "mcpServers": [] }
+                }),
                 HostRejection::InvalidFieldType {
                     method: "initialize".into(),
                     field: "capabilities".into(),
@@ -638,7 +688,10 @@ mod tests {
             (
                 "client 非对象",
                 "initialize",
-                serde_json::json!({ "client": "not-an-object" }),
+                serde_json::json!({
+                    "capabilities": { "terminal": false, "fs": false },
+                    "client": "not-an-object"
+                }),
                 HostRejection::InvalidFieldType {
                     method: "initialize".into(),
                     field: "client".into(),
@@ -647,7 +700,10 @@ mod tests {
             (
                 "terminal 为字符串 false",
                 "initialize",
-                serde_json::json!({ "capabilities": { "terminal": "false" } }),
+                serde_json::json!({
+                    "capabilities": { "terminal": "false", "fs": false },
+                    "client": { "mcpServers": [] }
+                }),
                 HostRejection::InvalidFieldType {
                     method: "initialize".into(),
                     field: "capabilities.terminal".into(),
@@ -656,7 +712,10 @@ mod tests {
             (
                 "fs 为数字 0",
                 "initialize",
-                serde_json::json!({ "capabilities": { "fs": 0 } }),
+                serde_json::json!({
+                    "capabilities": { "terminal": false, "fs": 0 },
+                    "client": { "mcpServers": [] }
+                }),
                 HostRejection::InvalidFieldType {
                     method: "initialize".into(),
                     field: "capabilities.fs".into(),
@@ -674,7 +733,11 @@ mod tests {
             (
                 "_meta 为标量",
                 "initialize",
-                serde_json::json!({ "_meta": "invalid" }),
+                serde_json::json!({
+                    "capabilities": { "terminal": false, "fs": false },
+                    "client": { "mcpServers": [] },
+                    "_meta": "invalid"
+                }),
                 HostRejection::ForbiddenField("initialize".into(), "_meta".into()),
             ),
             (

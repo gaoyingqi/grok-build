@@ -52,14 +52,14 @@ impl HostApp for FakeApp {
     }
 }
 
-/// 内存事件 sink；本任务不发射事件，但保留端口的真实构造路径。
+/// 内存事件 sink；用于验证 Host 出站边界只向产品运输合法事件。
 #[derive(Default)]
 struct MemorySink {
     events: Mutex<Vec<KitProductEvent>>,
 }
 
 impl KitEventSink for MemorySink {
-    fn emit(&self, ev: KitProductEvent) -> Result<()> {
+    fn emit_to_product(&self, ev: KitProductEvent) -> Result<()> {
         self.events.lock().expect("事件锁必须可用").push(ev);
         Ok(())
     }
@@ -377,6 +377,32 @@ fn kit_product_event_validate_allows_session_status_with_null_ids() {
     event
         .validate()
         .expect("session/process Status 的 null turn/submission 必须通过 Host 出站校验");
+}
+
+/// 入站 serde 保持宽容，但统一 emit 边界必须在产品运输前拒绝非法回合标识。
+#[test]
+fn kit_event_sink_rejects_invalid_inbound_event_before_transport() {
+    let event: KitProductEvent = serde_json::from_value(serde_json::json!({
+        "schema_version": 1,
+        "scope_id": "scope",
+        "session_id": "session",
+        "turn_id": "turn",
+        "submission_id": "different-submission",
+        "event_id": "event",
+        "sequence": 0,
+        "origin": "live",
+        "block_id": "block",
+        "block": { "kind": "user", "text": "hello" }
+    }))
+    .expect("入站 serde 不得因异常标识失败");
+    let sink = MemorySink::default();
+
+    sink.emit(event)
+        .expect_err("非法事件必须在 emit 边界被拒绝");
+    assert!(
+        sink.events.lock().expect("事件锁必须可用").is_empty(),
+        "被拒绝的事件不得进入产品运输"
+    );
 }
 
 /// 同一 key 与同一稳定指纹应回同一 turn，且第二次标记 duplicate。

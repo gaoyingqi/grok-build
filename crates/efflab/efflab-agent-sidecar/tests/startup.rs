@@ -12,7 +12,9 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use common::acp_client::AcpClient;
-use common::process::{SIDECAR_BIN, SidecarProcess, apply_isolated_env};
+use common::process::{
+    SIDECAR_BIN, SidecarProcess, apply_isolated_env, write_host_authoritative_config,
+};
 
 /// 启动策略拒绝与锁竞争流程的最大等待时间。
 ///
@@ -273,6 +275,7 @@ fn private_home_lock_rejects_competition_and_releases_after_clean_exit() {
     let session_cwd = temporary.path().join("session");
     fs::create_dir(&session_cwd).expect("创建 session cwd");
     let grok_home = temporary.path().join("home");
+    write_host_authoritative_config(&grok_home, None);
 
     // A 保持 stdin 打开，确保 stdio agent 不会因 EOF 而释放私有 home 锁。
     let mut process_a = SidecarProcess::spawn(&grok_home, &session_cwd, &[], &[]);
@@ -361,4 +364,54 @@ fn private_home_lock_rejects_competition_and_releases_after_clean_exit() {
         "C 正常 EOF 应退出码 0，实际 {status_c:?}；stderr={}",
         process_c.stderr_text()
     );
+}
+
+#[test]
+fn missing_or_invalid_authoritative_config_is_rejected_without_overwrite() {
+    let _test_lock = startup_test_lock();
+    let temporary = tempfile::tempdir().expect("创建临时目录");
+    let session_cwd = temporary.path().join("session");
+    let grok_home = temporary.path().join("home");
+    let config_path = grok_home.join("config.toml");
+    fs::create_dir(&session_cwd).expect("创建 session cwd");
+    let args = vec![
+        "--grok-home".to_string(),
+        grok_home.display().to_string(),
+        "--session-cwd".to_string(),
+        session_cwd.display().to_string(),
+    ];
+
+    // 缺文件时 sidecar 必须退出 2，且不能借启动路径补写 config.toml。
+    let (status, stdout, stderr) = wait_rejected(rejected_command(temporary.path(), &args));
+    assert_startup_rejected(status, &stdout, &stderr, "校验 Host 权威 config");
+    assert!(
+        !config_path.exists(),
+        "缺失权威配置时 sidecar 不得创建或覆盖 config.toml"
+    );
+
+    let valid = write_host_authoritative_config(&grok_home, None);
+    let invalid_cases = [
+        (
+            "非法 models.default",
+            valid.replacen("default = \"byok\"", "default = \"other\"", 1),
+        ),
+        (
+            "零 TTL",
+            valid.replacen("cleanup_ttl_days = 36500", "cleanup_ttl_days = 0", 1),
+        ),
+        (
+            "允许 .envrc",
+            valid.replacen("load_envrc = false", "load_envrc = true", 1),
+        ),
+    ];
+    for (case_name, invalid) in invalid_cases {
+        fs::write(&config_path, &invalid).expect("写入篡改的 Host 配置应成功");
+        let (status, stdout, stderr) = wait_rejected(rejected_command(temporary.path(), &args));
+        assert_startup_rejected(status, &stdout, &stderr, "校验 Host 权威 config");
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("读取篡改配置应成功"),
+            invalid,
+            "{case_name} 必须被拒绝且 sidecar 不得覆写 Host 文件"
+        );
+    }
 }

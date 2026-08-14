@@ -14,14 +14,15 @@
 
 mod common;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use common::acp_client::AcpClient;
-use common::process::SidecarProcess;
+use common::process::{SidecarProcess, write_host_authoritative_config};
+use efflab_agent_contract::{ApprovedMcpConfig, McpServerSpec};
 use efflab_agent_sidecar::host_contract::{HostPolicy, HostRejection, validate_host_request};
 use serde_json::Value;
 
@@ -46,6 +47,7 @@ fn spawn_base() -> TestEnv {
     let session_cwd = dir.path().join("cwd");
     fs::create_dir_all(&session_cwd).expect("创建 session cwd");
     let grok_home = dir.path().join("home");
+    write_host_authoritative_config(&grok_home, None);
 
     let proc = SidecarProcess::spawn(&grok_home, &session_cwd, &[], &[]);
     TestEnv {
@@ -74,6 +76,18 @@ fn spawn_with_fixture_mcp(server_name: &str, fixture_name: &str) -> TestEnv {
     permissions.set_mode(0o755);
     fs::set_permissions(&fixture_dst, permissions).expect("设置 MCP fixture 可执行");
 
+    // 模拟 Host 仅把已批准的 MCP 规格写入权威配置；sidecar 只读取并校验。
+    let host_mcp = ApprovedMcpConfig {
+        servers: BTreeMap::from([(
+            server_name.to_string(),
+            McpServerSpec::Stdio {
+                command: fixture_dst.clone(),
+                args: Vec::new(),
+            },
+        )]),
+    };
+    write_host_authoritative_config(&grok_home, Some(&host_mcp));
+
     let command = toml::Value::String(fixture_dst.display().to_string());
     let mcp_toml = format!("[mcp_servers.{server_name}]\ncommand = {command}\n");
     let mcp_config_path = dir.path().join("mcp.toml");
@@ -98,6 +112,15 @@ fn spawn_with_http_mcp(server_name: &str, url: &str) -> TestEnv {
     let session_cwd = dir.path().join("cwd");
     fs::create_dir_all(&session_cwd).expect("创建 session cwd");
     let grok_home = dir.path().join("home");
+    let host_mcp = ApprovedMcpConfig {
+        servers: BTreeMap::from([(
+            server_name.to_string(),
+            McpServerSpec::Http {
+                url: url.to_string(),
+            },
+        )]),
+    };
+    write_host_authoritative_config(&grok_home, Some(&host_mcp));
 
     let url = toml::Value::String(url.to_string());
     let mcp_toml = format!("[mcp_servers.{server_name}]\nurl = {url}\n");
@@ -117,8 +140,13 @@ fn spawn_with_http_mcp(server_name: &str, url: &str) -> TestEnv {
 
 /// 连接 ACP 客户端并完成 initialize。
 fn connect_initialize(env: &mut TestEnv) -> AcpClient {
-    let stdin = env.proc.take_stdin();
-    let stdout = env.proc.stdout_reader().into_inner();
+    connect_initialize_process(&mut env.proc)
+}
+
+/// 对不需要转移临时目录所有权的进程完成 initialize，供冷启动测试复用。
+fn connect_initialize_process(process: &mut SidecarProcess) -> AcpClient {
+    let stdin = process.take_stdin();
+    let stdout = process.stdout_reader().into_inner();
     let mut client = AcpClient::new(stdin, stdout);
     let resp = client
         .request(
@@ -153,6 +181,21 @@ fn create_session(client: &mut AcpClient, session_cwd: &Path) -> Value {
         "session/new 必须返回字符串 sessionId: {resp}"
     );
     resp
+}
+
+/// 通过冷启动进程重新加载已持久化会话，覆盖 session/load 的 .envrc 路径。
+fn load_session(client: &mut AcpClient, session_cwd: &Path, session_id: &str) -> Value {
+    client
+        .request(
+            "session/load",
+            serde_json::json!({
+                "sessionId": session_id,
+                "cwd": session_cwd,
+                "mcpServers": []
+            }),
+            REQ_TIMEOUT,
+        )
+        .expect("session/load 必须成功")
 }
 
 /// 从 session/new 响应中提取必需的 sessionId。
@@ -354,6 +397,100 @@ fn initialize_and_session_new_succeed() {
 }
 
 #[test]
+fn sidecar_validates_host_written_config_without_overwrite() {
+    let dir = tempfile::TempDir::new().expect("创建测试临时目录");
+    let session_cwd = dir.path().join("cwd");
+    let grok_home = dir.path().join("home");
+    fs::create_dir_all(&session_cwd).expect("创建 session cwd");
+
+    // Host 写入格式化标记；sidecar 只能校验该文件，不能用自己的渲染结果覆盖它。
+    let rendered = write_host_authoritative_config(&grok_home, None);
+    let host_owned = format!("# host-owner-marker\n{rendered}");
+    let config_path = grok_home.join("config.toml");
+    fs::write(&config_path, &host_owned).expect("写入带 Host 标记的配置应成功");
+
+    let mut env = TestEnv {
+        proc: SidecarProcess::spawn(&grok_home, &session_cwd, &[], &[]),
+        dir,
+        session_cwd,
+    };
+    let mut client = connect_initialize(&mut env);
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("读取 Host 配置应成功"),
+        host_owned,
+        "sidecar 只能校验 Host 写入的 config.toml，不能覆写"
+    );
+    assert_clean_eof_exit(&mut env, &mut client, "Host 写入配置只校验路径");
+}
+
+#[test]
+fn session_new_and_cold_load_do_not_execute_workspace_envrc() {
+    let dir = tempfile::TempDir::new().expect("创建测试临时目录");
+    let session_cwd = dir.path().join("cwd");
+    let grok_home = dir.path().join("home");
+    let marker = dir.path().join("envrc-executed");
+    fs::create_dir_all(&session_cwd).expect("创建 session cwd");
+    fs::write(
+        session_cwd.join(".envrc"),
+        "touch \"$EFFLAB_ENVRC_MARKER\"\n",
+    )
+    .expect("写入带标记的 .envrc 应成功");
+    write_host_authoritative_config(&grok_home, None);
+    let marker_env = vec![(
+        "EFFLAB_ENVRC_MARKER".to_string(),
+        marker.display().to_string(),
+    )];
+
+    // 首进程的 session/new 必须因 [session].load_envrc=false 跳过 .envrc。
+    let session_id = {
+        let mut process = SidecarProcess::spawn(&grok_home, &session_cwd, &[], &marker_env);
+        let mut client = connect_initialize_process(&mut process);
+        let response = create_session(&mut client, &session_cwd);
+        let created_session_id = session_id(&response);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !marker.exists(),
+            "session/new 不得执行 workspace .envrc: {}",
+            marker.display()
+        );
+        client.close_stdin();
+        let status = process
+            .wait_timeout(EOF_EXIT_TIMEOUT)
+            .expect("session/new 进程必须在 EOF 后退出");
+        assert!(
+            status.success(),
+            "禁止 .envrc 的 session/new 路径必须正常退出: {status:?}; stderr: {}",
+            process.stderr_text()
+        );
+        created_session_id
+    };
+
+    // 重新启动同一 home，确保 session/load 是冷路径而不是进程内复用。
+    let mut process = SidecarProcess::spawn(&grok_home, &session_cwd, &[], &marker_env);
+    let mut client = connect_initialize_process(&mut process);
+    let response = load_session(&mut client, &session_cwd, &session_id);
+    assert!(
+        response.get("result").is_some(),
+        "冷 session/load 必须成功: {response}"
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !marker.exists(),
+        "冷 session/load 不得执行 workspace .envrc: {}",
+        marker.display()
+    );
+    client.close_stdin();
+    let status = process
+        .wait_timeout(EOF_EXIT_TIMEOUT)
+        .expect("冷 session/load 进程必须在 EOF 后退出");
+    assert!(
+        status.success(),
+        "禁止 .envrc 的冷 session/load 路径必须正常退出: {status:?}; stderr: {}",
+        process.stderr_text()
+    );
+}
+
+#[test]
 fn mcp_list_empty_without_config() {
     let mut env = spawn_base();
     let mut client = connect_initialize(&mut env);
@@ -420,6 +557,7 @@ fn malicious_env_cannot_reopen_capabilities() {
     let session_cwd = dir.path().join("cwd");
     fs::create_dir_all(&session_cwd).expect("创建 session cwd");
     let grok_home = dir.path().join("home");
+    write_host_authoritative_config(&grok_home, None);
     let malicious_env = vec![
         ("GROK_CURSOR_MCPS_ENABLED".to_string(), "true".to_string()),
         ("GROK_CURSOR_HOOKS_ENABLED".to_string(), "true".to_string()),
@@ -459,6 +597,7 @@ fn all_malicious_env_cannot_reopen_capabilities() {
     let session_cwd = dir.path().join("cwd");
     fs::create_dir_all(&session_cwd).expect("创建 session cwd");
     let grok_home = dir.path().join("home");
+    write_host_authoritative_config(&grok_home, None);
     let malicious_env = all_malicious_environment();
     assert_eq!(
         malicious_env.len(),
@@ -686,6 +825,7 @@ fn drop_cleanup_releases_home_lock_for_next_sidecar() {
     let session_cwd = dir.path().join("cwd");
     fs::create_dir_all(&session_cwd).expect("创建 session cwd");
     let grok_home = dir.path().join("home");
+    write_host_authoritative_config(&grok_home, None);
     let mut first_env = TestEnv {
         proc: SidecarProcess::spawn(&grok_home, &session_cwd, &[], &[]),
         dir,

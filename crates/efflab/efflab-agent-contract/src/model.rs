@@ -7,7 +7,7 @@ pub struct SidecarModelSpec {
     pub model: String,
     /// sidecar 应连接的受控基础 URL。
     pub base_url: String,
-    /// 配置表名。
+    /// 模型展示名；当前权威合同固定为 `BYOK`。
     pub name: String,
     /// 固定的 API 后端标识。
     pub api_backend: String,

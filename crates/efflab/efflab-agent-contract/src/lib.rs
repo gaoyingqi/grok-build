@@ -11,4 +11,4 @@ pub mod render;
 pub use host_contract::{HostPolicy, HostRejection, validate_host_request};
 pub use mcp_config::{ApprovedMcpConfig, McpServerSpec};
 pub use model::SidecarModelSpec;
-pub use render::render_authoritative_config;
+pub use render::{render_authoritative_config, validate_authoritative_config};

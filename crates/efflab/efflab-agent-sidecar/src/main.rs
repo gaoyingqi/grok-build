@@ -5,7 +5,7 @@
 //! 启动顺序（不可颠倒，硬性约束）：
 //! 1. CLI 解析与全部校验（`SidecarConfig::from_cli`，含 MCP 审核）。
 //! 2. 私有 GROK_HOME 准备 + fs2 独占锁（同 home 并发 fail-closed）。
-//! 3. 物化默认 AgentDefinition + 渲染权威 config → 原子写 `config.toml`。
+//! 3. 物化默认 AgentDefinition + 只读校验 Host 已写入的权威 `config.toml`。
 //! 4. env 卫生：清 OTEL / compat / subagent / storage / managed-MCP 环境变量。
 //! 5. 设最终 `GROK_HOME` / `GROK_AGENT`（必须早于任何 shell API 的 OnceLock）。
 //! 6. `set_current_dir(session_cwd)`（进程 cwd 隔离）。
@@ -18,7 +18,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::Context;
-use efflab_agent_contract::render_authoritative_config;
+use efflab_agent_contract::validate_authoritative_config;
 use efflab_agent_sidecar::hardening;
 use efflab_agent_sidecar::sidecar_config::SidecarConfig;
 use efflab_agent_sidecar::toolset::register_efflab_tool_pack;
@@ -51,7 +51,7 @@ fn main() -> ExitCode {
         }
     };
 
-    // === 阶段 3：物化 AgentDefinition + 权威 config 原子落盘 ===
+    // === 阶段 3：物化 AgentDefinition + 只读校验 Host 权威 config ===
     let agent_def_path = match hardening::materialize_agent_definition(&sidecar.grok_home) {
         Ok(path) => path,
         Err(err) => {
@@ -59,20 +59,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let config_toml = match render_authoritative_config(
-        &sidecar.grok_home,
-        &agent_def_path,
-        Some(&sidecar.mcp_config),
-    ) {
-        Ok(text) => text,
-        Err(err) => {
-            eprintln!("efflab-agent-sidecar: 启动策略拒绝: 渲染权威 config: {err:#}");
-            return ExitCode::from(2);
-        }
-    };
+    // Host 是 config.toml 的唯一写盘 owner；sidecar 只校验，绝不补写或覆盖。
     let config_path = sidecar.grok_home.join("config.toml");
-    if let Err(err) = hardening::atomic_write_private(&config_path, config_toml.as_bytes()) {
-        eprintln!("efflab-agent-sidecar: 启动策略拒绝: 写 config.toml: {err:#}");
+    if let Err(err) = validate_authoritative_config(&config_path, &agent_def_path) {
+        eprintln!("efflab-agent-sidecar: 启动策略拒绝: 校验 Host 权威 config: {err:#}");
         return ExitCode::from(2);
     }
 
@@ -185,7 +175,7 @@ async fn run(sidecar: SidecarConfig) -> anyhow::Result<()> {
 }
 
 /// 每项硬化断言的固定错误上下文；运行时与纯校验测试共用，避免二者漂移。
-const HARDENED_CHECK_MESSAGES: [&str; 7] = [
+const HARDENED_CHECK_MESSAGES: [&str; 8] = [
     "resolve_remote_fetch_enabled() 必须为 false（私有 GROK_HOME config.toml 需含 [features] remote_fetch=false）",
     "storage_mode 必须为 Local",
     "subagents_enabled 必须为 false",
@@ -193,6 +183,7 @@ const HARDENED_CHECK_MESSAGES: [&str; 7] = [
     "memory_config 必须为 None",
     "disable_web_search 必须为 true",
     "agent_profile_path 必须指向物化 AgentDefinition",
+    "session.load_envrc 必须为 Some(false)",
 ];
 
 /// 硬化断言（P1.4）：resolve 后逐项核对安全字段，任何一项失败即启动失败。
@@ -203,7 +194,7 @@ fn assert_hardened(
     assert_hardened_conditions(hardened_check_conditions(config, agent_def_path))
 }
 
-/// 从运行时配置计算七项已判定的硬化条件。
+/// 从运行时配置计算八项已判定的硬化条件。
 ///
 /// 将条件计算与失败传播分离，使测试可在不构造上游复杂 `Config` 的情况下，
 /// 逐项验证 fail-closed 错误边界。
@@ -239,6 +230,11 @@ fn hardened_check_conditions(
         (
             HARDENED_CHECK_MESSAGES[6],
             agent_profile_path_matches(config.agent_profile_path.as_deref(), agent_def_path),
+        ),
+        // 8) 不执行 workspace .envrc，避免会话创建或冷加载触发项目脚本。
+        (
+            HARDENED_CHECK_MESSAGES[7],
+            config.session.load_envrc == Some(false),
         ),
     ]
 }
@@ -286,7 +282,7 @@ mod tests {
         }
     }
 
-    /// 七项条件均满足时，纯错误传播边界必须允许继续运行。
+    /// 八项条件均满足时，纯错误传播边界必须允许继续运行。
     #[test]
     fn all_hardening_conditions_true_is_ok() {
         let conditions = HARDENED_CHECK_MESSAGES

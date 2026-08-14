@@ -362,7 +362,9 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
-    use efflab_agent_contract::{ApprovedMcpConfig, McpServerSpec, render_authoritative_config};
+    use efflab_agent_contract::{
+        ApprovedMcpConfig, McpServerSpec, SidecarModelSpec, render_authoritative_config,
+    };
 
     use super::*;
 
@@ -372,6 +374,17 @@ mod tests {
     const COMPAT_VENDORS: [&str; 3] = ["claude", "cursor", "codex"];
     /// compat 全量显式关闭的 surface 集合。
     const COMPAT_SURFACES: [&str; 6] = ["skills", "rules", "agents", "mcps", "hooks", "sessions"];
+
+    /// 构造 Host 写盘测试所需的唯一 BYOK 模型，避免测试引入用户凭据。
+    fn byok_model() -> SidecarModelSpec {
+        SidecarModelSpec {
+            model: "efflab-test-model".to_string(),
+            base_url: "http://127.0.0.1:43123/v1".to_string(),
+            name: "BYOK".to_string(),
+            api_backend: "chat_completions".to_string(),
+            env_key: "EFFLAB_L3B_BIND".to_string(),
+        }
+    }
 
     /// 本 crate 的环境变量测试共享同一把锁，避免相互污染进程全局状态。
     static ENVIRONMENT_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -823,9 +836,13 @@ mod tests {
             ]),
         };
 
-        let rendered =
-            render_authoritative_config(&grok_home, &agent_definition, Some(&approved_mcp))
-                .expect("渲染权威配置应成功");
+        let rendered = render_authoritative_config(
+            &grok_home,
+            &agent_definition,
+            Some(&approved_mcp),
+            &[byok_model()],
+        )
+        .expect("渲染权威配置应成功");
         let parsed: toml::Value = toml::from_str(&rendered).expect("渲染结果必须是合法 TOML");
 
         assert_eq!(
@@ -887,6 +904,32 @@ mod tests {
             value_at(&parsed, &["mcp_servers", "local-http", "url"]).and_then(toml::Value::as_str),
             Some("http://127.0.0.1:43123/mcp")
         );
+        assert_eq!(
+            value_at(&parsed, &["models", "default"]).and_then(toml::Value::as_str),
+            Some("byok")
+        );
+        assert_eq!(
+            value_at(&parsed, &["model", "byok", "api_backend"]).and_then(toml::Value::as_str),
+            Some("chat_completions")
+        );
+        assert_eq!(
+            value_at(&parsed, &["model", "byok", "env_key"]).and_then(toml::Value::as_str),
+            Some("EFFLAB_L3B_BIND")
+        );
+        assert_eq!(
+            value_at(&parsed, &["storage", "cleanup_ttl_days"]).and_then(toml::Value::as_integer),
+            Some(36500)
+        );
+        assert_eq!(
+            value_at(&parsed, &["session", "load_envrc"]).and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            value_at(&parsed, &["marketplace", "default_skills_installs_purged"],)
+                .and_then(toml::Value::as_bool),
+            Some(true),
+            "必须预置上游迁移标记，避免运行时改写 Host 配置"
+        );
 
         let actual_top_level_keys: BTreeSet<_> = parsed
             .as_table()
@@ -903,6 +946,11 @@ mod tests {
             "skills".to_string(),
             "agent".to_string(),
             "mcp_servers".to_string(),
+            "models".to_string(),
+            "model".to_string(),
+            "storage".to_string(),
+            "session".to_string(),
+            "marketplace".to_string(),
         ]);
         assert_eq!(
             actual_top_level_keys, expected_top_level_keys,
@@ -936,7 +984,7 @@ mod tests {
         };
 
         let rendered =
-            render_authoritative_config(&grok_home, &agent_definition, Some(&approved_mcp))
+            render_authoritative_config(&grok_home, &agent_definition, Some(&approved_mcp), &[])
                 .expect("渲染含 $ 的权威配置应成功");
         assert!(
             rendered.contains("/tmp/$$HOME/mcp"),
@@ -1027,7 +1075,7 @@ mod tests {
         };
 
         let rendered =
-            render_authoritative_config(&grok_home, &agent_definition, Some(&approved_mcp))
+            render_authoritative_config(&grok_home, &agent_definition, Some(&approved_mcp), &[])
                 .expect("渲染含引号和换行的权威配置应成功");
         let parsed: toml::Value = toml::from_str(&rendered).expect("转义后的配置必须是合法 TOML");
         assert_eq!(
@@ -1070,7 +1118,7 @@ mod tests {
         };
 
         let rendered =
-            render_authoritative_config(&grok_home, &agent_definition, Some(&approved_mcp))
+            render_authoritative_config(&grok_home, &agent_definition, Some(&approved_mcp), &[])
                 .expect("渲染含特殊 MCP 名称的配置应成功");
         let parsed: toml::Value =
             toml::from_str(&rendered).expect("特殊 MCP 名称必须生成合法 TOML");
@@ -1103,8 +1151,9 @@ mod tests {
             )]),
         };
 
-        let error = render_authoritative_config(&grok_home, &agent_definition, Some(&approved_mcp))
-            .expect_err("空 MCP 名称必须被拒绝");
+        let error =
+            render_authoritative_config(&grok_home, &agent_definition, Some(&approved_mcp), &[])
+                .expect_err("空 MCP 名称必须被拒绝");
 
         assert!(
             error.to_string().contains("受控 MCP server 名称不能为空"),
@@ -1129,8 +1178,9 @@ mod tests {
             )]),
         };
 
-        let error = render_authoritative_config(&grok_home, &agent_definition, Some(&approved_mcp))
-            .expect_err("相对 stdio command 必须被拒绝");
+        let error =
+            render_authoritative_config(&grok_home, &agent_definition, Some(&approved_mcp), &[])
+                .expect_err("相对 stdio command 必须被拒绝");
 
         assert!(
             error
@@ -1156,8 +1206,9 @@ mod tests {
             )]),
         };
 
-        let error = render_authoritative_config(&grok_home, &agent_definition, Some(&approved_mcp))
-            .expect_err("空 HTTP url 必须被拒绝");
+        let error =
+            render_authoritative_config(&grok_home, &agent_definition, Some(&approved_mcp), &[])
+                .expect_err("空 HTTP url 必须被拒绝");
 
         assert!(
             error
@@ -1178,7 +1229,7 @@ mod tests {
         let non_utf8_agent_definition =
             PathBuf::from(OsString::from_vec(b"/tmp/agent-\xFF.md".to_vec()));
 
-        let error = render_authoritative_config(&grok_home, &non_utf8_agent_definition, None)
+        let error = render_authoritative_config(&grok_home, &non_utf8_agent_definition, None, &[])
             .expect_err("非 UTF-8 AgentDefinition 路径必须被拒绝");
 
         assert!(

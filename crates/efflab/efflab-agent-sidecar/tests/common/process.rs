@@ -8,24 +8,28 @@
 
 #![allow(clippy::zombie_processes)]
 
+use std::fs;
 use std::io::{BufReader, Read};
+use std::path::Path;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use efflab_agent_contract::{ApprovedMcpConfig, SidecarModelSpec, render_authoritative_config};
+
 /// 二进制路径：由 cargo 在编译期注入（仅对 integration test target 生效）。
 pub const SIDECAR_BIN: &str = env!("CARGO_BIN_EXE_efflab-agent-sidecar");
 
-/// 测试用的 BYOK 假 key（P3 链路不依赖真实模型调用；仅证明启动/握手不触网）。
-pub const FAKE_XAI_API_KEY: &str = "efflab-test-fake-key";
+/// 测试用的 Host 回环绑定令牌（P3 链路不依赖真实模型调用）。
+pub const FAKE_L3B_BIND: &str = "efflab-test-l3b-bind";
 /// 优雅终止 sidecar 的最长等待时间，超时后升级为强制杀死。
 const TERMINATE_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 /// 返回经过显式白名单筛选的子进程环境。
 ///
 /// 调用方必须先执行 `Command::env_clear()`；这里仅保留 sidecar 运行所需的平台
-/// 变量及假 BYOK key，绝不继承调用测试进程中未登记的父环境。
+/// 变量及 Host 回环绑定令牌，绝不继承调用测试进程中未登记的父环境。
 pub fn isolated_env() -> Vec<(String, String)> {
     let mut env = Vec::new();
     for key in platform_environment_allowlist() {
@@ -33,8 +37,28 @@ pub fn isolated_env() -> Vec<(String, String)> {
             env.push((key.to_string(), value.to_string_lossy().into_owned()));
         }
     }
-    env.push(("XAI_API_KEY".to_string(), FAKE_XAI_API_KEY.to_string()));
+    env.push(("EFFLAB_L3B_BIND".to_string(), FAKE_L3B_BIND.to_string()));
     env
+}
+
+/// 模拟 Host 在 spawn 前写入完整权威配置；sidecar 测试绝不依赖其自行落盘。
+pub fn write_host_authoritative_config(
+    grok_home: &Path,
+    mcp: Option<&ApprovedMcpConfig>,
+) -> String {
+    fs::create_dir_all(grok_home).expect("创建模拟 Host 私有 home 应成功");
+    let agent_definition = grok_home.join("agents").join("efflab-default.md");
+    let model = SidecarModelSpec {
+        model: "efflab-test-model".to_string(),
+        base_url: "http://127.0.0.1:43123/v1".to_string(),
+        name: "BYOK".to_string(),
+        api_backend: "chat_completions".to_string(),
+        env_key: "EFFLAB_L3B_BIND".to_string(),
+    };
+    let rendered = render_authoritative_config(grok_home, &agent_definition, mcp, &[model])
+        .expect("模拟 Host 渲染权威配置应成功");
+    fs::write(grok_home.join("config.toml"), &rendered).expect("模拟 Host 写入权威配置应成功");
+    rendered
 }
 
 /// 返回各平台 `env_clear` 后仍可能被动态链接器或运行时需要的变量白名单。

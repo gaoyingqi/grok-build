@@ -3,10 +3,11 @@
 //! 里程碑：macOS isolated runtime integration POC。
 //!
 //! 启动顺序（不可颠倒，硬性约束）：
-//! 1. CLI 解析与全部校验（`SidecarConfig::from_cli`，含 MCP 审核）。
-//! 2. 私有 GROK_HOME 准备 + fs2 独占锁（同 home 并发 fail-closed）。
-//! 3. 物化默认 AgentDefinition + 只读校验 Host 已写入的权威 `config.toml`。
-//! 4. env 卫生：清 OTEL / compat / subagent / storage / managed-MCP 环境变量。
+//! 1. env 卫生：清 first-party 用户凭据、OTEL / compat / subagent / storage / managed-MCP
+//!    环境变量；配置可读取的唯一 L3b 绑定令牌为 `EFFLAB_L3B_BIND`。
+//! 2. CLI 解析与全部校验（`SidecarConfig::from_cli`，含 MCP 审核）。
+//! 3. 私有 GROK_HOME 准备 + fs2 独占锁（同 home 并发 fail-closed）。
+//! 4. 物化默认 AgentDefinition + 只读校验 Host 已写入的权威 `config.toml`。
 //! 5. 设最终 `GROK_HOME` / `GROK_AGENT`（必须早于任何 shell API 的 OnceLock）。
 //! 6. `set_current_dir(session_cwd)`（进程 cwd 隔离）。
 //! 7. tracing 初始化（固定 stderr，stdout 仅承载 ACP JSON-RPC）。
@@ -27,7 +28,13 @@ use efflab_agent_sidecar::toolset::register_efflab_tool_pack;
 const AGENT_DEF_FILENAME: &str = "efflab-default.md";
 
 fn main() -> ExitCode {
-    // === 阶段 1：CLI 解析与全部校验（任何 env mutation / runtime 之前） ===
+    // === 阶段 1：先清用户凭据与策略变量，避免后续任意启动路径读取继承环境 ===
+    if let Err(err) = hardening::sanitize_env() {
+        eprintln!("efflab-agent-sidecar: 启动策略拒绝: env 卫生: {err:#}");
+        return ExitCode::from(2);
+    }
+
+    // === 阶段 2：CLI 解析与全部校验（任何 shell runtime 之前） ===
     let sidecar = match SidecarConfig::from_cli() {
         Ok(cfg) => cfg,
         Err(err) => {
@@ -42,7 +49,7 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    // === 阶段 2：私有 home 准备 + 独占锁（锁文件持有到进程退出） ===
+    // === 阶段 3：私有 home 准备 + 独占锁（锁文件持有到进程退出） ===
     let _home_lock = match hardening::acquire_home_lock(&sidecar.grok_home) {
         Ok(lock) => lock,
         Err(err) => {
@@ -51,7 +58,7 @@ fn main() -> ExitCode {
         }
     };
 
-    // === 阶段 3：物化 AgentDefinition + 只读校验 Host 权威 config ===
+    // === 阶段 4：物化 AgentDefinition + 只读校验 Host 权威 config ===
     let agent_def_path = match hardening::materialize_agent_definition(&sidecar.grok_home) {
         Ok(path) => path,
         Err(err) => {
@@ -66,12 +73,7 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    // === 阶段 4：env 卫生（清 OTEL / compat / subagent / storage / managed-MCP） ===
-    if let Err(err) = hardening::sanitize_env() {
-        eprintln!("efflab-agent-sidecar: 启动策略拒绝: env 卫生: {err:#}");
-        return ExitCode::from(2);
-    }
-    // 设最终 GROK_HOME / GROK_AGENT：必须在任何 shell API / OnceLock 前。
+    // === 阶段 5：设最终 GROK_HOME / GROK_AGENT，必须在任何 shell API / OnceLock 前 ===
     if let Err(err) = hardening::set_grok_home(&sidecar.grok_home) {
         eprintln!("efflab-agent-sidecar: 启动策略拒绝: GROK_HOME: {err:#}");
         return ExitCode::from(2);
@@ -81,7 +83,7 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    // === 阶段 5：进程 cwd 隔离 ===
+    // === 阶段 6：进程 cwd 隔离 ===
     if let Err(err) = std::env::set_current_dir(&sidecar.session_cwd) {
         eprintln!(
             "efflab-agent-sidecar: 启动策略拒绝: set_current_dir({}): {err:#}",
@@ -90,13 +92,13 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    // === 阶段 6：tracing（固定 stderr；stdout 仅承载 ACP JSON-RPC） ===
+    // === 阶段 7：tracing（固定 stderr；stdout 仅承载 ACP JSON-RPC） ===
     if let Err(err) = init_tracing() {
         eprintln!("efflab-agent-sidecar: 启动策略拒绝: init_tracing: {err:#}");
         return ExitCode::from(2);
     }
 
-    // === 阶段 7：Tokio runtime + 异步主流程 ===
+    // === 阶段 8：Tokio runtime + 异步主流程 ===
     // current-thread 初选（devplan §5-3 待实现时验证；P3 集成测试核实）。
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()

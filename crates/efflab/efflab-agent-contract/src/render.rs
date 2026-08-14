@@ -1,7 +1,8 @@
-//! sidecar 权威 TOML 的纯渲染函数。
+//! sidecar 权威 TOML 的渲染与只读校验。
 //!
-//! 文件系统原子写与 sidecar 启动仍各自留在运行时 crate；这里仅保留 Host 和
-//! sidecar 均可复用的、无 grok-shell 依赖的确定性文本渲染。
+//! 文件系统原子写与 sidecar 启动仍各自留在运行时 crate；这里保留 Host 和 sidecar
+//! 均可复用的、无 grok-shell 依赖的确定性文本渲染，以及读取 Host 已写入文件的
+//! fail-closed 校验。校验函数绝不修复、合并或覆盖配置。
 
 use std::fs;
 use std::path::Path;
@@ -527,12 +528,13 @@ fn toml_string_array_literal(values: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
 
     use tempfile::tempdir;
 
     use super::{render_authoritative_config, validate_authoritative_config};
-    use crate::SidecarModelSpec;
+    use crate::{ApprovedMcpConfig, McpServerSpec, SidecarModelSpec};
 
     /// 构造 Host 写入配置时使用的唯一 BYOK 模型，不携带用户上游凭据。
     fn byok_model() -> SidecarModelSpec {
@@ -592,6 +594,57 @@ mod tests {
             assert!(
                 !rendered.contains(forbidden),
                 "权威配置不得包含 {forbidden:?}: {rendered}"
+            );
+        }
+    }
+
+    /// renderer 的每种受支持 MCP 形状都必须被只读 validator 接受，防止字段列表漂移。
+    #[test]
+    fn rendered_authoritative_configs_round_trip_through_validator() {
+        // 使用当前测试二进制的绝对路径，仅验证 stdio 字段合同而不实际启动它。
+        let test_binary = std::env::current_exe().expect("读取当前测试二进制路径应成功");
+        let cases = [
+            ("无 MCP", None),
+            (
+                "stdio MCP",
+                Some(ApprovedMcpConfig {
+                    servers: BTreeMap::from([(
+                        "local".to_string(),
+                        McpServerSpec::Stdio {
+                            command: test_binary,
+                            args: vec!["--sidecar".to_string()],
+                        },
+                    )]),
+                }),
+            ),
+            (
+                "回环 HTTP MCP",
+                Some(ApprovedMcpConfig {
+                    servers: BTreeMap::from([(
+                        "local".to_string(),
+                        McpServerSpec::Http {
+                            url: "http://127.0.0.1:43124/mcp".to_string(),
+                        },
+                    )]),
+                }),
+            ),
+        ];
+
+        for (case_name, mcp) in cases {
+            let (_temporary, grok_home, agent_definition) = authoritative_paths();
+            fs::create_dir_all(&grok_home).expect("创建 Host 私有 home 应成功");
+            let config_path = grok_home.join("config.toml");
+            let rendered = render_authoritative_config(
+                &grok_home,
+                &agent_definition,
+                mcp.as_ref(),
+                &[byok_model()],
+            )
+            .unwrap_or_else(|error| panic!("{case_name} 的权威配置应可渲染: {error:#}"));
+            fs::write(&config_path, rendered).expect("Host 写入权威配置应成功");
+
+            validate_authoritative_config(&config_path, &agent_definition).unwrap_or_else(
+                |error| panic!("{case_name} 的 renderer 输出必须通过 validator: {error:#}"),
             );
         }
     }

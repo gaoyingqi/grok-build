@@ -15,6 +15,7 @@ use common::acp_client::AcpClient;
 use common::process::{
     SIDECAR_BIN, SidecarProcess, apply_isolated_env, write_host_authoritative_config,
 };
+use efflab_agent_contract::render_authoritative_config;
 
 /// 启动策略拒绝与锁竞争流程的最大等待时间。
 ///
@@ -363,6 +364,44 @@ fn private_home_lock_rejects_competition_and_releases_after_clean_exit() {
         status_c.success(),
         "C 正常 EOF 应退出码 0，实际 {status_c:?}；stderr={}",
         process_c.stderr_text()
+    );
+}
+
+/// Host 写出的空模型安全骨架必须在创建运行时前被 sidecar 拒绝。
+#[test]
+fn empty_model_skeleton_is_rejected_before_runtime_startup() {
+    let _test_lock = startup_test_lock();
+    let temporary = tempfile::tempdir().expect("创建临时目录");
+    let session_cwd = temporary.path().join("session");
+    let grok_home = temporary.path().join("home");
+    let agent_definition = grok_home.join("agents").join("efflab-default.md");
+    let config_path = grok_home.join("config.toml");
+    fs::create_dir(&session_cwd).expect("创建 session cwd");
+    fs::create_dir_all(&grok_home).expect("创建模拟 Host 私有 home");
+
+    // Host 实际写入 renderer 的空模型输出；不能用手写不完整 TOML 代替该回归场景。
+    let empty_model_skeleton =
+        render_authoritative_config(&grok_home, &agent_definition, None, &[])
+            .expect("空模型集合应渲染安全骨架");
+    fs::write(&config_path, &empty_model_skeleton).expect("Host 写入空模型骨架应成功");
+    let args = vec![
+        "--grok-home".to_string(),
+        grok_home.display().to_string(),
+        "--session-cwd".to_string(),
+        session_cwd.display().to_string(),
+    ];
+
+    let (status, stdout, stderr) = wait_rejected(rejected_command(temporary.path(), &args));
+
+    assert_startup_rejected(status, &stdout, &stderr, "校验 Host 权威 config");
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("读取 Host 空模型配置应成功"),
+        empty_model_skeleton,
+        "未配置模型时 sidecar 必须拒绝且不得覆写 Host 文件"
+    );
+    assert!(
+        !grok_home.join(".config-init.lock").exists(),
+        "空模型必须在进入 xai-grok-shell runtime 前被拒绝，不能创建 runtime 初始化锁"
     );
 }
 

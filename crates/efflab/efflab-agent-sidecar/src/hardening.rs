@@ -34,6 +34,23 @@ const SANITIZED_ENV_VARS: [&str; 5] = [
     "GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED",
 ];
 
+/// 上游认证路径可能读取的 first-party 用户凭据环境变量。
+///
+/// 清单依据 `xai-grok-shell/src/agent/config.rs` 的认证变量审计固定；sidecar 不依赖
+/// 上游私有常量，但上游新增认证来源时必须同步审计此列表。唯一允许保留的 L3b
+/// 绑定令牌 `EFFLAB_L3B_BIND` 不在本列表中。
+const FIRST_PARTY_CREDENTIAL_ENV_VARS: [&str; 9] = [
+    "XAI_API_KEY",
+    "GROK_CODE_XAI_API_KEY",
+    "GROK_AUTH",
+    "GROK_AUTH_PATH",
+    "GROK_DEPLOYMENT_KEY",
+    "GROK_EXTRA_AUTH_KEY",
+    "GROK_TRACE_UPLOAD_CREDENTIALS_FILE",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "GROK_INTERNAL_OTLP_HEADERS",
+];
+
 /// `COMPAT_CELLS` 当前登记的全部 18 个环境变量。
 ///
 /// 此列表依据 `xai-grok-tools/src/types/compat.rs` 的 `COMPAT_CELLS` 固定，
@@ -162,10 +179,11 @@ pub fn materialize_agent_definition(grok_home: &Path) -> Result<PathBuf> {
     Ok(agent_definition_path)
 }
 
-/// 清除能够重新打开外部网络、compat、subagent、存储或 managed MCP 能力的环境变量。
+/// 清除可重开受限能力的变量，以及上游可能读取的 first-party 用户凭据。
 ///
-/// 必须在创建 Tokio runtime 和调用任何 shell API 前调用。`std::env` 在 Unix 上是
-/// 进程全局状态；调用方必须保证此时没有其他线程读取或修改环境变量。
+/// 唯一允许的 L3b 绑定令牌 `EFFLAB_L3B_BIND` 不在清理集合中。必须在创建 Tokio
+/// runtime 和调用任何 shell API 前调用。`std::env` 在 Unix 上是进程全局状态；调用方
+/// 必须保证此时没有其他线程读取或修改环境变量。
 pub fn sanitize_env() -> Result<()> {
     // 先快照所有 OTEL 前缀 key，随后再统一删除，避免在迭代环境时原地修改它。
     let otel_keys: Vec<_> = env::vars_os()
@@ -175,6 +193,9 @@ pub fn sanitize_env() -> Result<()> {
     // SAFETY: sidecar 的启动顺序要求本函数在 Tokio runtime 和任何 shell API 前调用，
     // 此时尚未创建并发读取环境变量的线程；测试也以本模块互斥锁串行化这些修改。
     unsafe {
+        for name in FIRST_PARTY_CREDENTIAL_ENV_VARS {
+            env::remove_var(name);
+        }
         for name in SANITIZED_ENV_VARS {
             env::remove_var(name);
         }
@@ -389,6 +410,22 @@ mod tests {
     /// 本 crate 的环境变量测试共享同一把锁，避免相互污染进程全局状态。
     static ENVIRONMENT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    /// 上游认证路径实际读取的 first-party 用户凭据环境变量。
+    ///
+    /// 此清单刻意不引用生产常量，使测试能在启动硬化遗漏任一凭据时失败；更新
+    /// 上游认证来源时也必须同步审计本清单。
+    const EXPECTED_FIRST_PARTY_CREDENTIAL_ENV_VARS: [&str; 9] = [
+        "XAI_API_KEY",
+        "GROK_CODE_XAI_API_KEY",
+        "GROK_AUTH",
+        "GROK_AUTH_PATH",
+        "GROK_DEPLOYMENT_KEY",
+        "GROK_EXTRA_AUTH_KEY",
+        "GROK_TRACE_UPLOAD_CREDENTIALS_FILE",
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "GROK_INTERNAL_OTLP_HEADERS",
+    ];
+
     /// 在测试结束或断言 panic 时恢复所有被测试修改过的环境变量。
     struct EnvironmentRestore {
         previous: Vec<(OsString, Option<OsString>)>,
@@ -428,6 +465,11 @@ mod tests {
     fn sanitized_environment_keys() -> Vec<OsString> {
         let mut keys: Vec<_> = SANITIZED_ENV_VARS.iter().map(OsString::from).collect();
         keys.extend(COMPAT_ENV_VARS.iter().map(OsString::from));
+        keys.extend(
+            EXPECTED_FIRST_PARTY_CREDENTIAL_ENV_VARS
+                .iter()
+                .map(OsString::from),
+        );
         keys.extend(
             env::vars_os().filter_map(|(key, _)| is_otel_environment_key(&key).then_some(key)),
         );
@@ -1290,14 +1332,14 @@ mod tests {
         );
     }
 
-    /// 所有精确名单和动态 `OTEL_` 前缀变量均不得在清理后残留。
+    /// first-party 用户凭据、精确名单和动态 `OTEL_` 前缀变量均不得在清理后残留。
     #[test]
-    fn sanitize_env_removes_constructed_malicious_variables() {
+    fn sanitize_env_removes_credentials_and_preserves_l3b_bind() {
         let _test_lock = ENVIRONMENT_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut malicious_keys = sanitized_environment_keys();
-        let preserved_key = OsString::from("EFFLAB_ENVIRONMENT_SHOULD_SURVIVE");
+        let preserved_key = OsString::from("EFFLAB_L3B_BIND");
         malicious_keys.push(preserved_key.clone());
         let _restore = EnvironmentRestore::capture(&malicious_keys);
 

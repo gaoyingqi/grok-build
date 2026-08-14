@@ -61,7 +61,12 @@ fn fixture_cases_all_pass() {
 
     // 构造策略：允许 modelId=grok-code-fast，cwd 指向 cwd_dir。
     let policy = HostPolicy::new(cwd_dir.path().to_path_buf())
-        .with_meta_key("modelId".to_string())
+        // 既有方法保留 modelId，新 prompt 方法只允许 submission 对应的 promptId。
+        .with_meta_key_for("initialize", "modelId")
+        .with_meta_key_for("session/new", "modelId")
+        .with_meta_key_for("session/load", "modelId")
+        .with_meta_key_for("x.ai/mcp/list", "modelId")
+        .with_meta_key_for("session/prompt", "promptId")
         .with_model_id("grok-code-fast".to_string());
 
     for case in &cases {

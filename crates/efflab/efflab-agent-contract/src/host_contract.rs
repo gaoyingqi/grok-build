@@ -1,20 +1,22 @@
 //! Host 请求字段白名单校验（P3.1 / 方案 v3 R7'）。
 //!
-//! 职责：sidecar 只接受可信 Host 的 ACP 请求。本模块对每个入站请求做
+//! 职责：可信 Host 在写入 sidecar stdin 前，必须对每个 ACP 请求执行
 //! **字段白名单**（非黑名单）校验：
 //! - `initialize` 仅允许协议、客户端、能力、认证与 `_meta` 字段；
 //!   `capabilities.terminal` / `capabilities.fs` 必须为 false，
 //!   `client.mcpServers` 必须为空数组（MCP 全部来自 `--mcp-config`）。
 //! - `session/new` / `session/load` 仅允许会话、cwd、MCP 与 `_meta` 字段；
 //!   `cwd` 精确匹配策略指定值，`mcpServers` 必须为空数组。
-//! - `x.ai/mcp/list` 仅允许会话与 `_meta` 字段。
-//! - `_meta.modelId` 必须在模型白名单内；顶层 `modelId` 不在方法字段白名单，
+//! - `session/prompt` 只接受纯文本 ContentBlock，并在写入前阻断 grok-shell
+//!   可解析的文件引用文本；`session/cancel` 与 `session/list` 只开放最小字段面。
+//! - `_meta` 白名单按 method 隔离；顶层 `modelId` 不在方法字段白名单，
 //!   因此一律拒绝。
 //! - 未知字段与未知 method 默认拒绝（fail-closed）。
 //!
 //! 字段拼写遵循 ACP wire 协议（camelCase）：`_meta`、`cwd`、`mcpServers`、
 //! `capabilities`、`authentication`、`sessionId`、`modelId`。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -32,14 +34,23 @@ const INITIALIZE_ALLOWED_FIELDS: &[&str] = &[
 /// `session/new` 与 `session/load` 顶层 params 的唯一允许字段集合。
 const SESSION_ALLOWED_FIELDS: &[&str] = &["sessionId", "cwd", "mcpServers", "_meta"];
 
+/// `session/prompt` 顶层 params 的唯一允许字段集合。
+const SESSION_PROMPT_ALLOWED_FIELDS: &[&str] = &["sessionId", "prompt", "_meta"];
+
+/// `session/cancel` 顶层 params 的唯一允许字段集合。
+const SESSION_CANCEL_ALLOWED_FIELDS: &[&str] = &["sessionId"];
+
+/// `session/list` 顶层 params 的唯一允许字段集合。
+const SESSION_LIST_ALLOWED_FIELDS: &[&str] = &["cwd", "cursor"];
+
 /// `x.ai/mcp/list` 顶层 params 的唯一允许字段集合。
 const MCP_LIST_ALLOWED_FIELDS: &[&str] = &["sessionId", "_meta"];
 
 /// Host 契约策略：可信 Host 必须满足的边界。
 #[derive(Debug, Clone)]
 pub struct HostPolicy {
-    /// `_meta` 中允许出现的键白名单（如 `modelId`）。
-    pub allowed_meta_keys: Vec<String>,
+    /// 按 method 隔离的 `_meta` 键白名单，防止一个方法的元数据泄漏到另一个方法。
+    allowed_meta_keys_by_method: BTreeMap<String, Vec<String>>,
     /// 允许的模型 id 白名单（`modelId`）。
     pub allowed_model_ids: Vec<String>,
     /// 期望的 session cwd（canonical 绝对路径）。
@@ -52,17 +63,28 @@ impl HostPolicy {
     /// 构造策略：至少需要期望的 cwd。
     pub fn new(expected_cwd: impl Into<PathBuf>) -> Self {
         Self {
-            allowed_meta_keys: Vec::new(),
+            allowed_meta_keys_by_method: BTreeMap::new(),
             allowed_model_ids: Vec::new(),
             expected_cwd: expected_cwd.into(),
             allowed_mcp_servers: Vec::new(),
         }
     }
 
-    /// 追加允许的 `_meta` 键。
-    pub fn with_meta_key(mut self, key: impl Into<String>) -> Self {
-        self.allowed_meta_keys.push(key.into());
+    /// 为一个指定 method 追加允许的 `_meta` 键。
+    pub fn with_meta_key_for(mut self, method: impl Into<String>, key: impl Into<String>) -> Self {
+        self.allowed_meta_keys_by_method
+            .entry(method.into())
+            .or_default()
+            .push(key.into());
         self
+    }
+
+    /// 返回指定 method 的 `_meta` 白名单；未登记的 method 没有可用元数据键。
+    pub fn meta_keys_for(&self, method: &str) -> &[String] {
+        self.allowed_meta_keys_by_method
+            .get(method)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// 追加允许的模型 id。
@@ -76,6 +98,15 @@ impl HostPolicy {
         self.allowed_mcp_servers.push(name.into());
         self
     }
+}
+
+/// 独立文本语义门的拒绝原因，供 Host 展开 mentions 后复用。
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum PromptTextRejection {
+    #[error("prompt text contains an @ file reference")]
+    AtFileReference,
+    #[error("prompt text contains a file URI")]
+    FileUri,
 }
 
 /// Host 请求被拒绝的原因（含 method 与具体违规点）。
@@ -133,6 +164,9 @@ pub fn validate_host_request(
     match method {
         "initialize" => validate_initialize(params, policy),
         "session/new" | "session/load" => validate_session_request(method, params, policy),
+        "session/prompt" => validate_session_prompt(params, policy),
+        "session/cancel" => validate_session_cancel(params),
+        "session/list" => validate_session_list(params, policy),
         // 只读协议方法：仍校验 _meta 与未知字段，但放宽 cwd/mcpServers 约束。
         "x.ai/mcp/list" => validate_meta_only(method, params, policy),
         // 已由 validate_top_level_fields 拒绝；保留分支防止未来修改绕过 fail-closed。
@@ -145,6 +179,9 @@ fn validate_top_level_fields(method: &str, params: &Value) -> Result<(), HostRej
     let allowed_fields = match method {
         "initialize" => INITIALIZE_ALLOWED_FIELDS,
         "session/new" | "session/load" => SESSION_ALLOWED_FIELDS,
+        "session/prompt" => SESSION_PROMPT_ALLOWED_FIELDS,
+        "session/cancel" => SESSION_CANCEL_ALLOWED_FIELDS,
+        "session/list" => SESSION_LIST_ALLOWED_FIELDS,
         "x.ai/mcp/list" => MCP_LIST_ALLOWED_FIELDS,
         _ => return Err(HostRejection::UnknownMethod(method.to_string())),
     };
@@ -322,6 +359,212 @@ fn validate_session_request(
     validate_meta_and_model(method, params, policy)
 }
 
+/// `session/prompt`：只接受带 submission id 的非空纯文本块。
+fn validate_session_prompt(params: &Value, policy: &HostPolicy) -> Result<(), HostRejection> {
+    const METHOD: &str = "session/prompt";
+
+    validate_required_non_empty_string(METHOD, params, "sessionId")?;
+    let prompt = params
+        .get("prompt")
+        .ok_or_else(|| HostRejection::MissingRequiredField {
+            method: METHOD.to_string(),
+            field: "prompt".to_string(),
+        })?
+        .as_array()
+        .ok_or_else(|| HostRejection::InvalidFieldType {
+            method: METHOD.to_string(),
+            field: "prompt".to_string(),
+        })?;
+    if prompt.is_empty() {
+        return Err(HostRejection::ForbiddenField(
+            METHOD.to_string(),
+            "prompt".to_string(),
+        ));
+    }
+
+    for (index, block) in prompt.iter().enumerate() {
+        let prefix = format!("prompt[{index}]");
+        let block = block
+            .as_object()
+            .ok_or_else(|| HostRejection::InvalidFieldType {
+                method: METHOD.to_string(),
+                field: prefix.clone(),
+            })?;
+        // ContentBlock 收窄为唯一安全的 text 变体，未知键不能静默透传给 grok-shell。
+        validate_nested_fields(METHOD, block, &prefix, &["type", "text"])?;
+
+        let block_type = block
+            .get("type")
+            .ok_or_else(|| HostRejection::MissingRequiredField {
+                method: METHOD.to_string(),
+                field: format!("{prefix}.type"),
+            })?
+            .as_str()
+            .ok_or_else(|| HostRejection::InvalidFieldType {
+                method: METHOD.to_string(),
+                field: format!("{prefix}.type"),
+            })?;
+        if block_type != "text" {
+            return Err(HostRejection::ForbiddenField(
+                METHOD.to_string(),
+                format!("{prefix}.type"),
+            ));
+        }
+
+        let text = block
+            .get("text")
+            .ok_or_else(|| HostRejection::MissingRequiredField {
+                method: METHOD.to_string(),
+                field: format!("{prefix}.text"),
+            })?
+            .as_str()
+            .ok_or_else(|| HostRejection::InvalidFieldType {
+                method: METHOD.to_string(),
+                field: format!("{prefix}.text"),
+            })?;
+        if text.is_empty() {
+            return Err(HostRejection::ForbiddenField(
+                METHOD.to_string(),
+                format!("{prefix}.text"),
+            ));
+        }
+        // 复用独立文本门，阻断 shell 对 @ 文件引用和 file URI 的隐式读盘路径。
+        validate_prompt_text(text).map_err(|_| {
+            HostRejection::ForbiddenField(METHOD.to_string(), format!("{prefix}.text"))
+        })?;
+    }
+
+    validate_meta_and_model(METHOD, params, policy)?;
+    let prompt_id = params
+        .get("_meta")
+        .and_then(Value::as_object)
+        .and_then(|meta| meta.get("promptId"))
+        .ok_or_else(|| HostRejection::MissingRequiredField {
+            method: METHOD.to_string(),
+            field: "_meta.promptId".to_string(),
+        })?
+        .as_str()
+        .ok_or_else(|| HostRejection::InvalidFieldType {
+            method: METHOD.to_string(),
+            field: "_meta.promptId".to_string(),
+        })?;
+    if prompt_id.is_empty() {
+        return Err(HostRejection::InvalidFieldType {
+            method: METHOD.to_string(),
+            field: "_meta.promptId".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+/// `session/cancel` 是无 reply 的通知，只允许关联到一个已知 session。
+fn validate_session_cancel(params: &Value) -> Result<(), HostRejection> {
+    validate_required_non_empty_string("session/cancel", params, "sessionId")
+}
+
+/// `session/list` 只能列出当前 scope 的 session，并只接受标准 cursor 分页字段。
+fn validate_session_list(params: &Value, policy: &HostPolicy) -> Result<(), HostRejection> {
+    const METHOD: &str = "session/list";
+    let cwd =
+        params
+            .get("cwd")
+            .and_then(Value::as_str)
+            .ok_or_else(|| HostRejection::CwdMismatch {
+                method: METHOD.to_string(),
+                expected: policy.expected_cwd.display().to_string(),
+                got: "<missing>".to_string(),
+            })?;
+    if !cwd_matches(Path::new(cwd), &policy.expected_cwd) {
+        return Err(HostRejection::CwdMismatch {
+            method: METHOD.to_string(),
+            expected: policy.expected_cwd.display().to_string(),
+            got: cwd.to_string(),
+        });
+    }
+    if params
+        .get("cursor")
+        .is_some_and(|cursor| cursor.as_str().is_none())
+    {
+        return Err(HostRejection::InvalidFieldType {
+            method: METHOD.to_string(),
+            field: "cursor".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+/// 校验必填字符串字段，空值和非字符串都不能绕过 session 关联边界。
+fn validate_required_non_empty_string(
+    method: &str,
+    params: &Value,
+    field: &str,
+) -> Result<(), HostRejection> {
+    let value = params
+        .get(field)
+        .ok_or_else(|| HostRejection::MissingRequiredField {
+            method: method.to_string(),
+            field: field.to_string(),
+        })?;
+    if value.as_str().is_some_and(|value| !value.is_empty()) {
+        Ok(())
+    } else {
+        Err(HostRejection::InvalidFieldType {
+            method: method.to_string(),
+            field: field.to_string(),
+        })
+    }
+}
+
+/// 校验 Host 组包或展开 mentions 后的单段 prompt 文本。
+///
+/// grok-shell 的 `prompt_parser::collect_file_references` 会从每个 `@` 后的
+/// 剩余文本取 `split_whitespace().next()`，再交给 `FileReference::parse`。
+/// 因此此处使用同一 token 边界，只要 token 会成为解析候选就拒绝；单独的
+/// 尾随 `@` 或仅跟空白不会触发文件读取。`file://` 同样可能指向本地文件，
+/// 所以按 ASCII 大小写不敏感的 URI scheme 拒绝。
+pub fn validate_prompt_text(text: &str) -> Result<(), PromptTextRejection> {
+    if contains_file_uri(text) {
+        return Err(PromptTextRejection::FileUri);
+    }
+    if contains_at_file_reference(text) {
+        return Err(PromptTextRejection::AtFileReference);
+    }
+
+    Ok(())
+}
+
+/// 判断文本中的任一 `@` 是否会在上游成为可解析的 FileReference token。
+fn contains_at_file_reference(text: &str) -> bool {
+    text.match_indices('@').any(|(offset, _)| {
+        let token = text[offset + '@'.len_utf8()..]
+            .split_whitespace()
+            .next()
+            .unwrap_or_default();
+        let token = token.strip_prefix('@').unwrap_or(token);
+        // 上游正则允许一个可选 @，但文件路径的首字符不能再是 @。
+        token.chars().next().is_some_and(|first| first != '@')
+    })
+}
+
+/// 判断文本是否含有独立的、不区分 ASCII 大小写的 `file://` URI scheme。
+fn contains_file_uri(text: &str) -> bool {
+    const FILE_URI: &[u8] = b"file://";
+    text.as_bytes()
+        .windows(FILE_URI.len())
+        .enumerate()
+        .any(|(offset, candidate)| {
+            candidate.eq_ignore_ascii_case(FILE_URI)
+                && (offset == 0 || !is_uri_scheme_byte(text.as_bytes()[offset - 1]))
+        })
+}
+
+/// URI scheme 允许的 ASCII 字节；避免将 `profile://` 的后缀误判为 `file://`。
+fn is_uri_scheme_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+}
+
 /// 只读方法：仅校验 `_meta` 白名单与 modelId。
 fn validate_meta_only(
     method: &str,
@@ -337,12 +580,16 @@ fn validate_meta_and_model(
     params: &Value,
     policy: &HostPolicy,
 ) -> Result<(), HostRejection> {
-    // _meta 白名单（未声明任何白名单键时，_meta 必须缺失或为空对象）。
+    // _meta 白名单按 method 隔离：未登记键时，_meta 必须缺失或为空对象。
     // 顶层类型已由 validate_meta_field_type 在分派前校验；此处保留既有语义。
     if let Some(meta) = params.get("_meta") {
         if let Some(obj) = meta.as_object() {
             for key in obj.keys() {
-                if !policy.allowed_meta_keys.iter().any(|k| k == key) {
+                if !policy
+                    .meta_keys_for(method)
+                    .iter()
+                    .any(|allowed| allowed == key)
+                {
                     return Err(HostRejection::UnknownMetaKey(
                         method.to_string(),
                         key.clone(),
@@ -392,7 +639,12 @@ mod tests {
     /// 构造一个默认策略：cwd 指向临时目录。
     fn policy_with(cwd: &Path) -> HostPolicy {
         HostPolicy::new(cwd.to_path_buf())
-            .with_meta_key("modelId".to_string())
+            // 保留 Task 1/2 已有 method 的 modelId 行为，同时把 promptId 限在 prompt。
+            .with_meta_key_for("initialize", "modelId")
+            .with_meta_key_for("session/new", "modelId")
+            .with_meta_key_for("session/load", "modelId")
+            .with_meta_key_for("x.ai/mcp/list", "modelId")
+            .with_meta_key_for("session/prompt", "promptId")
             .with_model_id("grok-code-fast".to_string())
     }
 
@@ -441,6 +693,25 @@ mod tests {
                     "_meta": { "modelId": "grok-code-fast" }
                 }),
             ),
+            (
+                "session/prompt",
+                "session/prompt",
+                serde_json::json!({
+                    "sessionId": "existing-session",
+                    "prompt": [{ "type": "text", "text": "处理 /Volumes/Music/Inbox" }],
+                    "_meta": { "promptId": "submission-1" }
+                }),
+            ),
+            (
+                "session/cancel",
+                "session/cancel",
+                serde_json::json!({ "sessionId": "existing-session" }),
+            ),
+            (
+                "session/list",
+                "session/list",
+                serde_json::json!({ "cwd": cwd, "cursor": "next-page" }),
+            ),
         ];
 
         for (name, method, params) in cases {
@@ -449,6 +720,92 @@ mod tests {
                 "白名单用例 {name} 应通过"
             );
         }
+    }
+
+    #[test]
+    fn meta_keys_are_isolated_by_method() {
+        let dir = TempDir::new().unwrap();
+        let policy = policy_with(dir.path());
+        let prompt_keys: Vec<&str> = policy
+            .meta_keys_for("session/prompt")
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let new_session_keys: Vec<&str> = policy
+            .meta_keys_for("session/new")
+            .iter()
+            .map(String::as_str)
+            .collect();
+
+        assert_eq!(prompt_keys, ["promptId"]);
+        assert_eq!(new_session_keys, ["modelId"]);
+        assert!(policy.meta_keys_for("session/cancel").is_empty());
+        assert!(policy.meta_keys_for("session/list").is_empty());
+    }
+
+    #[test]
+    fn prompt_text_gate_matches_grok_file_reference_tokens() {
+        for text in [
+            "普通中文请求",
+            "请处理 /Volumes/Music/Inbox 这批歌曲",
+            "末尾 @",
+            "末尾 @ \n\t",
+            "profile://不是本地 file URI",
+        ] {
+            assert!(validate_prompt_text(text).is_ok(), "文本应允许: {text:?}");
+        }
+
+        for (text, expected) in [
+            ("请读取 @secret.txt", PromptTextRejection::AtFileReference),
+            ("请读取 @foo/bar", PromptTextRejection::AtFileReference),
+            (
+                "请读取 @../secret.txt",
+                PromptTextRejection::AtFileReference,
+            ),
+            ("请读取 @~/secret.txt", PromptTextRejection::AtFileReference),
+            (
+                "请读取 @C:\\secret.txt",
+                PromptTextRejection::AtFileReference,
+            ),
+            (
+                "请读取 @\\\\server\\share\\secret.txt",
+                PromptTextRejection::AtFileReference,
+            ),
+            (
+                "请读取 @\\\\?\\C:\\secret.txt",
+                PromptTextRejection::AtFileReference,
+            ),
+            (
+                "引号边界 \"@secret.txt\"",
+                PromptTextRejection::AtFileReference,
+            ),
+            ("标点边界（@foo/bar）", PromptTextRejection::AtFileReference),
+            (
+                "换行边界\n@../secret.txt",
+                PromptTextRejection::AtFileReference,
+            ),
+            ("file:///etc/passwd", PromptTextRejection::FileUri),
+            ("FILE:///etc/passwd", PromptTextRejection::FileUri),
+        ] {
+            assert_eq!(
+                validate_prompt_text(text),
+                Err(expected),
+                "文本应拒绝: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_text_gate_can_be_reused_after_host_mention_expansion() {
+        // Host 展开曲库 mention 后仍必须使用同一纯函数，而不是自行复制匹配规则。
+        let safe_expansion = "曲目《晚风》已加入待整理列表";
+        let unsafe_expansion = "展开结果包含 @../private/secret.txt";
+
+        assert!(validate_prompt_text(safe_expansion).is_ok());
+        assert_eq!(
+            validate_prompt_text(unsafe_expansion),
+            Err(PromptTextRejection::AtFileReference)
+        );
     }
 
     #[test]

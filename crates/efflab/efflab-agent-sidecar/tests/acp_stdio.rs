@@ -936,7 +936,9 @@ fn trusted_host_gatekeeper_rejects_before_wire() {
     let expected_cwd =
         dunce::canonicalize(&env.session_cwd).expect("session cwd 必须可 canonicalize");
     let policy = HostPolicy::new(expected_cwd.clone())
-        .with_meta_key("modelId")
+        // Host 校验按 method 绑定元数据，避免 initialize 的 modelId 泄漏到其它请求。
+        .with_meta_key_for("initialize", "modelId")
+        .with_meta_key_for("session/new", "modelId")
         .with_model_id("grok-code-fast");
     let stdin = env.proc.take_stdin();
     let stdout = env.proc.stdout_reader().into_inner();

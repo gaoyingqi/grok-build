@@ -8,7 +8,9 @@ pub mod mcp_config;
 pub mod model;
 pub mod render;
 
-pub use host_contract::{HostPolicy, HostRejection, validate_host_request};
+pub use host_contract::{
+    HostPolicy, HostRejection, PromptTextRejection, validate_host_request, validate_prompt_text,
+};
 pub use mcp_config::{ApprovedMcpConfig, McpServerSpec};
 pub use model::SidecarModelSpec;
 pub use render::{render_authoritative_config, validate_authoritative_config};

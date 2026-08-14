@@ -323,5 +323,334 @@
     },
     "expect": "reject",
     "rejection": "ModelIdNotAllowed"
+  },
+  {
+    "name": "session/new rejects promptId meta",
+    "method": "session/new",
+    "params": {
+      "cwd": "{{CWD}}",
+      "mcpServers": [],
+      "_meta": { "promptId": "submission-1" }
+    },
+    "expect": "reject",
+    "rejection": "UnknownMetaKey"
+  },
+  {
+    "name": "session/prompt text ok with plain absolute path",
+    "method": "session/prompt",
+    "params": {
+      "sessionId": "s1",
+      "prompt": [
+        { "type": "text", "text": "请处理 /Volumes/Music/Inbox 这批歌曲" }
+      ],
+      "_meta": { "promptId": "submission-1" }
+    },
+    "expect": "allow"
+  },
+  {
+    "name": "session/prompt rejects missing sessionId",
+    "method": "session/prompt",
+    "params": {
+      "prompt": [
+        { "type": "text", "text": "正常内容" }
+      ],
+      "_meta": { "promptId": "submission-1" }
+    },
+    "expect": "reject",
+    "rejection": "MissingRequiredField"
+  },
+  {
+    "name": "session/prompt rejects empty prompt array",
+    "method": "session/prompt",
+    "params": {
+      "sessionId": "s1",
+      "prompt": [],
+      "_meta": { "promptId": "submission-1" }
+    },
+    "expect": "reject",
+    "rejection": "ForbiddenField"
+  },
+  {
+    "name": "session/prompt rejects non-text content type",
+    "method": "session/prompt",
+    "params": {
+      "sessionId": "s1",
+      "prompt": [
+        { "type": "resource", "text": "不能透传 resource" }
+      ],
+      "_meta": { "promptId": "submission-1" }
+    },
+    "expect": "reject",
+    "rejection": "ForbiddenField"
+  },
+  {
+    "name": "session/prompt rejects flat text",
+    "method": "session/prompt",
+    "params": {
+      "sessionId": "s1",
+      "text": "不能使用扁平 text",
+      "prompt": [
+        { "type": "text", "text": "正常内容" }
+      ],
+      "_meta": { "promptId": "submission-1" }
+    },
+    "expect": "reject",
+    "rejection": "UnknownField"
+  },
+  {
+    "name": "session/prompt rejects image block",
+    "method": "session/prompt",
+    "params": {
+      "sessionId": "s1",
+      "prompt": [
+        { "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" }
+      ],
+      "_meta": { "promptId": "submission-1" }
+    },
+    "expect": "reject",
+    "rejection": "UnknownNestedField"
+  },
+  {
+    "name": "session/prompt rejects text block extra key",
+    "method": "session/prompt",
+    "params": {
+      "sessionId": "s1",
+      "prompt": [
+        { "type": "text", "text": "正常内容", "_meta": {} }
+      ],
+      "_meta": { "promptId": "submission-1" }
+    },
+    "expect": "reject",
+    "rejection": "UnknownNestedField"
+  },
+  {
+    "name": "session/prompt rejects empty text",
+    "method": "session/prompt",
+    "params": {
+      "sessionId": "s1",
+      "prompt": [
+        { "type": "text", "text": "" }
+      ],
+      "_meta": { "promptId": "submission-1" }
+    },
+    "expect": "reject",
+    "rejection": "ForbiddenField"
+  },
+  {
+    "name": "session/prompt rejects missing promptId",
+    "method": "session/prompt",
+    "params": {
+      "sessionId": "s1",
+      "prompt": [
+        { "type": "text", "text": "正常内容" }
+      ],
+      "_meta": {}
+    },
+    "expect": "reject",
+    "rejection": "MissingRequiredField"
+  },
+  {
+    "name": "session/prompt rejects modelId meta",
+    "method": "session/prompt",
+    "params": {
+      "sessionId": "s1",
+      "prompt": [
+        { "type": "text", "text": "正常内容" }
+      ],
+      "_meta": { "modelId": "grok-code-fast" }
+    },
+    "expect": "reject",
+    "rejection": "UnknownMetaKey"
+  },
+  {
+    "name": "session/prompt rejects at secret reference",
+    "method": "session/prompt",
+    "params": {
+      "sessionId": "s1",
+      "prompt": [
+        { "type": "text", "text": "请读取 @secret.txt" }
+      ],
+      "_meta": { "promptId": "submission-1" }
+    },
+    "expect": "reject",
+    "rejection": "ForbiddenField"
+  },
+  {
+    "name": "session/prompt rejects at nested path reference",
+    "method": "session/prompt",
+    "params": {
+      "sessionId": "s1",
+      "prompt": [
+        { "type": "text", "text": "请读取 @foo/bar" }
+      ],
+      "_meta": { "promptId": "submission-1" }
+    },
+    "expect": "reject",
+    "rejection": "ForbiddenField"
+  },
+  {
+    "name": "session/prompt rejects at parent traversal reference",
+    "method": "session/prompt",
+    "params": {
+      "sessionId": "s1",
+      "prompt": [
+        { "type": "text", "text": "请读取 @../secret.txt" }
+      ],
+      "_meta": { "promptId": "submission-1" }
+    },
+    "expect": "reject",
+    "rejection": "ForbiddenField"
+  },
+  {
+    "name": "session/prompt rejects at home reference",
+    "method": "session/prompt",
+    "params": {
+      "sessionId": "s1",
+      "prompt": [
+        { "type": "text", "text": "请读取 @~/secret.txt" }
+      ],
+      "_meta": { "promptId": "submission-1" }
+    },
+    "expect": "reject",
+    "rejection": "ForbiddenField"
+  },
+  {
+    "name": "session/prompt rejects at windows drive reference",
+    "method": "session/prompt",
+    "params": {
+      "sessionId": "s1",
+      "prompt": [
+        { "type": "text", "text": "请读取 @C:\\secret.txt" }
+      ],
+      "_meta": { "promptId": "submission-1" }
+    },
+    "expect": "reject",
+    "rejection": "ForbiddenField"
+  },
+  {
+    "name": "session/prompt rejects at UNC reference",
+    "method": "session/prompt",
+    "params": {
+      "sessionId": "s1",
+      "prompt": [
+        { "type": "text", "text": "请读取 @\\\\server\\share\\secret.txt" }
+      ],
+      "_meta": { "promptId": "submission-1" }
+    },
+    "expect": "reject",
+    "rejection": "ForbiddenField"
+  },
+  {
+    "name": "session/prompt rejects at extended windows reference",
+    "method": "session/prompt",
+    "params": {
+      "sessionId": "s1",
+      "prompt": [
+        { "type": "text", "text": "请读取 @\\\\?\\C:\\secret.txt" }
+      ],
+      "_meta": { "promptId": "submission-1" }
+    },
+    "expect": "reject",
+    "rejection": "ForbiddenField"
+  },
+  {
+    "name": "session/prompt rejects lowercase file URI",
+    "method": "session/prompt",
+    "params": {
+      "sessionId": "s1",
+      "prompt": [
+        { "type": "text", "text": "请读取 file:///etc/passwd" }
+      ],
+      "_meta": { "promptId": "submission-1" }
+    },
+    "expect": "reject",
+    "rejection": "ForbiddenField"
+  },
+  {
+    "name": "session/prompt rejects uppercase file URI",
+    "method": "session/prompt",
+    "params": {
+      "sessionId": "s1",
+      "prompt": [
+        { "type": "text", "text": "请读取 FILE:///etc/passwd" }
+      ],
+      "_meta": { "promptId": "submission-1" }
+    },
+    "expect": "reject",
+    "rejection": "ForbiddenField"
+  },
+  {
+    "name": "session/cancel ok",
+    "method": "session/cancel",
+    "params": { "sessionId": "s1" },
+    "expect": "allow"
+  },
+  {
+    "name": "session/cancel missing sessionId",
+    "method": "session/cancel",
+    "params": {},
+    "expect": "reject",
+    "rejection": "MissingRequiredField"
+  },
+  {
+    "name": "session/cancel rejects rewindIfNoOutput",
+    "method": "session/cancel",
+    "params": { "sessionId": "s1", "rewindIfNoOutput": true },
+    "expect": "reject",
+    "rejection": "UnknownField"
+  },
+  {
+    "name": "session/cancel rejects meta",
+    "method": "session/cancel",
+    "params": { "sessionId": "s1", "_meta": { "promptId": "submission-1" } },
+    "expect": "reject",
+    "rejection": "UnknownField"
+  },
+  {
+    "name": "session/list cwd ok",
+    "method": "session/list",
+    "params": { "cwd": "{{CWD}}" },
+    "expect": "allow"
+  },
+  {
+    "name": "session/list cursor ok",
+    "method": "session/list",
+    "params": { "cwd": "{{CWD}}", "cursor": "opaque-next-page" },
+    "expect": "allow"
+  },
+  {
+    "name": "session/list rejects limit",
+    "method": "session/list",
+    "params": { "cwd": "{{CWD}}", "limit": 30 },
+    "expect": "reject",
+    "rejection": "UnknownField"
+  },
+  {
+    "name": "session/list rejects additional_directories",
+    "method": "session/list",
+    "params": { "cwd": "{{CWD}}", "additional_directories": ["{{OTHER}}"] },
+    "expect": "reject",
+    "rejection": "UnknownField"
+  },
+  {
+    "name": "session/list rejects allowRelax",
+    "method": "session/list",
+    "params": { "cwd": "{{CWD}}", "allowRelax": true },
+    "expect": "reject",
+    "rejection": "UnknownField"
+  },
+  {
+    "name": "session/list rejects other cwd",
+    "method": "session/list",
+    "params": { "cwd": "{{OTHER}}" },
+    "expect": "reject",
+    "rejection": "CwdMismatch"
+  },
+  {
+    "name": "session/list rejects meta",
+    "method": "session/list",
+    "params": { "cwd": "{{CWD}}", "_meta": { "modelId": "grok-code-fast" } },
+    "expect": "reject",
+    "rejection": "UnknownField"
   }
 ]

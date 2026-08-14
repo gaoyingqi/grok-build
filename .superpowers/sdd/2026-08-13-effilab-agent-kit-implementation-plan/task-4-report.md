@@ -170,3 +170,33 @@ cargo fmt --all -- --check
 
 - 未执行 push，未修改 Task 5+；所有修复、测试脚手架、Cargo.lock 与本报告应在同一修复提交中。
 - Unix/macOS 路径提供可中断 fd reader；非 Unix 保留兼容读循环，但通用阻塞 `Read` 在没有平台关闭能力时仍依赖其自身 EOF 才能结束 worker，这是当前跨平台实现边界。
+
+## Task 4 Re-review Fix Report
+
+### 修复内容
+
+- 取消清理：`notify_validated("session/cancel", ...)` 在 contract 校验和 cancel wire 成功写出后，按 `sessionId` 移除匹配的 `outbound_requests`；其它 session 的 pending request 保留，cancel 写失败时不提前释放账本。
+- 确定性 overflow 测试：`MANY_NOTIFICATIONS` 在无消费者时写入 65 条 notification；reader 因第 65 条触发队列溢出并关闭 stdout 后，sidecar 才通过独立 stderr fd 发出 `queue-overflow-observed` 握手。测试先等待握手，再消费前 64 条并断言终止错误，消除了生产者/消费者调度竞速。
+
+### TDD 与测试
+
+- RED：`cargo test -p efflab-agent-host --test acp_runtime cancel_releases_matching_outbound_requests -- --test-threads=1`，退出码 `101`；实现前在第一个 cancel 后 request 处因 `ACP 出站 request 账本达到上限 64` 失败。
+- 新增 `cancel_releases_matching_outbound_requests`：先占满 63 个待取消 session request 与 1 个其它 session request，cancel 后重新登记 63 个同 session request，并确认其它 session 仍占用最后槽位。
+- 更新 `inbound_notification_queue_overflow_is_observable`：握手完成后验证 64 条既有 notification 和可观察 overflow 错误。
+
+### 最终验证命令与输出
+
+```text
+cargo test -p efflab-agent-host
+退出码: 0
+结果: 14 个 acp_runtime 集成测试通过；21 个 protocol_and_submission 集成测试通过；unit tests 0 个、doc-tests 0 个，均通过。
+
+cargo fmt --all -- --check
+退出码: 0
+结果: 格式检查通过。
+```
+
+### 交付边界
+
+- 未执行 push，未修改 Task 5+；本次修复仅涉及取消路径、overflow 集成测试及本报告。
+- 非 Unix 阻塞 `Read` 的生命周期边界保持上一报告结论，未在本次 macOS 目标修复范围内扩展。

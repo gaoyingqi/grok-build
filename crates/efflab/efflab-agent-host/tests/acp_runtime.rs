@@ -94,15 +94,29 @@ while IFS= read -r line; do
 done
 "#;
 
-/// 一次写满并溢出 notification 队列；stdin EOF 是 reader fail-closed 的可观测信号。
+/// 先灌满 notification 队列，再用 stdout 写失败作为 reader overflow 的握手信号。
 const MANY_NOTIFICATIONS: &str = r#"
+exec 3>&2
+exec 2>/dev/null
+trap '' PIPE
 i=1
 while [ "$i" -le 65 ]; do
-    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sequence":%s}}\n' "$i"
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sequence":%s}}\n' "$i" 2>/dev/null
     i=$((i + 1))
 done
+while :; do
+    if cat 2>/dev/null <<'EOF'
+{"jsonrpc":"2.0","method":"queue-overflow-probe","params":{}}
+EOF
+    then
+        sleep 0.01
+    else
+        printf '%s\n' 'queue-overflow-observed' >&3
+        break
+    fi
+done
 IFS= read -r line
-printf '%s\n' 'stdin-closed-after-queue-overflow' >&2
+printf '%s\n' 'stdin-closed-after-queue-overflow' >&3
 "#;
 
 /// 子进程退出后让孙进程暂时持有 stdout；Runtime Drop 必须先回收 reader，不能等该 fd 自行 EOF。
@@ -160,6 +174,17 @@ impl PipePeer {
             .expect("读取测试 sidecar stderr 必须成功");
         assert_ne!(size, 0, "预期 Host 写入一条 JSON-RPC 消息");
         serde_json::from_str(&line).expect("Host 写入必须是 JSON")
+    }
+
+    /// 读取 sidecar 的测试握手标记，不消费 Host→sidecar JSON wire。
+    fn read_stderr_marker(&mut self) -> String {
+        let mut line = String::new();
+        let size = self
+            .stderr
+            .read_line(&mut line)
+            .expect("读取测试 sidecar stderr 握手必须成功");
+        assert_ne!(size, 0, "预期 sidecar stderr 握手标记");
+        line.trim_end_matches(['\r', '\n']).to_string()
     }
 
     /// 在 Runtime 关闭 stdin 后回收子进程，并返回所有未逐行读取的 stderr 内容。
@@ -523,6 +548,64 @@ fn outbound_request_ledger_is_bounded_before_write() {
     peer.finish();
 }
 
+/// session/cancel 只释放同一 session 的 pending request，释放后可以再次登记。
+#[test]
+fn cancel_releases_matching_outbound_requests() {
+    let (runtime, peer) = runtime_with_peer(DISCARD_STDIN);
+    let policy = policy();
+
+    // 先占满账本：63 条属于将被取消的 session，1 条属于其它 session。
+    for _ in 0..63 {
+        runtime
+            .request_validated(
+                "x.ai/mcp/list",
+                json!({ "sessionId": "session-1" }),
+                &policy,
+            )
+            .expect("取消前 session-1 request 必须可登记");
+    }
+    runtime
+        .request_validated(
+            "x.ai/mcp/list",
+            json!({ "sessionId": "session-2" }),
+            &policy,
+        )
+        .expect("其它 session request 必须占用一个 pending 槽位");
+
+    runtime
+        .notify_validated(
+            "session/cancel",
+            json!({ "sessionId": "session-1" }),
+            &policy,
+        )
+        .expect("session/cancel 必须写入后释放对应账本");
+
+    // 如果 cancel 没有移除 session-1 记录，这里会因为 64 项上限失败。
+    for _ in 0..63 {
+        runtime
+            .request_validated(
+                "x.ai/mcp/list",
+                json!({ "sessionId": "session-1" }),
+                &policy,
+            )
+            .expect("cancel 后 session-1 必须可以再次登记 request");
+    }
+    let error = runtime
+        .request_validated(
+            "x.ai/mcp/list",
+            json!({ "sessionId": "session-1" }),
+            &policy,
+        )
+        .expect_err("未被取消的 session-2 pending 必须仍占用最后一个槽位");
+    assert!(
+        error.to_string().contains("上限") || error.to_string().contains("limit"),
+        "取消后未匹配账本仍须受上限约束: {error}"
+    );
+
+    runtime.shutdown().expect("显式 shutdown 必须回收 runtime");
+    peer.finish();
+}
+
 /// reverse request 账本达到上限时必须终止 reader，并清理全部 pending 记录。
 #[test]
 fn inbound_reverse_request_ledger_is_bounded_and_fails_closed() {
@@ -580,7 +663,11 @@ fn inbound_reverse_request_ledger_is_bounded_and_fails_closed() {
 /// 入站 notification 队列溢出必须报告错误，不能静默丢弃消息换取内存安全。
 #[test]
 fn inbound_notification_queue_overflow_is_observable() {
-    let (runtime, peer) = runtime_with_peer(MANY_NOTIFICATIONS);
+    let (runtime, mut peer) = runtime_with_peer(MANY_NOTIFICATIONS);
+
+    // sidecar 只有在 reader 关闭 stdout（由队列 overflow 触发）后才发出握手，
+    // 因此下面开始消费时 overflow 已确定发生，不依赖线程调度快慢。
+    assert_eq!(peer.read_stderr_marker(), "queue-overflow-observed");
 
     for expected_sequence in 1..=64 {
         match next_inbound(&runtime) {

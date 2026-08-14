@@ -329,12 +329,20 @@ impl AcpRuntime {
             bail!("{method} 不是当前 Host contract 允许的 notification");
         }
 
+        let session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("session/cancel 缺少有效 sessionId"))?
+            .to_string();
         let message = json!({
             "jsonrpc": "2.0",
             "method": wire_method(method),
             "params": params,
         });
-        self.write_message(&message)
+        self.write_message(&message)?;
+        // 只有 cancel 已成功写入 sidecar 后才释放同一 session 的在途 request；
+        // 其它 session 的 request 保留，避免取消关联范围过宽。
+        self.remove_outbound_requests_for_session(&session_id)
     }
 
     /// 校验已保存的 reverse request 后回复 sidecar。
@@ -447,6 +455,18 @@ impl AcpRuntime {
         if let Ok(mut requests) = self.outbound_requests.lock() {
             requests.remove(&id);
         }
+    }
+
+    /// 按 sessionId 释放被取消的 Host→sidecar 在途 request，保留其它 session 的账本。
+    fn remove_outbound_requests_for_session(&self, session_id: &str) -> Result<()> {
+        let mut requests = self
+            .outbound_requests
+            .lock()
+            .map_err(|_| anyhow!("ACP 出站 request 账本不可用，无法处理 cancel"))?;
+        requests.retain(|_, saved| {
+            saved.params.get("sessionId").and_then(Value::as_str) != Some(session_id)
+        });
+        Ok(())
     }
 
     /// join 已保存的 reader worker；worker 只会在 EOF、错误或 shutdown 后结束。

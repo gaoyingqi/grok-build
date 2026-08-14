@@ -51,6 +51,76 @@ while IFS= read -r line; do
 done
 "#;
 
+/// stdout 立即 EOF，用于确认传输终止不会被伪装成“暂无消息”。
+const STDOUT_EOF: &str = "exit 0";
+
+/// 同一个 reverse id 的第二个 request 带不同的 permission options，属于协议错误。
+const DUPLICATE_REVERSE_REQUESTS: &str = r#"
+printf '%s\n' '{"jsonrpc":"2.0","id":41,"method":"session/request_permission","params":{"options":[{"optionId":"first-option","name":"First","kind":"allow_once"}]}}'
+IFS= read -r line
+printf '%s\n' "$line" >&2
+printf '%s\n' '{"jsonrpc":"2.0","id":41,"method":"session/request_permission","params":{"options":[{"optionId":"second-option","name":"Second","kind":"allow_once"}]}}'
+while IFS= read -r line; do
+    printf '%s\n' "$line" >&2
+done
+"#;
+
+/// 非扩展 method 的前导 `_` 不能被 extension 映射误删。
+const NON_EXTENSION_UNDERSCORE_REQUEST: &str = r#"
+printf '%s\n' '{"jsonrpc":"2.0","id":24,"method":"_not_an_extension","params":{}}'
+while IFS= read -r line; do
+    printf '%s\n' "$line" >&2
+done
+"#;
+
+/// 丢弃 Host 写入，供出站在途账本上限测试使用。
+const DISCARD_STDIN: &str = r#"
+while IFS= read -r line; do
+    :
+done
+"#;
+
+/// 每个 reverse request 必须等 Host 的确认后才发下一个，避免测试自身填满入站队列。
+const MANY_REVERSE_REQUESTS: &str = r#"
+i=1
+while [ "$i" -le 65 ]; do
+    printf '{"jsonrpc":"2.0","id":%s,"method":"_x.ai/test","params":{}}\n' "$i"
+    IFS= read -r line
+    printf '%s\n' "$line" >&2
+    i=$((i + 1))
+done
+while IFS= read -r line; do
+    :
+done
+"#;
+
+/// 一次写满并溢出 notification 队列；stdin EOF 是 reader fail-closed 的可观测信号。
+const MANY_NOTIFICATIONS: &str = r#"
+i=1
+while [ "$i" -le 65 ]; do
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sequence":%s}}\n' "$i"
+    i=$((i + 1))
+done
+IFS= read -r line
+printf '%s\n' 'stdin-closed-after-queue-overflow' >&2
+"#;
+
+/// 子进程退出后让孙进程暂时持有 stdout；Runtime Drop 必须先回收 reader，不能等该 fd 自行 EOF。
+const STDOUT_HELD_BY_DESCENDANT: &str = r#"
+(
+    trap '' PIPE
+    sleep 1
+    if printf '%s\n' 'runtime-reader-still-open'; then
+        printf '%s\n' 'reader-open' >&2
+    else
+        printf '%s\n' 'reader-closed' >&2
+    fi
+) < /dev/null &
+while IFS= read -r line; do
+    :
+done
+"#;
+
 /// 包装真实的子进程管道；Host 连接 stdin/stdout，测试从 stderr 观察 Host 写入。
 struct PipePeer {
     child: Child,
@@ -92,8 +162,8 @@ impl PipePeer {
         serde_json::from_str(&line).expect("Host 写入必须是 JSON")
     }
 
-    /// 在 Runtime 关闭 stdin 后回收子进程，并确认没有未断言的 Host 写入。
-    fn finish(mut self) {
+    /// 在 Runtime 关闭 stdin 后回收子进程，并返回所有未逐行读取的 stderr 内容。
+    fn finish_with_stderr(mut self) -> String {
         let status = self.child.wait().expect("测试 sidecar 必须退出");
         assert!(status.success(), "测试 sidecar 退出状态异常: {status}");
 
@@ -101,6 +171,12 @@ impl PipePeer {
         self.stderr
             .read_to_string(&mut remaining)
             .expect("读取剩余 stderr 必须成功");
+        remaining
+    }
+
+    /// 在 Runtime 关闭 stdin 后回收子进程，并确认没有未断言的 Host 写入。
+    fn finish(self) {
+        let remaining = self.finish_with_stderr();
         assert!(remaining.is_empty(), "存在未断言的 Host wire: {remaining}");
     }
 }
@@ -117,6 +193,21 @@ fn next_inbound(runtime: &AcpRuntime) -> Inbound {
         }
         assert!(Instant::now() < deadline, "等待 sidecar 入站消息超时");
         thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// 等待 reader 将传输终止或协议错误显式交给调用方，不能无限轮询 `None`。
+fn next_inbound_error(runtime: &AcpRuntime) -> String {
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    loop {
+        match runtime.poll_inbound() {
+            Ok(Some(inbound)) => panic!("预期入站错误，实际收到消息: {inbound:?}"),
+            Ok(None) => {
+                assert!(Instant::now() < deadline, "等待 ACP 入站错误超时");
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return error.to_string(),
+        }
     }
 }
 
@@ -319,4 +410,212 @@ fn unknown_reverse_request_can_receive_method_not_found_error() {
 
     drop(runtime);
     peer.finish();
+}
+
+/// stdout EOF 必须变成可观察的终止错误，而不是让调用方无限得到 None。
+#[test]
+fn stdout_eof_is_reported_as_transport_error() {
+    let (runtime, peer) = runtime_with_peer(STDOUT_EOF);
+
+    let error = next_inbound_error(&runtime);
+    assert!(
+        error.contains("ACP stdout EOF"),
+        "EOF 错误必须包含传输终止原因: {error}"
+    );
+
+    drop(runtime);
+    peer.finish();
+}
+
+/// 同一个 reverse id 的重复 request 必须报错且保留第一次 options 账本。
+#[test]
+fn duplicate_reverse_id_preserves_original_permission_options() {
+    let (runtime, mut peer) = runtime_with_peer(DUPLICATE_REVERSE_REQUESTS);
+
+    let id = match next_inbound(&runtime) {
+        Inbound::Request { id, method, params } => {
+            assert_eq!(method, "session/request_permission");
+            assert_eq!(params["options"][0]["optionId"], "first-option");
+            id
+        }
+        other => panic!("预期第一次 permission reverse request，实际: {other:?}"),
+    };
+
+    // 给 sidecar 一个独立的 notification 作为继续发送重复 id 的同步点；不能回复
+    // 第一次 request，否则重复 id 到达时原账本已经被消费。
+    runtime
+        .notify_validated(
+            "session/cancel",
+            json!({ "sessionId": "session-1" }),
+            &policy(),
+        )
+        .expect("同步 notification 必须写入");
+    let wire = peer.read_wire();
+    assert_eq!(wire["method"], "session/cancel");
+    assert!(wire.get("id").is_none());
+
+    let duplicate_error = next_inbound_error(&runtime);
+    assert!(
+        duplicate_error.contains("重复") || duplicate_error.contains("duplicate"),
+        "重复 reverse id 必须被明确拒绝: {duplicate_error}"
+    );
+
+    runtime
+        .reply_validated(
+            id.clone(),
+            ValidatedReply::Result(json!({
+                "outcome": { "outcome": "selected", "optionId": "first-option" }
+            })),
+            &policy(),
+        )
+        .expect("第一次 request 的原始 option 必须仍可回复");
+    let reply_wire = peer.read_wire();
+    assert_eq!(reply_wire["id"], json!(id.get()));
+    assert_eq!(reply_wire["result"]["outcome"]["optionId"], "first-option");
+
+    drop(runtime);
+    peer.finish();
+}
+
+/// ACP decoder 只还原 `_x.ai/` 扩展前缀，非扩展 method 的前导 `_` 必须保留。
+#[test]
+fn non_extension_leading_underscore_is_preserved() {
+    let (runtime, peer) = runtime_with_peer(NON_EXTENSION_UNDERSCORE_REQUEST);
+
+    match next_inbound(&runtime) {
+        Inbound::Request { method, .. } => assert_eq!(method, "_not_an_extension"),
+        other => panic!("预期带前导下划线的 reverse request，实际: {other:?}"),
+    }
+
+    drop(runtime);
+    peer.finish();
+}
+
+/// Host→sidecar 在途账本必须有上限，超限 request 在写入前 fail-closed。
+#[test]
+fn outbound_request_ledger_is_bounded_before_write() {
+    let (runtime, peer) = runtime_with_peer(DISCARD_STDIN);
+    let policy = policy();
+
+    for _ in 0..64 {
+        runtime
+            .request_validated(
+                "x.ai/mcp/list",
+                json!({ "sessionId": "session-1" }),
+                &policy,
+            )
+            .expect("达到上限前 request 必须可登记");
+    }
+
+    let error = runtime
+        .request_validated(
+            "x.ai/mcp/list",
+            json!({ "sessionId": "session-1" }),
+            &policy,
+        )
+        .expect_err("第 65 个在途 request 必须被拒绝");
+    assert!(
+        error.to_string().contains("上限") || error.to_string().contains("limit"),
+        "超限错误必须可观察: {error}"
+    );
+
+    runtime.shutdown().expect("显式 shutdown 必须回收 runtime");
+    peer.finish();
+}
+
+/// reverse request 账本达到上限时必须终止 reader，并清理全部 pending 记录。
+#[test]
+fn inbound_reverse_request_ledger_is_bounded_and_fails_closed() {
+    let (runtime, mut peer) = runtime_with_peer(MANY_REVERSE_REQUESTS);
+    let policy = policy();
+
+    for expected_id in 1..=64 {
+        match next_inbound(&runtime) {
+            Inbound::Request { id, method, .. } => {
+                assert_eq!(id, RequestId::new(expected_id));
+                assert_eq!(method, "x.ai/test");
+            }
+            other => panic!("预期 reverse request {expected_id}，实际: {other:?}"),
+        }
+
+        runtime
+            .notify_validated(
+                "session/cancel",
+                json!({ "sessionId": "session-1" }),
+                &policy,
+            )
+            .expect("同步 notification 必须写入");
+        let wire = peer.read_wire();
+        assert_eq!(wire["method"], "session/cancel");
+        assert!(wire.get("id").is_none());
+    }
+
+    let error = next_inbound_error(&runtime);
+    assert!(
+        error.contains("账本") || error.contains("limit"),
+        "reverse request 账本超限必须可观察: {error}"
+    );
+
+    // 终止后账本已清理；旧 id 不得再被当作可回复 request。
+    let reply_error = runtime
+        .reply_validated(
+            RequestId::new(1),
+            ValidatedReply::Error {
+                code: METHOD_NOT_FOUND,
+                message: "Method not found".to_string(),
+            },
+            &policy,
+        )
+        .expect_err("transport 终止后 pending reverse request 必须清理");
+    assert!(reply_error.to_string().contains("未找到"));
+
+    drop(runtime);
+    let remaining = peer.finish_with_stderr();
+    assert!(
+        remaining.trim().is_empty(),
+        "存在未断言的 Host wire: {remaining:?}"
+    );
+}
+
+/// 入站 notification 队列溢出必须报告错误，不能静默丢弃消息换取内存安全。
+#[test]
+fn inbound_notification_queue_overflow_is_observable() {
+    let (runtime, peer) = runtime_with_peer(MANY_NOTIFICATIONS);
+
+    for expected_sequence in 1..=64 {
+        match next_inbound(&runtime) {
+            Inbound::Notification { method, params } => {
+                assert_eq!(method, "session/update");
+                assert_eq!(params["sequence"], expected_sequence);
+            }
+            other => panic!("预期第 {expected_sequence} 条 notification，实际: {other:?}"),
+        }
+    }
+
+    let error = next_inbound_error(&runtime);
+    assert!(
+        error.contains("队列") || error.contains("queue"),
+        "入站队列超限必须可观察: {error}"
+    );
+
+    drop(runtime);
+    let stderr = peer.finish_with_stderr();
+    assert_eq!(stderr, "stdin-closed-after-queue-overflow\n");
+}
+
+/// Runtime Drop 必须关闭 reader 持有的 stdout fd，再回收 worker，不能留下阻塞线程。
+#[test]
+fn runtime_drop_closes_stdout_reader_before_worker_join() {
+    let (runtime, peer) = runtime_with_peer(STDOUT_HELD_BY_DESCENDANT);
+
+    drop(runtime);
+    let stderr = peer.finish_with_stderr();
+    assert!(
+        stderr.contains("reader-closed"),
+        "runtime Drop 后 stdout 读端必须关闭，实际 stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("reader-open"),
+        "runtime Drop 不得遗留持有 stdout 的 reader worker: {stderr:?}"
+    );
 }

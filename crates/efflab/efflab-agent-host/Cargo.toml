@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 anyhow = { workspace = true }
 efflab-agent-contract = { path = "../efflab-agent-contract" }
+libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

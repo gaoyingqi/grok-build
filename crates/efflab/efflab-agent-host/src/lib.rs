@@ -15,7 +15,7 @@ pub use app_port::{
     ScopeId, SealedSecret, SecretGuard,
 };
 pub use config::HostRuntimeConfig;
-pub use event_sink::KitEventSink;
+pub use event_sink::{KitEventSink, ValidatedKitEventSink};
 pub use protocol::{
     Capability, CapabilityLimits, KIT_SCHEMA_VERSION, KitBlock, KitCommand, KitError,
     KitProductEvent, KitProductEventValidationError, KitReply, LlmChannelKind, LlmChannelView,

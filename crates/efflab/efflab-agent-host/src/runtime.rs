@@ -6,13 +6,15 @@
 use std::sync::Mutex;
 
 use crate::submission::{SubmissionDecision, SubmissionMap};
-use crate::{HostApp, HostRuntimeConfig, KitCommand, KitError, KitEventSink, KitReply};
+use crate::{
+    HostApp, HostRuntimeConfig, KitCommand, KitError, KitEventSink, KitReply, ValidatedKitEventSink,
+};
 
 /// 产品唯一调用入口的最小运行时状态。
 pub struct HostRuntime {
     /// 产品领域端口；本任务保留以冻结构造 API，不调用其业务方法。
     _app: Box<dyn HostApp>,
-    /// 产品事件运输端口；本任务不发射事件。
+    /// 构造时已包入验证边界的产品事件运输端口；本任务不发射事件。
     _sink: Box<dyn KitEventSink>,
     /// 运行配置；本任务不访问其中路径。
     _cfg: HostRuntimeConfig,
@@ -29,7 +31,7 @@ impl HostRuntime {
     ) -> Self {
         Self {
             _app: Box::new(app),
-            _sink: Box::new(sink),
+            _sink: Box::new(ValidatedKitEventSink::new(sink)),
             _cfg: cfg,
             submissions: Mutex::new(SubmissionMap::default()),
         }

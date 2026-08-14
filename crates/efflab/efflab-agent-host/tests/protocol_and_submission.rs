@@ -3,14 +3,14 @@
 //! 本文件先于 host crate 实现创建，以锁定 M0 协议形状和最小 dispatch 行为。
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
 use efflab_agent_host::{
     ApprovedMcpSpec, HostApp, HostRuntime, HostRuntimeConfig, KitBlock, KitCommand, KitError,
     KitEventSink, KitProductEvent, KitReply, LlmChannelConfig, LlmChannelView, MentionId,
-    ResolvedMention, ScopeId, SealedSecret, SecretGuard,
+    ResolvedMention, ScopeId, SealedSecret, SecretGuard, ValidatedKitEventSink,
 };
 
 /// 构造仅供协议测试使用的运行时配置；骨架阶段不会访问这些路径。
@@ -52,14 +52,14 @@ impl HostApp for FakeApp {
     }
 }
 
-/// 内存事件 sink；用于验证 Host 出站边界只向产品运输合法事件。
+/// 内存事件 sink；仅实现冻结的产品运输 trait，校验由 Host 包装器负责。
 #[derive(Default)]
 struct MemorySink {
-    events: Mutex<Vec<KitProductEvent>>,
+    events: Arc<Mutex<Vec<KitProductEvent>>>,
 }
 
 impl KitEventSink for MemorySink {
-    fn emit_to_product(&self, ev: KitProductEvent) -> Result<()> {
+    fn emit(&self, ev: KitProductEvent) -> Result<()> {
         self.events.lock().expect("事件锁必须可用").push(ev);
         Ok(())
     }
@@ -395,12 +395,15 @@ fn kit_event_sink_rejects_invalid_inbound_event_before_transport() {
         "block": { "kind": "user", "text": "hello" }
     }))
     .expect("入站 serde 不得因异常标识失败");
-    let sink = MemorySink::default();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = ValidatedKitEventSink::new(MemorySink {
+        events: Arc::clone(&events),
+    });
 
     sink.emit(event)
-        .expect_err("非法事件必须在 emit 边界被拒绝");
+        .expect_err("非法事件必须在 Host emit 边界被拒绝");
     assert!(
-        sink.events.lock().expect("事件锁必须可用").is_empty(),
+        events.lock().expect("事件锁必须可用").is_empty(),
         "被拒绝的事件不得进入产品运输"
     );
 }

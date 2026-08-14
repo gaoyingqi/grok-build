@@ -25,7 +25,7 @@ use tokio::sync::oneshot;
 use url::Url;
 
 use crate::config::L3bRuntimeConfig;
-use crate::llm_channel::{LlmChannelError, LlmChannelManager};
+use crate::llm_channel::{LlmChannelError, LlmChannelManager, is_loopback_ip};
 
 /// 入站 Chat Completions 请求的硬上限；超过时在任何上游访问前返回 413。
 pub const MAX_L3B_REQUEST_BODY_BYTES: usize = 1_048_576;
@@ -533,12 +533,34 @@ async fn verify_upstream(base_url: &str, allow_loopback_llm: bool) -> Result<Ver
     {
         return Err(());
     }
-    let hostname = chat_completions_url.host_str().ok_or(())?.to_string();
+    // IPv4-compatible/mapped IPv6 在部分内核没有可路由的 IPv6 路径；将 URL 规范为
+    // 等价的嵌入 IPv4 literal，使设置和请求阶段按同一地址语义处理。
+    if let Some(url::Host::Ipv6(address)) = chat_completions_url.host() {
+        if let Some(embedded) = embedded_ipv4_address(address) {
+            let embedded = embedded.to_string();
+            chat_completions_url
+                .set_host(Some(embedded.as_str()))
+                .map_err(|_| ())?;
+        }
+    }
+    // reqwest 的 resolver 以不带 IPv6 方括号的 host 查找覆盖地址；未规范化的 URL
+    // 仍保持原 host，因而 HTTPS 时的 SNI/证书校验语义不变。
+    let hostname = match chat_completions_url.host().ok_or(())? {
+        url::Host::Ipv4(address) => address.to_string(),
+        url::Host::Ipv6(address) => address.to_string(),
+        url::Host::Domain(host) => host.to_string(),
+    };
     let port = chat_completions_url.port_or_known_default().ok_or(())?;
-    let addresses: Vec<SocketAddr> = tokio::net::lookup_host((hostname.as_str(), port))
-        .await
-        .map_err(|_| ())?
-        .collect();
+    // IP literal 已由 URL 解析为地址，直接构造 SocketAddr，避免把带方括号的 IPv6 host
+    // 误交给 DNS；只有域名才需要在每次请求前重新解析并全量审查。
+    let addresses: Vec<SocketAddr> = match chat_completions_url.host().ok_or(())? {
+        url::Host::Ipv4(address) => vec![SocketAddr::new(IpAddr::V4(address), port)],
+        url::Host::Ipv6(address) => vec![SocketAddr::new(IpAddr::V6(address), port)],
+        url::Host::Domain(host) => tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|_| ())?
+            .collect(),
+    };
     if addresses.is_empty()
         || addresses
             .iter()
@@ -551,8 +573,8 @@ async fn verify_upstream(base_url: &str, allow_loopback_llm: bool) -> Result<Ver
         "https" => {}
         // 明文 HTTP 仅支持显式开发开关下的纯 loopback 集合；private/metadata 永不例外。
         "http"
-            if allow_loopback_llm && addresses.iter().all(|address| address.ip().is_loopback()) => {
-        }
+            if allow_loopback_llm
+                && addresses.iter().all(|address| is_loopback_ip(address.ip())) => {}
         _ => return Err(()),
     }
 

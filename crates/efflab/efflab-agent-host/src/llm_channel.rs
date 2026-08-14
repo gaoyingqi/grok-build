@@ -650,7 +650,7 @@ fn validate_byok_candidate_addresses(
 }
 
 /// 判断原生或 IPv4-embedded 地址是否等价于回环，用于严格的开发 HTTP 例外。
-fn is_loopback_ip(ip: IpAddr) -> bool {
+pub(crate) fn is_loopback_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(address) => address.is_loopback(),
         IpAddr::V6(address) => {

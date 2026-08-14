@@ -127,13 +127,16 @@ impl std::error::Error for SupervisorError {
 
 /// 将 app_id 或 scope 约束为单一、不可遍历的目录组件。
 ///
-/// 该函数不替换、截断或归一化输入，避免不同不透明 scope 映射到同一个目录。
+/// 该函数不替换、截断或归一化输入，避免不同不透明 scope 映射到同一个目录；也拒绝
+/// `:`，使 Windows 盘符前缀不能改变后续 `Path::join` 的固定根目录。
 pub fn sanitize(component: &str) -> Result<String, SupervisorError> {
     if component.is_empty()
         || component == "."
         || component.contains("..")
         || component.contains('/')
         || component.contains('\\')
+        // `:` 可构成 Windows 盘符前缀；跨平台稳定标识一律拒绝，避免 join 丢弃左侧根目录。
+        || component.contains(':')
         || component.contains('\0')
     {
         return Err(SupervisorError::InvalidPathComponent);

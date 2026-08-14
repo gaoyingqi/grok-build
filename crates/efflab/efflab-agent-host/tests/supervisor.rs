@@ -56,10 +56,18 @@ fn acquire_reuses_one_slot_per_scope_with_initial_metadata() {
 
 /// 组件输入若能形成路径语义，必须在 join 前 fail-closed，避免 scope 或 app_id 逃逸。
 #[test]
-fn sanitize_rejects_empty_dot_parent_and_path_separators() {
-    for invalid in ["", ".", "..", "name/child", r"name\child", "name..suffix"] {
+fn sanitize_rejects_empty_traversal_separators_and_drive_prefixes() {
+    for invalid in [
+        "",
+        ".",
+        "..",
+        "name/child",
+        r"name\child",
+        "name..suffix",
+        "C:temp",
+    ] {
         let error = efflab_agent_host::sanitize(invalid)
-            .expect_err("空、遍历或含路径分隔符的组件必须被拒绝");
+            .expect_err("空、遍历、路径分隔符或 Windows 盘符前缀的组件必须被拒绝");
         assert!(
             matches!(error, SupervisorError::InvalidPathComponent),
             "{invalid:?} 必须报告组件非法，而不是被静默规范化: {error}"
@@ -91,22 +99,19 @@ fn paths_force_app_id_join_and_remain_absolute() {
         .acquire("scope-7")
         .expect("合法 scope 必须可取得 slot");
     let paths = slot.paths();
-    assert_eq!(
-        paths.home,
-        supplied_root
-            .join("authoritative-app")
-            .join("scope-7")
-            .join("home")
-    );
-    assert_eq!(
-        paths.workspace,
-        supplied_root
-            .join("authoritative-app")
-            .join("scope-7")
-            .join("workspace")
-    );
+    let expected_scope_root = supplied_root.join("authoritative-app").join("scope-7");
+    assert_eq!(paths.home, expected_scope_root.join("home"));
+    assert_eq!(paths.workspace, expected_scope_root.join("workspace"));
     assert!(paths.home.is_absolute());
     assert!(paths.workspace.is_absolute());
+    assert!(
+        paths.home.starts_with(&expected_scope_root),
+        "home 必须保持在 Host 派生的 app_id/scope 根目录内"
+    );
+    assert!(
+        paths.workspace.starts_with(&expected_scope_root),
+        "workspace 必须保持在 Host 派生的 app_id/scope 根目录内"
+    );
 }
 
 /// sidecar 已拥有的私有 home lock 不得阻塞 Host 的独立 process-slot metadata。
@@ -277,6 +282,29 @@ fn child_lifecycle_drop_cancels_then_escalates_with_fixed_grace_periods() {
         ],
         "Drop 必须按 cancel → close stdin 3.5s → TERM 2s → KILL 的顺序执行"
     );
+}
+
+/// Windows 盘符相对组件会让 Path::join 丢弃左侧根目录，app_id 与 scope 均必须拒绝。
+#[cfg(windows)]
+#[test]
+fn windows_rejects_drive_relative_app_id_and_scope() {
+    let root = std::env::temp_dir().join("efflab-agent-host-windows-drive-prefix");
+
+    let app_id_error = Supervisor::new(config(root.clone()), "C:temp")
+        .err()
+        .expect("盘符相对 app_id 不得越过 Host 强制根目录");
+    assert!(matches!(
+        app_id_error,
+        SupervisorError::InvalidPathComponent
+    ));
+
+    let supervisor =
+        Supervisor::new(config(root), "windows-app").expect("合法 app_id 必须可构造 supervisor");
+    let scope_error = supervisor
+        .paths_for("C:temp")
+        .err()
+        .expect("盘符相对 scope 不得越过 Host 强制根目录");
+    assert!(matches!(scope_error, SupervisorError::InvalidPathComponent));
 }
 
 /// Windows 必须保留 Supervisor、lifecycle 和 kill API 的编译形状，同时 fail-closed。

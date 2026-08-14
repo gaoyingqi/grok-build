@@ -147,3 +147,76 @@ Windows 交叉检查：已运行 `rustup target list --installed`；仅安装 `a
 - `cargo fmt --all -- --check`：最终格式检查通过。
 - `git diff --check`：无空白错误。
 - `rustup target list --installed`：确认 Windows target 未安装。
+
+---
+
+## Task 5 修复报告：Windows 盘符前缀路径边界
+
+### 修复背景
+
+复审发现 `sanitize` 先前允许 `C:temp`。该值在 Windows 上属于带盘符前缀、但不带根的路径组件，若传给 `Path::join`，可能丢弃 Host 已拼接的左侧根目录，破坏 `{home_root}/{app_id}/{scope}` 的稳定绝对路径合同。
+
+### TDD Evidence
+
+#### RED
+
+先补充回归测试，再修改生产实现：
+
+```text
+cargo test -p efflab-agent-host --test supervisor sanitize_rejects_empty_traversal_separators_and_drive_prefixes
+退出码: 101
+失败断言: 空、遍历或含路径分隔符的组件必须被拒绝: "C:temp"
+```
+
+该失败符合预期：旧 `sanitize` 未将 `:` 视为非法组件字符，因此错误接受了 Windows 盘符相对前缀。
+
+#### GREEN
+
+将 `:` 加入 `sanitize` 的 fail-closed 拒绝条件，并补充中文注释说明其阻止 Windows `Path::join` 丢弃左侧根目录。随后运行：
+
+```text
+cargo test -p efflab-agent-host --test supervisor
+退出码: 0
+结果: 8 passed, 0 failed
+```
+
+### 变更内容
+
+- `crates/efflab/efflab-agent-host/src/supervisor.rs`
+  - `sanitize` 现在拒绝 `:`；该保守的跨平台规则覆盖 Windows 盘符前缀，同时保留原有空串、`.`、`..`、分隔符和 NUL 拒绝逻辑。
+- `crates/efflab/efflab-agent-host/tests/supervisor.rs`
+  - 通用非法组件表新增 `C:temp`，使非 Windows 开发机也能执行 RED/GREEN 回归。
+  - 稳定路径测试继续断言 `home` 和 `workspace` 绝对、精确等于 `{home_root}/{app_id}/{scope}/{home|workspace}`，并新增两者都以派生 `app_id/scope` 根目录开头的断言。
+  - 新增 `#[cfg(windows)] windows_rejects_drive_relative_app_id_and_scope`：分别断言 `app_id="C:temp"` 的构造失败，以及合法 app_id 下 `paths_for("C:temp")` 的 scope 失败；此用例与既有 Windows capability/kill API 用例共同在 Windows target 编译。
+
+### 验证结果
+
+```text
+cargo test -p efflab-agent-host
+退出码: 0
+结果:
+- acp_runtime.rs: 14 passed
+- protocol_and_submission.rs: 21 passed
+- supervisor.rs: 8 passed
+- lib unit tests 与 doc-tests: 0 failed
+
+cargo fmt --all -- --check
+退出码: 0
+
+git diff --check
+退出码: 0
+```
+
+已运行 `rustup target list --installed`；本机仍未安装 `x86_64-pc-windows-msvc`，因此按任务要求未执行该 target 的 `cargo check`，也没有下载 target。Windows target 安装后应执行：
+
+```text
+cargo check -p efflab-agent-host --target x86_64-pc-windows-msvc
+```
+
+### 自审与范围
+
+- `:` 拒绝发生在 `Supervisor::new` 的 app_id join 前、以及 `paths_for`/`acquire` 的 scope join 前，因此两个公开路径入口均 fail-closed。
+- 未修改 `AcpRuntime`、真实 spawn、L3b、TOML、sidecar lock、child env 或任何 Task 6+ 内容。
+- 未发现新的已知问题；唯一环境限制仍是本机缺少 Windows target 的实际编译验证。
+
+提交：`fix(host): reject windows drive-prefix app_id and scope`（本修复报告与该提交一并提交；未 push）。

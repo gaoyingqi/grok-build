@@ -3,6 +3,7 @@
 //! 这些类型定义产品领域端口；Task 7 使用其中的 Channel 密封接缝，MCP 启动与
 //! mention 文本展开仍由后续专项任务实现。
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use anyhow::Result;
@@ -30,9 +31,31 @@ pub struct ResolvedMention {
     pub text: String,
 }
 
-/// 受控 MCP 规格占位；实际 server DTO 由 contract crate 提供。
+/// 产品为当前 scope 审核过、模型可见的 MCP 工具集合。
+///
+/// Task 7b 只消费此集合完成运行时 catalog/permission 校验；它不据此启动 MCP
+/// server。默认空集代表当前产品没有启用 Task 11 的领域 MCP。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ApprovedMcpSpec;
+pub struct ApprovedMcpSpec {
+    expected_tools: BTreeSet<String>,
+}
+
+impl ApprovedMcpSpec {
+    /// 用审核后的完整工具名构造规格，并丢弃空白名称以保持失败关闭的空集语义。
+    pub fn with_expected_tools(names: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            expected_tools: names
+                .into_iter()
+                .filter(|name| !name.trim().is_empty())
+                .collect(),
+        }
+    }
+
+    /// 返回稳定排序的模型可见工具名；调用方不得把原始 MCP 配置泄漏到产品协议。
+    pub fn expected_tools(&self) -> &BTreeSet<String> {
+        &self.expected_tools
+    }
+}
 
 /// 已密封秘密的产品存储载体；Host 不解释其内部字节。
 ///

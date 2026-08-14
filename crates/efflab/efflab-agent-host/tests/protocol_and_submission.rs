@@ -9,8 +9,8 @@ use std::time::Duration;
 use anyhow::Result;
 use efflab_agent_host::{
     ApprovedMcpSpec, HostApp, HostRuntime, HostRuntimeConfig, KitBlock, KitCommand, KitError,
-    KitEventSink, KitProductEvent, KitReply, LlmChannelConfig, LlmChannelView, MentionId,
-    ResolvedMention, ScopeId, SealedSecret, SecretGuard, ValidatedKitEventSink,
+    KitEventSink, KitProductEvent, KitReply, LlmChannelConfig, LlmChannelView, ResolvedMention,
+    ScopeId, SealedSecret, SecretGuard, ValidatedKitEventSink,
 };
 
 /// 构造仅供协议测试使用的运行时配置；骨架阶段不会访问这些路径。
@@ -245,9 +245,9 @@ fn set_llm_channel_wire_keeps_secret_out_of_responses() {
     assert!(!rendered.contains("access_token"));
 }
 
-/// 全空 Set 请求是未来 Channel 语义的合法 no-op，M0 仍必须走 structured unsupported。
+/// 全空 Set 请求是 Channel 语义的合法 no-op，闭环 runtime 直接回当前无凭据 view。
 #[test]
-fn empty_set_llm_channel_decodes_and_reaches_unsupported_dispatch() {
+fn empty_set_llm_channel_decodes_and_returns_current_view() {
     let command = KitCommand::from_json_value(serde_json::json!({ "cmd": "set_llm_channel" }))
         .expect("全空 SetLlmChannel 必须能解码");
     assert!(matches!(
@@ -259,15 +259,19 @@ fn empty_set_llm_channel_decodes_and_reaches_unsupported_dispatch() {
         }
     ));
 
-    let error = runtime()
-        .dispatch(command)
-        .expect_err("全空 SetLlmChannel 在 skeleton 阶段必须 unsupported");
-    assert_eq!(error.code, "unsupported");
+    assert_eq!(
+        runtime()
+            .dispatch(command)
+            .expect("全空 SetLlmChannel 必须返回当前 view"),
+        KitReply::LlmChannelView {
+            channel: LlmChannelView::default(),
+        }
+    );
 }
 
-/// 仅带请求幂等标识的 Set 请求也是合法 no-op，不能在 serde 边界失败。
+/// 仅带请求幂等标识的 Set 请求也是合法 no-op，不能在 serde 或 dispatch 边界失败。
 #[test]
-fn request_id_only_set_llm_channel_decodes_and_reaches_unsupported_dispatch() {
+fn request_id_only_set_llm_channel_decodes_and_returns_current_view() {
     let command = KitCommand::from_json_value(serde_json::json!({
         "cmd": "set_llm_channel",
         "client_request_id": "request-1"
@@ -282,10 +286,14 @@ fn request_id_only_set_llm_channel_decodes_and_reaches_unsupported_dispatch() {
         } if request_id == "request-1"
     ));
 
-    let error = runtime()
-        .dispatch(command)
-        .expect_err("仅 client_request_id 的 SetLlmChannel 在 skeleton 阶段必须 unsupported");
-    assert_eq!(error.code, "unsupported");
+    assert_eq!(
+        runtime()
+            .dispatch(command)
+            .expect("仅 client_request_id 的 SetLlmChannel 必须返回当前 view"),
+        KitReply::LlmChannelView {
+            channel: LlmChannelView::default(),
+        }
+    );
 }
 
 /// 命令调试输出是潜在日志路径，必须对请求中所有一次性秘密脱敏。
@@ -432,58 +440,20 @@ fn kit_event_sink_rejects_invalid_inbound_event_before_transport() {
     );
 }
 
-/// 同一 key 与同一稳定指纹应回同一 turn，且第二次标记 duplicate。
+/// 闭环 runtime 在未配置 Channel 时必须在 SubmissionMap 和 sidecar 之前拒绝 Send。
+/// 幂等指纹的完整真实 sidecar 覆盖位于 dispatch_loop 集成测试，避免本测试依赖假进程。
 #[test]
-fn same_submission_id_same_fingerprint_is_duplicate_reply() {
-    let runtime = runtime();
-    let first = runtime
-        .dispatch(send("same text", vec![]))
-        .expect("首次 Send 必须被接受");
-    let second = runtime
-        .dispatch(send("same text", vec![]))
-        .expect("同指纹 Send 必须幂等成功");
-
-    assert_send_reply(&first, false, "submission");
-    assert_send_reply(&second, true, "submission");
-}
-
-/// 同一 submission key 的文本字节变化必须 fail-closed，禁止重复投递为新 turn。
-#[test]
-fn same_submission_id_different_bytes_fail_closed() {
-    let runtime = runtime();
-    runtime
-        .dispatch(send("first text", vec![]))
-        .expect("首次 Send 必须被接受");
-
-    let error = runtime
-        .dispatch(send("second text", vec![]))
-        .expect_err("同 submission 的不同文本必须冲突");
-    assert_eq!(error.code, "fingerprint_conflict");
-}
-
-/// mentions 必须按 (kind, id) 排序计算指纹；集合变化则同 submission 冲突。
-#[test]
-fn same_submission_and_text_with_different_mentions_conflicts() {
-    let runtime = runtime();
-    runtime
-        .dispatch(send(
-            "same text",
-            vec![mention("album", "2"), mention("track", "1")],
-        ))
-        .expect("首次 Send 必须被接受");
-
-    let same_mentions_different_order = runtime
-        .dispatch(send(
-            "same text",
-            vec![mention("track", "1"), mention("album", "2")],
-        ))
-        .expect("排序变化不得影响稳定指纹");
-    assert_send_reply(&same_mentions_different_order, true, "submission");
-
-    let error = runtime
-        .dispatch(send("same text", vec![mention("track", "different")]))
-        .expect_err("mentions 集合变化必须冲突");
-    assert_eq!(error.code, "fingerprint_conflict");
+fn unconfigured_runtime_rejects_send_before_submission_or_sidecar_work() {
+    let error = runtime()
+        .dispatch(KitCommand::Send {
+            scope_id: "scope".to_string(),
+            session_id: "session".to_string(),
+            submission_id: "submission".to_string(),
+            text: "same text".to_string(),
+            mentions: None,
+        })
+        .expect_err("未配置 Channel 时 Send 必须 fail-closed");
+    assert_eq!(error.code, "llm_channel_unconfigured");
 }
 
 /// host 只能依赖 contract 与小依赖，禁止反向链接 sidecar 或 grok shell。
@@ -508,45 +478,6 @@ fn event(block: KitBlock, turn_id: Option<&str>, submission_id: Option<&str>) ->
         origin: efflab_agent_host::Origin::Live,
         block_id: "block".to_string(),
         block,
-    }
-}
-
-/// 构造固定 key 的 Send 命令，便于覆盖 SubmissionMap 的幂等边界。
-fn send(text: &str, mentions: Vec<MentionId>) -> KitCommand {
-    KitCommand::Send {
-        scope_id: "scope".to_string(),
-        session_id: "session".to_string(),
-        submission_id: "submission".to_string(),
-        text: text.to_string(),
-        mentions: (!mentions.is_empty()).then_some(mentions),
-    }
-}
-
-/// 构造最小 mention 标识；解析与业务扩展属于后续任务。
-fn mention(kind: &str, id: &str) -> MentionId {
-    MentionId {
-        kind: kind.to_string(),
-        id: id.to_string(),
-    }
-}
-
-/// 收束 Send reply 的协议断言，避免测试只检查某一个字段。
-fn assert_send_reply(reply: &KitReply, expected_duplicate: bool, expected_turn_id: &str) {
-    match reply {
-        KitReply::Send {
-            accepted,
-            duplicate,
-            session_id,
-            turn_id,
-            submission_id,
-        } => {
-            assert!(*accepted);
-            assert_eq!(*duplicate, expected_duplicate);
-            assert_eq!(session_id, "session");
-            assert_eq!(turn_id, expected_turn_id);
-            assert_eq!(submission_id, "submission");
-        }
-        other => panic!("期望 Send reply，实际为 {other:?}"),
     }
 }
 

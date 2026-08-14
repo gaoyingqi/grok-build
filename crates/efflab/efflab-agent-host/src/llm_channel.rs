@@ -13,7 +13,9 @@ use crate::app_port::{HostApp, LlmChannelConfig, LlmSecretSlot, SealedSecret, Se
 use crate::config::{HostRuntimeConfig, L3bRuntimeConfig};
 use crate::llm_loopback::{L3bLoopback, embedded_ipv4_address, is_allowed_upstream_ip};
 use crate::protocol::{KitError, LlmChannelKind, LlmChannelView};
-use crate::supervisor::{SidecarProcessInfo, Supervisor, SupervisorError};
+use crate::supervisor::{
+    ScopePaths, SidecarProcessInfo, SidecarStdio, Supervisor, SupervisorError,
+};
 
 /// 一次 `set_llm_channel` 的受控输入；秘密只可在本对象生命周期内出现一次。
 #[derive(Default)]
@@ -69,6 +71,16 @@ pub struct ChannelChange {
     pub revision: u64,
     /// 不带凭据的 committed view。
     pub view: LlmChannelView,
+}
+
+/// 交给 HostRuntime scope actor 的一次真实启动结果。
+///
+/// 进程仍由 Supervisor slot 管理；该结构只移交 actor 独占所需的 stdin/stdout 与
+/// 不敏感进程/路径信息。
+pub(crate) struct LaunchedScope {
+    pub info: SidecarProcessInfo,
+    pub paths: ScopePaths,
+    pub stdio: SidecarStdio,
 }
 
 /// Channel 层的稳定失败分类；展示文本和日志均不包含用户输入或秘密。
@@ -760,6 +772,90 @@ impl LlmChannelService {
         self.supervisor
             .launch_sidecar(scope.as_ref(), &loopback, &self.manager)
             .map_err(map_supervisor_error_to_lifecycle)
+    }
+
+    /// 启动 scope 并将 ACP stdio 交给唯一的 HostRuntime IO actor。
+    ///
+    /// 这是 Task 7b 的内部接线入口；它严格复用 Task 7 的监听、token 注册、TOML
+    /// 写盘和 spawn 顺序，不允许 runtime 复制或绕开这些安全边界。
+    pub(crate) fn launch_scope_with_stdio(
+        &self,
+        scope: impl AsRef<str>,
+    ) -> Result<LaunchedScope, LlmChannelError> {
+        let scope = scope.as_ref();
+        let _lifecycle = self
+            .lifecycle_lock
+            .lock()
+            .map_err(|_| LlmChannelError::StateUnavailable)?;
+        let loopback = self.ensure_loopback()?;
+        let paths = self
+            .supervisor
+            .paths_for(scope)
+            .map_err(map_supervisor_error_to_lifecycle)?;
+        let info = self
+            .supervisor
+            .launch_sidecar(scope, &loopback, &self.manager)
+            .map_err(map_supervisor_error_to_lifecycle)?;
+        let stdio = match self.supervisor.take_stdio(scope, info.generation) {
+            Ok(stdio) => stdio,
+            Err(error) => {
+                // 不能留下已经取得 binding token、但没有 IO actor 的 child。
+                let _ = self.supervisor.stop_scope(scope);
+                return Err(map_supervisor_error_to_lifecycle(error));
+            }
+        };
+        Ok(LaunchedScope { info, paths, stdio })
+    }
+
+    /// 停止一个 scope；调用方必须先关闭其 actor 持有的 stdin，确保 child 能尽快 EOF。
+    pub(crate) fn stop_scope(&self, scope: &str) -> Result<(), LlmChannelError> {
+        let _lifecycle = self
+            .lifecycle_lock
+            .lock()
+            .map_err(|_| LlmChannelError::StateUnavailable)?;
+        self.supervisor
+            .stop_scope(scope)
+            .map_err(map_supervisor_error_to_lifecycle)
+    }
+
+    /// 返回当前实际仍存活的 sidecar scope；HostRuntime 据此只重建全局换代前的 live actor。
+    pub(crate) fn live_scope_ids(&self) -> Result<Vec<String>, LlmChannelError> {
+        let _lifecycle = self
+            .lifecycle_lock
+            .lock()
+            .map_err(|_| LlmChannelError::StateUnavailable)?;
+        self.supervisor
+            .live_scope_ids()
+            .map_err(map_supervisor_error_to_lifecycle)
+    }
+
+    /// 仅提交 Channel 并立即使旧 token 失效；actor drain/restart 由 HostRuntime 协调。
+    ///
+    /// 公开 `set` 保持 Task 7 的独立 lifecycle 语义。此内部入口避免 Supervisor 在
+    /// stdio 已转交 AcpRuntime 后无权关闭 writer 的问题，并让 runtime 能重建新 actor。
+    pub(crate) fn commit_and_invalidate(
+        &self,
+        request: SetLlmChannelRequest,
+    ) -> Result<ChannelChange, LlmChannelError> {
+        let _lifecycle = self
+            .lifecycle_lock
+            .lock()
+            .map_err(|_| LlmChannelError::StateUnavailable)?;
+        let change = self.manager.set(request)?;
+        if !change.changed {
+            return Ok(change);
+        }
+        if let Some(loopback) = self
+            .loopback
+            .lock()
+            .map_err(|_| LlmChannelError::StateUnavailable)?
+            .as_ref()
+            .cloned()
+        {
+            // persist 成功后立即撤销旧身份；后续 restart 失败也不能复活旧 token。
+            loopback.registry().invalidate_all();
+        }
+        Ok(change)
     }
 
     /// 提交全局 Channel，再使所有旧 token 失效并 drain/restart 所有活跃 scope。

@@ -12,7 +12,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -98,6 +98,8 @@ pub enum SupervisorError {
     RestartFailed,
     /// scope slot 的内部状态锁已中毒，不能安全继续复用。
     StateUnavailable,
+    /// 已启动 child 的 ACP stdin/stdout 已被另一个 IO actor 接管或不可用。
+    StdioUnavailable,
     /// 生命周期底层操作失败；保留 I/O 分类但不记录环境内容。
     Io {
         /// 失败的生命周期动作名称。
@@ -133,6 +135,7 @@ impl fmt::Display for SupervisorError {
             Self::ConfigWriteFailed => formatter.write_str("权威 sidecar 配置写入失败"),
             Self::RestartFailed => formatter.write_str("sidecar 批量重启失败"),
             Self::StateUnavailable => formatter.write_str("scope slot 状态不可用"),
+            Self::StdioUnavailable => formatter.write_str("sidecar ACP stdio 不可用"),
             Self::Io { operation, source } => write!(formatter, "子进程{operation}失败: {source}"),
         }
     }
@@ -299,6 +302,15 @@ pub struct SidecarProcessInfo {
     pub generation: u64,
     /// 注册 token 时的 Channel revision。
     pub channel_revision: u64,
+}
+
+/// 只交给该 scope 唯一 IO actor 的 ACP 管道端点。
+///
+/// child 本身仍留在 Supervisor slot 中负责 token 失效与进程回收；actor 只独占 stdin
+/// 和 stdout，不能取得 child、环境或 binding token。
+pub(crate) struct SidecarStdio {
+    pub stdin: ChildStdin,
+    pub stdout: ChildStdout,
 }
 
 /// 一个 scope 唯一对应的进程所有权槽。
@@ -583,6 +595,53 @@ impl Supervisor {
             pid,
             generation,
             channel_revision,
+        })
+    }
+
+    /// 把刚启动 child 的 ACP stdio 仅移交给该 scope 的唯一 IO actor。
+    ///
+    /// Supervisor 保留 child 所有权以负责 token 与生命周期；重复移交、旧 generation
+    /// 或正在停止的 slot 一律 fail-closed，避免两个 actor 竞争同一 stdin/stdout。
+    pub(crate) fn take_stdio(
+        &self,
+        scope: &str,
+        generation: u64,
+    ) -> Result<SidecarStdio, SupervisorError> {
+        let scope_id = sanitize(scope)?;
+        let slot = self
+            .slots
+            .lock()
+            .map_err(|_| SupervisorError::StateUnavailable)?
+            .get(&scope_id)
+            .cloned()
+            .ok_or(SupervisorError::StdioUnavailable)?;
+        let mut runtime = slot
+            .runtime
+            .lock()
+            .map_err(|_| SupervisorError::StateUnavailable)?;
+        if runtime.stopping || runtime.launching {
+            return Err(SupervisorError::StdioUnavailable);
+        }
+        let process = runtime
+            .child
+            .as_mut()
+            .filter(|process| process.generation == generation)
+            .ok_or(SupervisorError::StdioUnavailable)?;
+        // 同一 runtime 锁内先检查两端，之后没有其它路径可抢走任一 pipe。
+        if process.child.stdin.is_none() || process.child.stdout.is_none() {
+            return Err(SupervisorError::StdioUnavailable);
+        }
+        Ok(SidecarStdio {
+            stdin: process
+                .child
+                .stdin
+                .take()
+                .expect("已检查 sidecar stdin 必须存在"),
+            stdout: process
+                .child
+                .stdout
+                .take()
+                .expect("已检查 sidecar stdout 必须存在"),
         })
     }
 }

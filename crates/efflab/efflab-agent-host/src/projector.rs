@@ -191,6 +191,17 @@ impl Projector {
         std::mem::take(&mut session.replay_skipped)
     }
 
+    /// 为 Host 合成的 session/process 状态分配同一会话的下一个稳定序号。
+    ///
+    /// 这样 `replay_complete`、`mcp_failed` 等事件不会与刚刚投影的 ACP update 复用
+    /// sequence；新会话第一次合成状态从零开始。
+    pub fn next_host_sequence(&mut self, session_id: &str) -> Result<u64, ProjectError> {
+        self.sessions
+            .entry(session_id.to_string())
+            .or_default()
+            .allocate_sequence()
+    }
+
     /// 应用一个 ACP notification 的 params，返回零条或多条已校验的 Kit 事件。
     pub fn apply_acp_notification(
         &mut self,

@@ -40,6 +40,18 @@ pub(crate) enum SubmissionDecision {
 }
 
 impl SubmissionMap {
+    /// 删除尚未实际写入 ACP 的首次提交记录。
+    ///
+    /// dispatch 在 sidecar 启动、自动 load 或 stdin 写入失败时调用本方法，避免后续
+    /// 重试被误判为已投递的 duplicate；已成功写入 prompt 的记录绝不能移除。
+    pub(crate) fn forget(&mut self, scope_id: &str, session_id: &str, submission_id: &str) {
+        self.entries.remove(&SubmissionKey {
+            scope_id: scope_id.to_string(),
+            session_id: session_id.to_string(),
+            submission_id: submission_id.to_string(),
+        });
+    }
+
     /// 以稳定、长度前缀的 canonical 输入登记 Send，避免字段拼接歧义。
     pub(crate) fn record(
         &mut self,

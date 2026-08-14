@@ -7,6 +7,7 @@ mod acp_runtime;
 mod app_port;
 mod config;
 mod event_sink;
+mod projector;
 mod protocol;
 mod runtime;
 mod submission;
@@ -19,6 +20,7 @@ pub use app_port::{
 };
 pub use config::HostRuntimeConfig;
 pub use event_sink::{KitEventSink, ValidatedKitEventSink};
+pub use projector::{ProjectError, Projector, apply_acp_notification};
 pub use protocol::{
     Capability, CapabilityLimits, KIT_SCHEMA_VERSION, KitBlock, KitCommand, KitError,
     KitProductEvent, KitProductEventValidationError, KitReply, LlmChannelKind, LlmChannelView,

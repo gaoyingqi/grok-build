@@ -10,6 +10,7 @@ mod event_sink;
 mod protocol;
 mod runtime;
 mod submission;
+mod supervisor;
 
 pub use acp_runtime::{AcpRuntime, Inbound, METHOD_NOT_FOUND, RequestId, RpcError, ValidatedReply};
 pub use app_port::{
@@ -24,3 +25,8 @@ pub use protocol::{
     Origin, SessionSummary, ToolStatus,
 };
 pub use runtime::HostRuntime;
+pub use supervisor::{
+    ChildEnvironment, ChildLifecycle, ChildLifecycleOps, ProcessSlotMetadata, ProcessSlotState,
+    STDIN_CLOSE_GRACE, ScopePaths, ScopeSlot, Supervisor, SupervisorCapability, SupervisorError,
+    TERMINATE_GRACE, UnavailableReason, capability, sanitize,
+};

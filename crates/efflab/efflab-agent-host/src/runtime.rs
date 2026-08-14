@@ -39,6 +39,8 @@ const ACTOR_TICK: Duration = Duration::from_millis(5);
 const ACP_BYOK_MODEL_SLOT: &str = "byok";
 /// MCP catalog 中始终可安全自动许可的内置无副作用工具。
 const NOOP_TOOL: &str = "GrokBuild:efflab_noop";
+/// Kit capability 与实际写入 sidecar 的单次 prompt 统一字符上限。
+const MAX_PROMPT_CHARS: usize = 32_000;
 
 /// 产品唯一调用入口的进程内状态。
 pub struct HostRuntime {
@@ -220,12 +222,12 @@ impl HostRuntime {
             features,
             channel,
             limits: CapabilityLimits {
-                max_prompt_chars: 32_000,
+                max_prompt_chars: MAX_PROMPT_CHARS as u32,
             },
         }))
     }
 
-    /// 先解析并门禁 mention，再以原始字段登记稳定幂等键，最后把安全文本交给 scope actor。
+    /// 先确认对话 Channel，再解析并门禁 mention，最后以原始字段登记稳定幂等键。
     fn dispatch_send(
         &self,
         scope_id: String,
@@ -235,8 +237,9 @@ impl HostRuntime {
         mentions: Vec<crate::MentionId>,
     ) -> Result<KitReply, KitError> {
         validate_send_input(&scope_id, &session_id, &submission_id, &text)?;
-        let prompt_text = self.resolve_send_prompt_text(&scope_id, &text, &mentions)?;
+        // 未配置 Channel 是所有对话命令的优先失败契约，不能被 mention 校验覆盖。
         self.require_conversation_channel()?;
+        let prompt_text = self.resolve_send_prompt_text(&scope_id, &text, &mentions)?;
         let decision = self
             .submissions
             .lock()
@@ -315,8 +318,10 @@ impl HostRuntime {
             .collect::<Vec<_>>()
             .join("\n");
         let prompt_text = format!("{text}\n\n{expanded}");
-        // 原始 text 已在上方校验；这里专门覆盖 resolver 拼入内容后的完整 prompt。
-        validate_prompt_text(&prompt_text).map_err(|_| invalid_mentions_request())?;
+        // 原始 text 已在上方校验；这里覆盖 resolver 拼入后的完整长度与文本语义。
+        if !prompt_text_within_limit(&prompt_text) || validate_prompt_text(&prompt_text).is_err() {
+            return Err(invalid_mentions_request());
+        }
 
         Ok(prompt_text)
     }
@@ -1931,21 +1936,12 @@ fn invalid_mentions_request() -> KitError {
 
 /// 校验产品提供的单个展示文本，补足通用 prompt 门刻意允许的正文绝对路径。
 ///
-/// 通用门允许用户正常提及「/Volumes/...」等正文；但 resolver 仅应返回已审核的
-/// 中文展示信息，所以任何 `@`、file URI 或跨平台绝对路径形式都必须失败关闭。
+/// `@` 与 file URI 必须完全沿用 Task 3 的 prompt 语义，避免把不会形成文件引用的
+/// 合法元数据误拒；resolver 文本仍额外禁止跨平台绝对路径形式。
 fn is_safe_mention_expansion(text: &str) -> bool {
     !text.trim().is_empty()
-        && !text.contains('@')
-        && !contains_mention_file_uri(text)
+        && validate_prompt_text(text).is_ok()
         && !contains_absolute_mention_path(text)
-}
-
-/// 以 ASCII 大小写不敏感方式识别展示文本中任意位置的 `file://`。
-fn contains_mention_file_uri(text: &str) -> bool {
-    const FILE_URI: &[u8] = b"file://";
-    text.as_bytes()
-        .windows(FILE_URI.len())
-        .any(|candidate| candidate.eq_ignore_ascii_case(FILE_URI))
 }
 
 /// 检测 POSIX 根路径、Windows 根路径、UNC 和盘符路径，且不依赖当前宿主平台。
@@ -1974,14 +1970,17 @@ fn contains_absolute_mention_path(text: &str) -> bool {
     false
 }
 
-/// 路径起点只能出现在开头或文本边界，避免把普通 `AC/DC` 曲名误判为绝对路径。
+/// 路径起点只能出现在开头或文本边界，Unicode 字母/数字后的斜杠属于标题正文。
 fn is_mention_path_boundary(previous: Option<char>) -> bool {
     match previous {
         None => true,
-        Some(character) => {
-            !character.is_ascii_alphanumeric() && !matches!(character, '_' | '-' | '.')
-        }
+        Some(character) => !character.is_alphanumeric() && !matches!(character, '_' | '-' | '.'),
     }
+}
+
+/// 按 capability 宣告的统一上限计算 Unicode 标量字符数，而非 UTF-8 字节数。
+fn prompt_text_within_limit(text: &str) -> bool {
+    text.chars().count() <= MAX_PROMPT_CHARS
 }
 
 /// 在登记 submission 或拉起 sidecar 前拒绝明显无效的 Send，避免失败路径占用幂等键。
@@ -1995,7 +1994,7 @@ fn validate_send_input(
         || session_id.is_empty()
         || submission_id.is_empty()
         || text.is_empty()
-        || text.chars().count() > 32_000
+        || !prompt_text_within_limit(text)
         || validate_prompt_text(text).is_err()
     {
         return Err(KitError::non_retryable(

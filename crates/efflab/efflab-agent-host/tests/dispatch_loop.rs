@@ -45,8 +45,8 @@ enum MentionMode {
     Resolve,
     /// 模拟未知或跨 scope 标识被产品端口拒绝。
     Reject,
-    /// 模拟产品错误返回的不安全展示文本，供 Host 最终门禁回归测试使用。
-    Unsafe(String),
+    /// 返回指定展示文本，供 Host 长度与最终安全门回归测试使用。
+    Text(String),
 }
 
 /// 已配置或未配置 Channel 的最小产品端口；测试凭据只停留在内存中。
@@ -154,7 +154,7 @@ impl HostAppMentions for FakeApp {
                 })
                 .collect()),
             MentionMode::Reject => Err(anyhow::anyhow!("测试端口拒绝未知 mention")),
-            MentionMode::Unsafe(text) => Ok(ids
+            MentionMode::Text(text) => Ok(ids
                 .iter()
                 .cloned()
                 .map(|id| ResolvedMention {
@@ -587,6 +587,32 @@ fn assert_send(reply: KitReply, duplicate: bool, session_id: &str, submission_id
     );
 }
 
+/// 轮询前一 prompt 的 in-flight 状态，避免依赖 fake sidecar 的固定 wall-clock sleep。
+fn send_after_inflight_finishes(
+    harness: &Harness,
+    session_id: &str,
+    submission_id: &str,
+    text: &str,
+) -> KitReply {
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    loop {
+        match harness
+            .runtime
+            .dispatch(send(session_id, submission_id, text, None))
+        {
+            Ok(reply) => return reply,
+            Err(error) if error.code == "turn_in_progress" => {
+                assert!(
+                    Instant::now() < deadline,
+                    "等待前一 prompt 完成时超出测试时限"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("等待前一 prompt 完成时收到意外错误: {}", error.code),
+        }
+    }
+}
+
 /// TC-LAUNCH / TC-HP：真实 child 只会在 Host 完成 L3b、token 和 TOML 前置后启动。
 #[test]
 fn launch_handshake_new_session_and_empty_mcp_catalog_are_wired_through_real_stdio() {
@@ -700,6 +726,15 @@ fn unconfigured_channel_rejects_all_conversation_commands_without_spawning() {
     let commands = [
         KitCommand::GetCapability,
         send("session-a", "submission-a", "hello", None),
+        send(
+            "session-a",
+            "submission-with-mentions",
+            "hello",
+            Some(vec![MentionId {
+                kind: "track".to_string(),
+                id: "track-1".to_string(),
+            }]),
+        ),
         KitCommand::NewSession {
             scope_id: "scope-a".to_string(),
             client_request_id: None,
@@ -788,6 +823,122 @@ fn send_mentions_resolve_to_chinese_text_before_prompt_is_written() {
     assert!(prompt_text.contains("曲目：夜航；艺人：测试艺人"));
 }
 
+/// 原始文本虽在能力上限内，mention 展开后超过上限时也不能写入 sidecar。
+#[test]
+fn mention_expansion_over_max_prompt_chars_is_invalid_request() {
+    let harness = Harness::configured_with_mentions(
+        "default",
+        [],
+        MentionMode::Text("曲".to_string()),
+        Duration::from_secs(60),
+    );
+    let text = "a".repeat(32_000);
+    let error = harness
+        .runtime
+        .dispatch(send(
+            "unattached-session",
+            "overlong-mention-expansion",
+            &text,
+            Some(vec![MentionId {
+                kind: "track".to_string(),
+                id: "track-1".to_string(),
+            }]),
+        ))
+        .expect_err("完整 prompt 超过能力上限必须失败关闭");
+
+    assert_eq!(error.code, "invalid_request");
+    assert!(
+        !harness.started.exists(),
+        "完整 prompt 超限时不得启动 sidecar"
+    );
+}
+
+/// 合法中文标题中的斜杠不是绝对路径，Host 不得因 ASCII-only 边界误拒。
+#[test]
+fn mention_expansion_allows_chinese_title_with_slash() {
+    let expansion = "曲目：天地/人；艺人：甲";
+    let harness = Harness::configured_with_mentions(
+        "default",
+        [],
+        MentionMode::Text(expansion.to_string()),
+        Duration::from_secs(60),
+    );
+    let session_id = harness.new_session("scope-a");
+
+    assert_send(
+        harness
+            .runtime
+            .dispatch(send(
+                &session_id,
+                "chinese-slash-title",
+                "请分析曲目",
+                Some(vec![MentionId {
+                    kind: "track".to_string(),
+                    id: "track-1".to_string(),
+                }]),
+            ))
+            .expect("合法中文斜杠标题必须能写入 prompt"),
+        false,
+        &session_id,
+        "chinese-slash-title",
+    );
+    harness.wait_for_method("session/prompt");
+    let prompt = harness
+        .wire()
+        .into_iter()
+        .find(|item| item["method"] == "session/prompt")
+        .expect("必须写出 session/prompt");
+    assert!(
+        prompt["params"]["prompt"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains(expansion)),
+        "完整 prompt 必须保留合法中文标题"
+    );
+}
+
+/// 尾随 `@` 不会形成 grok-shell 文件引用，应与 Task 3 的文本门保持一致。
+#[test]
+fn mention_expansion_allows_trailing_at() {
+    let expansion = "曲目：尾随符号@";
+    let harness = Harness::configured_with_mentions(
+        "default",
+        [],
+        MentionMode::Text(expansion.to_string()),
+        Duration::from_secs(60),
+    );
+    let session_id = harness.new_session("scope-a");
+
+    assert_send(
+        harness
+            .runtime
+            .dispatch(send(
+                &session_id,
+                "trailing-at-title",
+                "请分析曲目",
+                Some(vec![MentionId {
+                    kind: "track".to_string(),
+                    id: "track-1".to_string(),
+                }]),
+            ))
+            .expect("尾随 @ 展示文本必须能写入 prompt"),
+        false,
+        &session_id,
+        "trailing-at-title",
+    );
+    harness.wait_for_method("session/prompt");
+    let prompt = harness
+        .wire()
+        .into_iter()
+        .find(|item| item["method"] == "session/prompt")
+        .expect("必须写出 session/prompt");
+    assert!(
+        prompt["params"]["prompt"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains(expansion)),
+        "完整 prompt 必须保留合法尾随 @"
+    );
+}
+
 /// 未声明 mention 端口时，即使 Channel 已配置也必须在创建 actor 前拒绝请求。
 #[test]
 fn send_mentions_without_port_is_invalid_request() {
@@ -849,7 +1000,7 @@ fn unsafe_mention_expansions_are_invalid_requests() {
         let harness = Harness::configured_with_mentions(
             "default",
             [],
-            MentionMode::Unsafe(unsafe_text.to_string()),
+            MentionMode::Text(unsafe_text.to_string()),
             Duration::from_secs(60),
         );
         let error = harness
@@ -973,19 +1124,16 @@ fn idempotency_mentions_and_cancel_keep_prompt_wire_and_inflight_state_correct()
         "cancel 绝不能分配 JSON-RPC id"
     );
     wait_for_status(&harness, "cancelled");
-    thread::sleep(DELAYED_PROMPT_RESULT + Duration::from_millis(80));
     assert_send(
-        harness
-            .runtime
-            .dispatch(send(&session_id, "after-result", "结果后新轮", None))
-            .expect("prompt result 到达后必须释放 in-flight"),
+        send_after_inflight_finishes(&harness, &session_id, "after-result", "结果后新轮"),
         false,
         &session_id,
         "after-result",
     );
 
+    // 等待真实 prompt response 清除 in-flight，而非假定 shell sleep 已经结束。
+    wait_for_status(&harness, "turn_completed");
     // 无 in-flight 的 cancel 会被下一次 Send 消费：不得向 sidecar 写 prompt，仍要发 cancelled。
-    thread::sleep(DELAYED_PROMPT_RESULT + Duration::from_millis(80));
     harness
         .runtime
         .dispatch(KitCommand::Cancel {

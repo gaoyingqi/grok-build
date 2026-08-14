@@ -314,6 +314,31 @@
     "rejection": "UnknownMethod"
   },
   {
+    "name": "session/set_model remains forbidden",
+    "method": "session/set_model",
+    "params": { "sessionId": "s1", "modelId": "grok-code-fast" },
+    "expect": "reject",
+    "rejection": "UnknownMethod"
+  },
+  {
+    "name": "_x.ai/session/list remains forbidden",
+    "method": "_x.ai/session/list",
+    "params": { "cwd": "{{CWD}}", "allowRelax": true },
+    "expect": "reject",
+    "rejection": "UnknownMethod"
+  },
+  {
+    "name": "session/new rejects non-string meta modelId",
+    "method": "session/new",
+    "params": {
+      "cwd": "{{CWD}}",
+      "mcpServers": [],
+      "_meta": { "modelId": 123 }
+    },
+    "expect": "reject",
+    "rejection": "InvalidFieldType"
+  },
+  {
     "name": "modelId not allowed",
     "method": "session/new",
     "params": {
@@ -342,6 +367,18 @@
       "sessionId": "s1",
       "prompt": [
         { "type": "text", "text": "请处理 /Volumes/Music/Inbox 这批歌曲" }
+      ],
+      "_meta": { "promptId": "submission-1" }
+    },
+    "expect": "allow"
+  },
+  {
+    "name": "session/prompt permits parser-ignored triple at token",
+    "method": "session/prompt",
+    "params": {
+      "sessionId": "s1",
+      "prompt": [
+        { "type": "text", "text": "保留字面量 @@@foo" }
       ],
       "_meta": { "promptId": "submission-1" }
     },

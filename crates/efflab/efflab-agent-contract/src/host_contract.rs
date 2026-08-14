@@ -537,15 +537,36 @@ pub fn validate_prompt_text(text: &str) -> Result<(), PromptTextRejection> {
 
 /// 判断文本中的任一 `@` 是否会在上游成为可解析的 FileReference token。
 fn contains_at_file_reference(text: &str) -> bool {
-    text.match_indices('@').any(|(offset, _)| {
-        let token = text[offset + '@'.len_utf8()..]
-            .split_whitespace()
-            .next()
-            .unwrap_or_default();
-        let token = token.strip_prefix('@').unwrap_or(token);
-        // 上游正则允许一个可选 @，但文件路径的首字符不能再是 @。
-        token.chars().next().is_some_and(|first| first != '@')
-    })
+    // 与 grok-shell 的 collect_file_references 保持同一单游标推进方式：
+    // 每次提取候选后前移游标，避免再次检查同一 token 内的后续 @。
+    let mut cursor = 0;
+    while cursor < text.len() {
+        if !text.is_char_boundary(cursor) {
+            cursor += 1;
+            continue;
+        }
+
+        let Some(at_symbol_offset) = text[cursor..].find('@') else {
+            break;
+        };
+        let start = cursor + at_symbol_offset + '@'.len_utf8();
+        if start >= text.len() || !text.is_char_boundary(start) {
+            break;
+        }
+
+        let rest = &text[start..];
+        let token = rest.split_whitespace().next().unwrap_or_default();
+        // FileReference::parse 最多剥离一个前导 @，随后路径首字符不能再是 @。
+        let path = token.strip_prefix('@').unwrap_or(token);
+        if path.chars().next().is_some_and(|first| first != '@') {
+            return true;
+        }
+
+        // 与上游相同地跳过本次候选，确保连续 @ 只作为一个 token 判定。
+        cursor = start + token.len().max(1);
+    }
+
+    false
 }
 
 /// 判断文本是否含有独立的、不区分 ASCII 大小写的 `file://` URI scheme。
@@ -604,19 +625,21 @@ fn validate_meta_and_model(
         }
     }
 
-    // modelId：出现在 _meta 或 params 顶层时必须在白名单。
-    let model_id = params
-        .get("_meta")
-        .and_then(|m| m.get("modelId"))
-        .or_else(|| params.get("modelId"))
-        .and_then(Value::as_str);
-    if let Some(id) = model_id
-        && !policy.allowed_model_ids.iter().any(|allowed| allowed == id)
-    {
-        return Err(HostRejection::ModelIdNotAllowed(
-            method.to_string(),
-            id.to_string(),
-        ));
+    // 顶层 modelId 已被字段白名单拒绝；允许的 _meta.modelId 必须先是字符串，
+    // 再比较策略白名单，不能让标量或数组静默绕过 fail-closed 校验。
+    if let Some(model_id) = params.get("_meta").and_then(|meta| meta.get("modelId")) {
+        let id = model_id
+            .as_str()
+            .ok_or_else(|| HostRejection::InvalidFieldType {
+                method: method.to_string(),
+                field: "_meta.modelId".to_string(),
+            })?;
+        if !policy.allowed_model_ids.iter().any(|allowed| allowed == id) {
+            return Err(HostRejection::ModelIdNotAllowed(
+                method.to_string(),
+                id.to_string(),
+            ));
+        }
     }
 
     Ok(())
@@ -793,6 +816,39 @@ mod tests {
                 "文本应拒绝: {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn prompt_text_gate_matches_parser_single_token_cursor() {
+        // grok-shell 每次候选后都会越过整个 token；只有一个可选前导 @。
+        assert_eq!(
+            validate_prompt_text("@@foo"),
+            Err(PromptTextRejection::AtFileReference)
+        );
+        assert!(validate_prompt_text("@@@foo").is_ok());
+
+        // 长连续 @ 必须仍被当作一个不可解析 token，而不是逐个 @ 重新扫描。
+        let long_at_token = format!("{}foo", "@".repeat(16_384));
+        assert!(validate_prompt_text(&long_at_token).is_ok());
+    }
+
+    #[test]
+    fn session_request_rejects_non_string_meta_model_id() {
+        let dir = TempDir::new().unwrap();
+        let p = policy_with(dir.path());
+        let params = serde_json::json!({
+            "cwd": dir.path().to_str().unwrap(),
+            "mcpServers": [],
+            "_meta": { "modelId": 123 }
+        });
+
+        assert_eq!(
+            validate_host_request("session/new", &params, &p),
+            Err(HostRejection::InvalidFieldType {
+                method: "session/new".into(),
+                field: "_meta.modelId".into(),
+            })
+        );
     }
 
     #[test]

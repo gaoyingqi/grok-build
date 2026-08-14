@@ -2,6 +2,9 @@
 //!
 //! sidecar 保留同名测试以覆盖兼容 re-export；本测试让 contract crate 自身也能
 //! 按发布契约运行相同 fixture，避免只验证转发层。
+//!
+//! 本 target 有意只校验 fixture 的 allow/reject 结果；拒绝变体由 sidecar 的
+//! 同名 harness 精确断言，以避免在 contract crate 重复维护该映射。
 
 use efflab_agent_contract::{HostPolicy, validate_host_request};
 use tempfile::TempDir;

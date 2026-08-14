@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use efflab_agent_host::{
     ApprovedMcpSpec, HostApp, HostRuntimeConfig, L3bLoopback, L3bRuntimeConfig, LlmChannelConfig,
-    LlmChannelError, LlmChannelKind, LlmChannelManager, LlmChannelService,
+    LlmChannelError, LlmChannelKind, LlmChannelManager, LlmChannelService, LlmSecretSlot,
     MAX_L3B_REQUEST_BODY_BYTES, ScopeId, SealedSecret, SecretGuard, SetLlmChannelRequest,
 };
 
@@ -82,6 +82,22 @@ impl HostApp for FakeApp {
     fn unseal_secret(&self, sealed: &SealedSecret) -> Result<SecretGuard> {
         self.unseal_calls.fetch_add(1, Ordering::SeqCst);
         Ok(SecretGuard::new(sealed.as_bytes().to_vec()))
+    }
+
+    /// 测试产品显式只声明 BYOK 槽；Relay 不能误用同一通用密封实现。
+    fn seal_llm_secret(&self, slot: LlmSecretSlot, plain: &[u8]) -> Result<SealedSecret> {
+        match slot {
+            LlmSecretSlot::Byok => self.seal_secret(plain),
+            LlmSecretSlot::Relay => Err(anyhow::anyhow!("测试产品未声明 Relay 密封槽")),
+        }
+    }
+
+    /// 测试产品显式只声明 BYOK 槽；Relay 不能误用同一通用解封实现。
+    fn unseal_llm_secret(&self, slot: LlmSecretSlot, sealed: &SealedSecret) -> Result<SecretGuard> {
+        match slot {
+            LlmSecretSlot::Byok => self.unseal_secret(sealed),
+            LlmSecretSlot::Relay => Err(anyhow::anyhow!("测试产品未声明 Relay 解封槽")),
+        }
     }
 
     fn mcp_for_scope(&self, _scope: &ScopeId) -> Result<ApprovedMcpSpec> {
@@ -238,6 +254,57 @@ fn loaded_channel_rejects_secret_bearing_url_before_exposing_a_view() {
         .err()
         .expect("带 query 的已持久化上游 URL 必须在加载阶段 fail-closed");
     assert_eq!(error, LlmChannelError::InvalidRequest);
+}
+
+/// 持久化的 IP literal 在加载时必须同步执行地址策略，不能等 sidecar 请求才拒绝。
+#[test]
+fn loaded_channel_rejects_unsafe_ip_literals_before_sidecar_can_start() {
+    for blocked_url in [
+        "https://192.168.1.10/v1",
+        "https://169.254.169.254/v1",
+        "https://[::127.0.0.1]/v1",
+    ] {
+        let app = Arc::new(FakeApp::byok(
+            blocked_url.to_string(),
+            "test-model",
+            "test-user-key",
+        ));
+        let error = LlmChannelManager::new(app, false)
+            .err()
+            .expect("不安全 IP literal 不得形成可启动的已加载 Channel");
+        assert_eq!(error, LlmChannelError::InvalidRequest);
+    }
+}
+
+/// 依赖 DNS 的历史配置可保留给设置页修复，但在首次地址审查完成前不得启动 sidecar。
+#[test]
+fn loaded_dns_config_is_not_startable_before_address_validation() {
+    let app = Arc::new(FakeApp::byok(
+        "https://localhost/v1".to_string(),
+        "test-model",
+        "test-user-key",
+    ));
+    let manager =
+        LlmChannelManager::new(app, false).expect("仅有语法正确的 DNS 配置仍应可读取设置页 view");
+
+    assert!(
+        !manager.has_active_byok().expect("Channel 状态锁必须可用"),
+        "DNS 依赖的已加载配置在完整地址审查前不得被视为可启动"
+    );
+}
+
+/// 公开 Set 请求的 Debug 形状也只能标记 Relay app key 是否存在，不能泄露凭据。
+#[test]
+fn set_llm_channel_request_debug_redacts_relay_app_key() {
+    let request = SetLlmChannelRequest {
+        app_key: Some("debug-relay-app-key-secret".to_string()),
+        ..SetLlmChannelRequest::default()
+    };
+
+    assert!(
+        !format!("{request:?}").contains("debug-relay-app-key-secret"),
+        "公开 Set 请求的调试输出不得回显 Relay app key"
+    );
 }
 
 /// 未知 binding 必须在任何解封或上游连接之前被拒绝。
@@ -468,33 +535,80 @@ fn downstream_disconnect_stops_reading_upstream() {
     upstream.join().expect("断开测试上游线程必须退出");
 }
 
-/// 默认 SSRF 策略必须拒绝 loopback、私有网段和 metadata 地址，且绝不能碰上游。
+/// 默认 SSRF 策略必须拒绝历史回环配置，且绝不能把请求送到上游。
 #[test]
-fn ssrf_rejects_loopback_private_and_metadata_before_connecting() {
-    for blocked_url in [
-        "http://127.0.0.1:9/v1",
-        "https://192.168.1.10/v1",
-        "https://169.254.169.254/v1",
-        // IPv4-compatible IPv6 仍能指向 IPv4 loopback，不能绕过 IPv4 黑名单。
-        "https://[::127.0.0.1]:9/v1",
-    ] {
-        let app = Arc::new(FakeApp::byok(
-            blocked_url.to_string(),
-            "test-model",
-            "test-user-key",
-        ));
-        // 仅允许构造历史 HTTP loopback 配置；实际 L3b 出站策略仍明确保持默认拒绝。
-        let manager = manager(app, true);
-        let loopback = loopback(Arc::clone(&manager), false);
-        let token = register(&loopback, &manager, "scope-a", 1);
-        let mut downstream = open_chat_request(loopback.local_addr(), &token, "{\"stream\":false}");
-        let response = read_to_end(&mut downstream);
-        assert_eq!(
-            status_code(&response),
-            403,
-            "受限地址必须在连接前被 SSRF 策略拒绝"
-        );
-    }
+fn ssrf_rejects_loopback_before_connecting() {
+    let app = Arc::new(FakeApp::byok(
+        "http://127.0.0.1:9/v1".to_string(),
+        "test-model",
+        "test-user-key",
+    ));
+    // 仅允许构造历史 HTTP loopback 配置；实际 L3b 出站策略仍明确保持默认拒绝。
+    let manager = manager(app, true);
+    let loopback = loopback(Arc::clone(&manager), false);
+    let token = register(&loopback, &manager, "scope-a", 1);
+    let mut downstream = open_chat_request(loopback.local_addr(), &token, "{\"stream\":false}");
+    let response = read_to_end(&mut downstream);
+    assert_eq!(
+        status_code(&response),
+        403,
+        "受限地址必须在连接前被 SSRF 策略拒绝"
+    );
+}
+
+/// IPv4-compatible IPv6 必须在策略层降级为嵌入 IPv4，并在真实本地监听器前被拦截。
+#[test]
+fn ipv4_compatible_ipv6_ssrf_never_touches_real_listener() {
+    let listener = TcpListener::bind("[::]:0").expect("必须能绑定真实 IPv6 本地监听器");
+    listener
+        .set_nonblocking(true)
+        .expect("测试监听器必须能切换为非阻塞模式");
+    let port = listener
+        .local_addr()
+        .expect("必须能读取测试监听端口")
+        .port();
+    let (touched_tx, touched_rx) = mpsc::channel();
+    let upstream = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let mut touched = false;
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((_stream, _)) => {
+                    touched = true;
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = touched_tx.send(touched);
+    });
+
+    let app = Arc::new(FakeApp::byok(
+        format!("https://[::127.0.0.1]:{port}/v1"),
+        "test-model",
+        "test-user-key",
+    ));
+    // 加载时只为本回归夹具显式允许回环；实际请求路径仍必须按默认策略拒绝。
+    let manager = manager(app, true);
+    let loopback = loopback(Arc::clone(&manager), false);
+    let token = register(&loopback, &manager, "scope-a", 1);
+    let mut downstream = open_chat_request(loopback.local_addr(), &token, "{\"stream\":false}");
+
+    assert_eq!(
+        status_code(&read_to_end(&mut downstream)),
+        403,
+        "IPv4-compatible IPv6 必须在任何 TCP 连接前被拒绝"
+    );
+    assert!(
+        !touched_rx
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("真实本地监听器观察必须结束"),
+        "SSRF 策略不得触碰 IPv4-compatible IPv6 所指向的监听器"
+    );
+    upstream.join().expect("IPv6 监听观察线程必须退出");
 }
 
 /// SetLlmChannel 的空更新不可改变 committed view；端点、模型或类型变化必须带新 Key。
@@ -639,6 +753,64 @@ fn channel_set_rejects_ssrf_addresses_before_persisting() {
             "被拒绝 URL 不得调用产品持久化端口"
         );
     }
+}
+
+/// 非网络形状校验完成后必须立即密封明文 Key；地址审查失败时绝不能持久化候选配置。
+#[test]
+fn channel_set_seals_key_before_address_validation_and_never_persists_failure() {
+    let app = Arc::new(FakeApp::unconfigured());
+    let manager = manager(Arc::clone(&app), false);
+
+    let result = manager.set(SetLlmChannelRequest {
+        kind: Some(LlmChannelKind::Byok),
+        base_url: Some("https://192.168.1.10/v1".to_string()),
+        model_id: Some("test-model".to_string()),
+        api_key: Some("test-user-key".to_string()),
+        ..SetLlmChannelRequest::default()
+    });
+
+    assert_eq!(result, Err(LlmChannelError::InvalidRequest));
+    assert_eq!(
+        app.seal_calls.load(Ordering::SeqCst),
+        1,
+        "地址解析前的结构校验通过后，明文 Key 必须立即交给密封端口"
+    );
+    assert_eq!(
+        app.persist_calls.load(Ordering::SeqCst),
+        0,
+        "地址审查失败的已密封候选配置不得被持久化"
+    );
+}
+
+/// 更新 URL/model 时的新明文 Key 也必须在 DNS/IP 审查前立即密封，失败不得覆盖旧配置。
+#[test]
+fn channel_update_seals_key_before_address_validation_and_keeps_old_config() {
+    let app = Arc::new(FakeApp::byok(
+        "https://8.8.8.8/v1".to_string(),
+        "original-model",
+        "original-test-key",
+    ));
+    let manager = manager(Arc::clone(&app), false);
+    let revision = manager.revision();
+
+    let result = manager.set(SetLlmChannelRequest {
+        base_url: Some("https://192.168.1.10/v1".to_string()),
+        api_key: Some("replacement-test-key".to_string()),
+        ..SetLlmChannelRequest::default()
+    });
+
+    assert_eq!(result, Err(LlmChannelError::InvalidRequest));
+    assert_eq!(
+        app.seal_calls.load(Ordering::SeqCst),
+        1,
+        "更新路径也必须在网络地址审查前密封新明文 Key"
+    );
+    assert_eq!(app.persist_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        manager.revision(),
+        revision,
+        "失败的地址审查不得覆盖既有 committed Channel"
+    );
 }
 
 /// restart 局部失败时，新 Channel 已提交，调用方必须收到可重试错误而不是旧 view。

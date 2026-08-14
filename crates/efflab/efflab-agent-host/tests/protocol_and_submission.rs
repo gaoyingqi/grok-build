@@ -296,6 +296,7 @@ fn set_llm_channel_debug_redacts_credentials() {
         "kind": "byok",
         "base_url": "https://example.test/v1?api_key=debug-url-secret",
         "relay_base_url": "https://relay.test/v1?token=debug-relay-url-secret",
+        "app_key": "debug-relay-app-key-secret",
         "api_key": "debug-api-key-secret",
         "access_token": "debug-access-token-secret"
     }))
@@ -304,6 +305,10 @@ fn set_llm_channel_debug_redacts_credentials() {
     let rendered = format!("{command:?}");
     assert!(!rendered.contains("debug-api-key-secret"));
     assert!(!rendered.contains("debug-access-token-secret"));
+    assert!(
+        !rendered.contains("debug-relay-app-key-secret"),
+        "Relay app key 同样可能是产品凭据，调试路径不得回显"
+    );
     assert!(
         !rendered.contains("debug-url-secret") && !rendered.contains("debug-relay-url-secret"),
         "未验证的 URL query 同样可能携带秘密，调试路径不得回显"

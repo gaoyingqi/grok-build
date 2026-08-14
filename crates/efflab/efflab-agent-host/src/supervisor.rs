@@ -212,6 +212,8 @@ struct ManagedSidecar {
     child: Child,
     /// registry 保留 token 本体；child 所有权只保留失效所需的 registry 与 generation。
     registry: Arc<BindingTokenRegistry>,
+    /// 用于在不抢占 metadata 锁的情况下立即撤销本代 token。
+    scope_id: String,
     generation: u64,
 }
 
@@ -220,6 +222,70 @@ struct ScopeSlotRuntime {
     child: Option<ManagedSidecar>,
     has_started: bool,
     launching: bool,
+    /// child 暂时被 stop 入口持有；watcher 必须等待，而不是误判为自然退出。
+    stopping: bool,
+    /// kill/wait 未确认 child 已退出时禁止下一次 launch，避免同 scope 双进程。
+    restart_blocked: bool,
+}
+
+/// spawn 已成功但尚未挂回 slot 的 child 所有权守卫。
+///
+/// 只有 `attach` 成功把 process 移入 slot 后才会解除；任何错误路径都会在 Drop 中撤销
+/// token、终止并回收 child，不能把无监督 sidecar 留在系统中。
+struct SpawnedSidecarGuard {
+    process: Option<ManagedSidecar>,
+}
+
+impl SpawnedSidecarGuard {
+    /// 用刚刚 spawn 的 child 构造已武装的清理守卫。
+    fn new(process: ManagedSidecar) -> Self {
+        Self {
+            process: Some(process),
+        }
+    }
+
+    /// 原子地把 child 挂回 slot；挂接失败时重新武装 guard 以便调用方返回时自动清理。
+    fn attach(&mut self, slot: &Arc<ScopeSlot>, pid: u32) -> Result<(), SupervisorError> {
+        let process = self
+            .process
+            .take()
+            .expect("spawn cleanup guard 在 attach 前必须持有 child");
+        match complete_slot_launch(slot, process, pid) {
+            Ok(()) => Ok(()),
+            Err((error, process)) => {
+                self.process = Some(process);
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for SpawnedSidecarGuard {
+    /// 挂接失败时以同步 kill + wait 回收 child；此时不能再把它交给任何 watcher。
+    fn drop(&mut self) {
+        if let Some(process) = self.process.take() {
+            terminate_and_reap_detached_process(process);
+        }
+    }
+}
+
+/// 无法安全挂回 slot 的 child 必须同步撤销 token、强制终止并 wait 回收。
+fn terminate_and_reap_detached_process(mut process: ManagedSidecar) {
+    process
+        .registry
+        .invalidate_generation(&process.scope_id, process.generation);
+    let _ = process.child.stdin.take();
+    let kill_result = process.child.kill();
+    let wait_result = process.child.wait();
+    if kill_result.is_err() || wait_result.is_err() {
+        tracing::debug!(
+            scope = %process.scope_id,
+            generation = process.generation,
+            kill_succeeded = kill_result.is_ok(),
+            wait_succeeded = wait_result.is_ok(),
+            "未挂接 sidecar 的强制回收出现系统错误"
+        );
+    }
 }
 
 /// 真实 launch 后向未来 runtime 返回的非敏感进程描述。
@@ -335,6 +401,8 @@ impl Supervisor {
                         child: None,
                         has_started: false,
                         launching: false,
+                        stopping: false,
+                        restart_blocked: false,
                     }),
                 })
             })
@@ -492,15 +560,15 @@ impl Supervisor {
             source,
         })?;
         let pid = child.id();
-        complete_slot_launch(
-            slot,
-            ManagedSidecar {
-                child,
-                registry,
-                generation,
-            },
-            pid,
-        )?;
+        // 在 slot 挂接前始终由 guard 独占 child；complete_slot_launch 任何失败均会触发
+        // 同步 token 撤销、kill 与 wait，不能把已启动进程遗留为无监督 child。
+        let mut child_guard = SpawnedSidecarGuard::new(ManagedSidecar {
+            child,
+            registry,
+            scope_id: scope_id.to_string(),
+            generation,
+        });
+        child_guard.attach(slot, pid)?;
         // watcher 只观察这一 generation；child 自然退出后 token 无需等下一次 dispatch 即失效。
         watch_sidecar_exit(Arc::clone(slot), generation);
         tracing::debug!(
@@ -528,7 +596,10 @@ impl Drop for Supervisor {
             .map(|slots| slots.values().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
         for slot in slots {
-            let _ = stop_slot(&slot);
+            if stop_slot(&slot).is_err() {
+                // Supervisor 即将释放 slot，不能让失败路径保留的 child 随 Child::drop 脱离监督。
+                force_reap_slot_on_supervisor_drop(&slot);
+            }
         }
     }
 }
@@ -539,7 +610,7 @@ fn prepare_slot_launch(slot: &Arc<ScopeSlot>) -> Result<(ScopePaths, u64), Super
         .runtime
         .lock()
         .map_err(|_| SupervisorError::StateUnavailable)?;
-    if runtime.launching {
+    if runtime.launching || runtime.stopping {
         return Err(SupervisorError::ScopeAlreadyRunning);
     }
     if let Some(process) = runtime.child.as_mut() {
@@ -549,7 +620,9 @@ fn prepare_slot_launch(slot: &Arc<ScopeSlot>) -> Result<(ScopePaths, u64), Super
                 let process = runtime.child.take().expect("已检查 child 必定存在");
                 process
                     .registry
-                    .invalidate_generation(&slot.metadata()?.scope_id, process.generation);
+                    .invalidate_generation(&process.scope_id, process.generation);
+                // 已确认旧 child 自然退出后才允许解除此前 stop 失败留下的重启隔离。
+                runtime.restart_blocked = false;
             }
             Err(source) => {
                 return Err(SupervisorError::Io {
@@ -558,6 +631,9 @@ fn prepare_slot_launch(slot: &Arc<ScopeSlot>) -> Result<(ScopePaths, u64), Super
                 });
             }
         }
+    }
+    if runtime.restart_blocked {
+        return Err(SupervisorError::ScopeAlreadyRunning);
     }
 
     let mut metadata = slot
@@ -586,25 +662,31 @@ fn clear_launching(slot: &Arc<ScopeSlot>) -> Result<(), SupervisorError> {
 }
 
 /// 完成 spawn 后把 child、token 与 metadata 一次性挂回 scope slot。
+///
+/// 锁或状态检查失败时把 process 原样返还给 RAII guard，确保 caller 可同步终止并回收它。
 fn complete_slot_launch(
     slot: &Arc<ScopeSlot>,
     process: ManagedSidecar,
     pid: u32,
-) -> Result<(), SupervisorError> {
+) -> Result<(), (SupervisorError, ManagedSidecar)> {
     let generation = process.generation;
-    let mut runtime = slot
-        .runtime
-        .lock()
-        .map_err(|_| SupervisorError::StateUnavailable)?;
-    if !runtime.launching || runtime.child.is_some() {
-        return Err(SupervisorError::ScopeAlreadyRunning);
+    let mut runtime = match slot.runtime.lock() {
+        Ok(runtime) => runtime,
+        Err(_) => return Err((SupervisorError::StateUnavailable, process)),
+    };
+    if !runtime.launching || runtime.stopping || runtime.restart_blocked || runtime.child.is_some()
+    {
+        return Err((SupervisorError::ScopeAlreadyRunning, process));
     }
+    // 先取得两个锁，之后的字段写入不再会产生可返回错误，避免 process 已移动后丢失。
+    let mut metadata = match slot.metadata.lock() {
+        Ok(metadata) => metadata,
+        Err(_) => return Err((SupervisorError::StateUnavailable, process)),
+    };
     runtime.child = Some(process);
     runtime.launching = false;
-    let mut metadata = slot
-        .metadata
-        .lock()
-        .map_err(|_| SupervisorError::StateUnavailable)?;
+    runtime.stopping = false;
+    runtime.restart_blocked = false;
     metadata.pid = Some(pid);
     metadata.generation = generation;
     metadata.state = ProcessSlotState::Idle;
@@ -636,7 +718,9 @@ fn slot_generation_is_live(
         .lock()
         .map_err(|_| SupervisorError::StateUnavailable)?;
     let Some(process) = runtime.child.as_mut() else {
-        return Ok(false);
+        // stop 入口临时持有 child 时，watcher 不能据此退出；否则 kill 失败恢复 child 后会
+        // 失去自然退出监督。
+        return Ok(runtime.stopping);
     };
     if process.generation != generation {
         return Ok(false);
@@ -647,7 +731,9 @@ fn slot_generation_is_live(
             let process = runtime.child.take().expect("已检查 child 必定存在");
             process
                 .registry
-                .invalidate_generation(&slot.metadata()?.scope_id, process.generation);
+                .invalidate_generation(&process.scope_id, process.generation);
+            runtime.stopping = false;
+            runtime.restart_blocked = false;
             let mut metadata = slot
                 .metadata
                 .lock()
@@ -679,21 +765,59 @@ fn watch_sidecar_exit(slot: Arc<ScopeSlot>, generation: u64) {
 
 /// 关闭 child stdin 后给正常 EOF 固定宽限期，再升级为强制 kill。
 fn stop_slot(slot: &Arc<ScopeSlot>) -> Result<(), SupervisorError> {
-    let mut process = {
+    stop_slot_with_kill(slot, STDIN_CLOSE_GRACE, |child| child.kill())
+}
+
+/// 执行 stop 状态机；测试可注入 kill 错误，以锁定 token/child 所有权的 fail-closed 语义。
+fn stop_slot_with_kill(
+    slot: &Arc<ScopeSlot>,
+    eof_grace: Duration,
+    kill: impl FnOnce(&mut Child) -> io::Result<()>,
+) -> Result<(), SupervisorError> {
+    let process = {
         let mut runtime = slot
             .runtime
             .lock()
             .map_err(|_| SupervisorError::StateUnavailable)?;
+        if runtime.stopping {
+            return Err(SupervisorError::ScopeAlreadyRunning);
+        }
         runtime.launching = false;
-        runtime.child.take()
+        let process = runtime.child.take();
+        if process.is_some() {
+            // 从这里起到确认 wait 成功前，任何 launch 都必须被阻塞。
+            runtime.stopping = true;
+            runtime.restart_blocked = true;
+        } else if !runtime.restart_blocked {
+            runtime.stopping = false;
+        }
+        process
     };
-    let Some(process) = process.as_mut() else {
-        return Ok(());
+    let Some(mut process) = process else {
+        return if slot
+            .runtime
+            .lock()
+            .map_err(|_| SupervisorError::StateUnavailable)?
+            .restart_blocked
+        {
+            Err(SupervisorError::ScopeAlreadyRunning)
+        } else {
+            Ok(())
+        };
     };
+
+    // 先撤销认证能力，再做任何可能失败或阻塞的 child 操作；旧 sidecar 即使仍活着也不能出站。
+    process
+        .registry
+        .invalidate_generation(&process.scope_id, process.generation);
+    if let Err(error) = mark_slot_killing(slot) {
+        restore_stopping_process(slot, process);
+        return Err(error);
+    }
 
     // Task 7b 会先发送 session/cancel；Task 7 尚无 ACP actor，因此只能先关闭 stdin。
     let _ = process.child.stdin.take();
-    let deadline = Instant::now() + STDIN_CLOSE_GRACE;
+    let deadline = Instant::now() + eof_grace;
     let mut exited = false;
     while Instant::now() < deadline {
         match process.child.try_wait() {
@@ -703,26 +827,71 @@ fn stop_slot(slot: &Arc<ScopeSlot>) -> Result<(), SupervisorError> {
             }
             Ok(None) => thread::sleep(Duration::from_millis(20)),
             Err(source) => {
-                process
-                    .registry
-                    .invalidate_generation(&slot.metadata()?.scope_id, process.generation);
-                return Err(SupervisorError::Io {
+                let error = SupervisorError::Io {
                     operation: "等待 child EOF 退出",
                     source,
-                });
+                };
+                restore_stopping_process(slot, process);
+                return Err(error);
             }
         }
     }
     if !exited {
-        process.child.kill().map_err(|source| SupervisorError::Io {
-            operation: "终止 child",
-            source,
-        })?;
-        let _ = process.child.wait();
+        if let Err(source) = kill(&mut process.child) {
+            let error = SupervisorError::Io {
+                operation: "终止 child",
+                source,
+            };
+            // kill 失败时绝不能丢 child；保留所有权和 restart_blocked，等待后续显式恢复。
+            restore_stopping_process(slot, process);
+            return Err(error);
+        }
+        if let Err(source) = process.child.wait() {
+            let error = SupervisorError::Io {
+                operation: "回收 child",
+                source,
+            };
+            // kill 已发出但未确认 reaped 时同样不能创建新代，直到后续检查确认退出。
+            restore_stopping_process(slot, process);
+            return Err(error);
+        }
     }
-    process
-        .registry
-        .invalidate_generation(&slot.metadata()?.scope_id, process.generation);
+    // `try_wait` 或 `wait` 已确认退出；现在才允许清除 pid 并解除 restart 隔离。
+    finish_stopped_slot(slot)
+}
+
+/// 将 stop 中的 slot 标成 Killing；pid 保留到 child 已被确认退出。
+fn mark_slot_killing(slot: &Arc<ScopeSlot>) -> Result<(), SupervisorError> {
+    let mut metadata = slot
+        .metadata
+        .lock()
+        .map_err(|_| SupervisorError::StateUnavailable)?;
+    metadata.state = ProcessSlotState::Killing;
+    Ok(())
+}
+
+/// stop 失败时恢复 child 所有权；若锁已不可用则立即同步回收，宁可失败也不能遗留孤儿。
+fn restore_stopping_process(slot: &Arc<ScopeSlot>, process: ManagedSidecar) {
+    match slot.runtime.lock() {
+        Ok(mut runtime) if runtime.child.is_none() => {
+            runtime.child = Some(process);
+            runtime.launching = false;
+            runtime.stopping = false;
+            runtime.restart_blocked = true;
+        }
+        Ok(_) | Err(_) => terminate_and_reap_detached_process(process),
+    }
+}
+
+/// child 已确认退出后清理 slot 的运行与可观察 metadata。
+fn finish_stopped_slot(slot: &Arc<ScopeSlot>) -> Result<(), SupervisorError> {
+    let mut runtime = slot
+        .runtime
+        .lock()
+        .map_err(|_| SupervisorError::StateUnavailable)?;
+    runtime.launching = false;
+    runtime.stopping = false;
+    runtime.restart_blocked = false;
     let mut metadata = slot
         .metadata
         .lock()
@@ -730,6 +899,22 @@ fn stop_slot(slot: &Arc<ScopeSlot>) -> Result<(), SupervisorError> {
     metadata.pid = None;
     metadata.state = ProcessSlotState::Idle;
     Ok(())
+}
+
+/// Supervisor Drop 无法向上返回 stop 错误时，仍必须尽力终止被失败路径保留的 child。
+fn force_reap_slot_on_supervisor_drop(slot: &Arc<ScopeSlot>) {
+    let mut runtime = match slot.runtime.lock() {
+        Ok(runtime) => runtime,
+        // Drop 的目标是防孤儿；即使先前 panic 使锁中毒，也要取得内部 child 并同步回收。
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    runtime.launching = false;
+    runtime.stopping = false;
+    runtime.restart_blocked = true;
+    if let Some(process) = runtime.child.take() {
+        drop(runtime);
+        terminate_and_reap_detached_process(process);
+    }
 }
 
 /// Host 在 renderer 写盘前创建自己的隔离目录，并拒绝被符号链接重定向。
@@ -1096,5 +1281,156 @@ fn finish_lifecycle(first_error: Option<SupervisorError>) -> Result<(), Supervis
     match first_error {
         Some(error) => Err(error),
         None => Ok(()),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::io;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
+
+    use super::{
+        BindingTokenRegistry, ManagedSidecar, ProcessSlotMetadata, ProcessSlotState, ScopePaths,
+        ScopeSlot, ScopeSlotRuntime, SpawnedSidecarGuard, SupervisorError, prepare_slot_launch,
+        stop_slot_with_kill,
+    };
+
+    /// 构造仅用于生命周期失败路径的内存 scope slot，不接入 Task 7b 的 ACP actor。
+    fn test_slot(
+        process: Option<ManagedSidecar>,
+        pid: Option<u32>,
+        launching: bool,
+    ) -> Arc<ScopeSlot> {
+        Arc::new(ScopeSlot {
+            paths: ScopePaths {
+                home: std::env::temp_dir().join("efflab-supervisor-test-home"),
+                workspace: std::env::temp_dir().join("efflab-supervisor-test-workspace"),
+            },
+            metadata: Mutex::new(ProcessSlotMetadata {
+                scope_id: "scope-test".to_string(),
+                pid,
+                generation: 1,
+                session_ids: Default::default(),
+                current_session: None,
+                state: ProcessSlotState::Idle,
+            }),
+            runtime: Mutex::new(ScopeSlotRuntime {
+                child: process,
+                has_started: true,
+                launching,
+                stopping: false,
+                restart_blocked: false,
+            }),
+        })
+    }
+
+    /// 创建不读取 stdin 的测试 sidecar，以便稳定覆盖 kill 失败时的保留所有权分支。
+    fn long_running_process() -> (ManagedSidecar, String, u32) {
+        let registry = Arc::new(BindingTokenRegistry::default());
+        let token = registry
+            .register("scope-test", 1, 1)
+            .expect("测试 binding 必须可注册");
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("while :; do sleep 1; done")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("测试 sidecar 必须可启动");
+        let pid = child.id();
+        (
+            ManagedSidecar {
+                child,
+                registry,
+                scope_id: "scope-test".to_string(),
+                generation: 1,
+            },
+            token.as_bearer(),
+            pid,
+        )
+    }
+
+    /// kill 报错时 token 必须已失效、child 仍被 slot 持有，且 launch 不得创建并行进程。
+    #[test]
+    fn stop_kill_failure_invalidates_token_and_blocks_restart() {
+        let (process, token, pid) = long_running_process();
+        let registry = Arc::clone(&process.registry);
+        let slot = test_slot(Some(process), Some(pid), false);
+
+        let error = stop_slot_with_kill(&slot, std::time::Duration::ZERO, |_child| {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "injected kill failure",
+            ))
+        })
+        .expect_err("注入 kill 失败必须向上报告");
+        assert!(matches!(
+            error,
+            SupervisorError::Io {
+                operation: "终止 child",
+                ..
+            }
+        ));
+        assert!(
+            registry.authorize(&token).is_none(),
+            "停止入口必须在 kill 前立即撤销旧 generation token"
+        );
+        {
+            let runtime = slot.runtime.lock().expect("测试 runtime 锁必须可用");
+            assert!(runtime.child.is_some(), "kill 失败时 child 所有权不得丢失");
+            assert!(
+                runtime.restart_blocked,
+                "kill 失败时 scope 必须保持不可重启，避免双 sidecar"
+            );
+            assert!(!runtime.stopping, "失败后 slot 必须回到可观察的保留状态");
+        }
+        let metadata = slot.metadata().expect("测试 metadata 锁必须可用");
+        assert_eq!(metadata.pid, Some(pid));
+        assert_eq!(metadata.state, ProcessSlotState::Killing);
+        assert!(matches!(
+            prepare_slot_launch(&slot),
+            Err(SupervisorError::ScopeAlreadyRunning)
+        ));
+
+        // 测试结束前由本测试直接强制回收故意保留的 child，避免留下系统进程。
+        let mut process = slot
+            .runtime
+            .lock()
+            .expect("测试 runtime 锁必须可用")
+            .child
+            .take()
+            .expect("失败路径必须保留 child");
+        let _ = process.child.kill();
+        let _ = process.child.wait();
+    }
+
+    /// spawn 后 slot 挂接失败时，RAII guard 必须撤销 token 并终止/回收未挂接 child。
+    #[test]
+    fn spawned_child_guard_reaps_child_when_slot_attachment_fails() {
+        let (process, token, pid) = long_running_process();
+        let registry = Arc::clone(&process.registry);
+        let slot = test_slot(None, None, false);
+        let mut guard = SpawnedSidecarGuard::new(process);
+
+        assert!(matches!(
+            guard.attach(&slot, pid),
+            Err(SupervisorError::ScopeAlreadyRunning)
+        ));
+        drop(guard);
+
+        assert!(
+            registry.authorize(&token).is_none(),
+            "挂接失败清理必须先撤销未受监督 child 的 token"
+        );
+        // guard 已 wait，pid 不能仍代表该测试 child；ESRCH 是 Unix 上已回收的可观测证据。
+        let probe = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        assert_eq!(probe, -1, "挂接失败 child 必须已被终止并回收");
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "挂接失败 child 的 pid 必须不可再被信号探测"
+        );
     }
 }

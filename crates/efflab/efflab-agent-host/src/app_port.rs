@@ -173,22 +173,26 @@ pub trait HostApp: Send + Sync {
 
     /// 按 Channel 槽位密封秘密。
     ///
-    /// 默认保持与既有产品 adapter 的 `seal_secret` 兼容；需要 Byok / Relay 分槽分 salt
-    /// 的产品应覆写该方法，Host 永不自行持久化或记录明文。
-    fn seal_llm_secret(&self, _slot: LlmSecretSlot, plain: &[u8]) -> Result<SealedSecret> {
-        self.seal_secret(plain)
+    /// 默认拒绝所有槽位。产品 adapter 必须显式声明自己如何把 Byok / Relay 隔离到不同的
+    /// 存储槽或 KDF salt，不能因遗留通用端口而把两个凭据静默落到同一处。
+    fn seal_llm_secret(&self, slot: LlmSecretSlot, _plain: &[u8]) -> Result<SealedSecret> {
+        Err(anyhow::anyhow!(
+            "HostApp 未声明 {slot:?} LLM 秘密槽的密封实现"
+        ))
     }
 
     /// 按 Channel 槽位解封秘密。
     ///
-    /// 默认保持与既有产品 adapter 的 `unseal_secret` 兼容；覆写实现必须在槽位不匹配时
-    /// fail-closed，避免 Byok 和 Relay 秘密互换使用。
+    /// 默认拒绝所有槽位；覆写实现必须在槽位不匹配时 fail-closed，避免 Byok 和 Relay
+    /// 秘密互换使用。
     fn unseal_llm_secret(
         &self,
-        _slot: LlmSecretSlot,
-        sealed: &SealedSecret,
+        slot: LlmSecretSlot,
+        _sealed: &SealedSecret,
     ) -> Result<SecretGuard> {
-        self.unseal_secret(sealed)
+        Err(anyhow::anyhow!(
+            "HostApp 未声明 {slot:?} LLM 秘密槽的解封实现"
+        ))
     }
 
     /// 返回当前作用域可用的 MCP 规格；Task 1 不调用。
@@ -204,4 +208,63 @@ pub trait HostApp: Send + Sync {
 pub trait HostAppMentions: Send + Sync {
     /// 将已授权 scope 中的标识解析成安全文本；Task 1 不调用。
     fn resolve_mentions(&self, scope: &ScopeId, ids: &[MentionId]) -> Result<Vec<ResolvedMention>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+
+    use super::{
+        ApprovedMcpSpec, HostApp, LlmChannelConfig, LlmSecretSlot, ScopeId, SealedSecret,
+        SecretGuard,
+    };
+
+    /// 仅实现旧通用密封端口的 legacy adapter；它没有声明任何 Channel 槽位绑定。
+    struct LegacyUnslottedApp;
+
+    impl HostApp for LegacyUnslottedApp {
+        fn app_id(&self) -> &str {
+            "legacy-unslotted-test"
+        }
+
+        fn persist_llm_channel(&self, _cfg: &LlmChannelConfig) -> Result<()> {
+            Ok(())
+        }
+
+        fn load_llm_channel(&self) -> Result<LlmChannelConfig> {
+            Ok(LlmChannelConfig::Unconfigured)
+        }
+
+        fn seal_secret(&self, plain: &[u8]) -> Result<SealedSecret> {
+            Ok(SealedSecret::new(plain.to_vec()))
+        }
+
+        fn unseal_secret(&self, sealed: &SealedSecret) -> Result<SecretGuard> {
+            Ok(SecretGuard::new(sealed.as_bytes().to_vec()))
+        }
+
+        fn mcp_for_scope(&self, _scope: &ScopeId) -> Result<ApprovedMcpSpec> {
+            Ok(ApprovedMcpSpec::default())
+        }
+    }
+
+    /// 未显式绑定槽位的产品 adapter 不能把 BYOK 与 Relay 静默落到同一秘密存储。
+    #[test]
+    fn default_llm_secret_slots_fail_closed_without_explicit_adapter_binding() {
+        let app = LegacyUnslottedApp;
+        let sealed = app
+            .seal_secret(b"test-secret")
+            .expect("legacy 通用密封桩必须可用");
+
+        for slot in [LlmSecretSlot::Byok, LlmSecretSlot::Relay] {
+            assert!(
+                app.seal_llm_secret(slot, b"test-secret").is_err(),
+                "未声明的 {slot:?} 密封槽必须 fail-closed"
+            );
+            assert!(
+                app.unseal_llm_secret(slot, &sealed).is_err(),
+                "未声明的 {slot:?} 解封槽必须 fail-closed"
+            );
+        }
+    }
 }

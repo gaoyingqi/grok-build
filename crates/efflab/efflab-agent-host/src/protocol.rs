@@ -131,7 +131,7 @@ impl fmt::Debug for KitCommand {
                     "relay_base_url",
                     &relay_base_url.as_ref().map(|_| "[REDACTED]"),
                 )
-                .field("app_key", app_key)
+                .field("app_key", &app_key.as_ref().map(|_| "[REDACTED]"))
                 .field("api_key", &api_key.as_ref().map(|_| "[REDACTED]"))
                 .field("access_token", &access_token.as_ref().map(|_| "[REDACTED]"))
                 .field("client_request_id", client_request_id)
@@ -746,7 +746,7 @@ impl fmt::Debug for SetLlmChannelCommand {
                 "relay_base_url",
                 &self.relay_base_url.as_ref().map(|_| "[REDACTED]"),
             )
-            .field("app_key", &self.app_key)
+            .field("app_key", &self.app_key.as_ref().map(|_| "[REDACTED]"))
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .field(
                 "access_token",

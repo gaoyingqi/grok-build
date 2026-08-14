@@ -5,8 +5,9 @@
 //! 下游断开会 drop 上游流而不是继续缓冲。
 
 use std::fmt;
+use std::future::IntoFuture;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -230,6 +231,8 @@ pub enum L3bLoopbackError {
     BindFailed,
     /// Tokio runtime 初始化失败。
     RuntimeUnavailable,
+    /// listener 转换或服务首次运行失败。
+    ServeFailed,
     /// CSPRNG 不可用。
     RandomnessUnavailable,
     /// token 的 scope/generation/revision 非法。
@@ -246,6 +249,7 @@ impl fmt::Display for L3bLoopbackError {
             Self::ChannelUnconfigured => "LLM Channel 未配置",
             Self::BindFailed => "L3b 监听失败",
             Self::RuntimeUnavailable => "L3b 运行时不可用",
+            Self::ServeFailed => "L3b 回环服务启动失败",
             Self::RandomnessUnavailable => "无法生成 L3b binding token",
             Self::InvalidBindingContext => "L3b binding 上下文无效",
             Self::RegistryUnavailable => "L3b binding 注册表不可用",
@@ -270,6 +274,11 @@ impl L3bLoopback {
         manager: Arc<LlmChannelManager>,
         config: L3bRuntimeConfig,
     ) -> Result<Self, L3bLoopbackError> {
+        // 遗留的 DNS hostname 必须先完成本次启动的全量地址审查，不能只因 URL 形状正确
+        // 就产生可运行 sidecar。
+        manager
+            .ensure_startable()
+            .map_err(|_| L3bLoopbackError::ChannelUnconfigured)?;
         if !manager
             .has_active_byok()
             .map_err(|_| L3bLoopbackError::ChannelUnconfigured)?
@@ -302,25 +311,60 @@ impl L3bLoopback {
             .route("/v1/chat/completions", post(chat_completions))
             .with_state(state);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        // `start` 只有在 worker 已成功接管 listener 且 server 首次 poll 未立即失败后才返回。
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("efflab-l3b-loopback".to_string())
             .spawn(move || {
                 runtime.block_on(async move {
-                    let Ok(listener) = tokio::net::TcpListener::from_std(listener) else {
-                        return;
+                    let listener = match tokio::net::TcpListener::from_std(listener) {
+                        Ok(listener) => listener,
+                        Err(_) => {
+                            let _ = ready_tx.send(Err(L3bLoopbackError::ServeFailed));
+                            return;
+                        }
                     };
-                    // 收到 shutdown 时直接 drop server/futures，确保未消费的上游流随 body drop 取消。
+                    let server = axum::serve(listener, router).into_future();
+                    tokio::pin!(server);
+                    // 先给 server 一个调度机会：若首次 poll 已失败，必须把失败反馈给 start，
+                    // 而不是让后续 sidecar 拿到一个永远无法处理请求的端口。
                     tokio::select! {
-                        result = axum::serve(listener, router) => {
+                        biased;
+                        result = &mut server => {
                             if result.is_err() {
-                                tracing::debug!("L3b 回环服务已停止");
+                                tracing::debug!("L3b 回环服务首次运行失败");
+                            }
+                            let _ = ready_tx.send(Err(L3bLoopbackError::ServeFailed));
+                        }
+                        _ = tokio::task::yield_now() => {
+                            if ready_tx.send(Ok(())).is_err() {
+                                return;
+                            }
+                            // 收到 shutdown 时直接 drop server/futures，确保未消费的上游流随 body drop 取消。
+                            tokio::select! {
+                                result = &mut server => {
+                                    if result.is_err() {
+                                        tracing::debug!("L3b 回环服务已停止");
+                                    }
+                                }
+                                _ = shutdown_rx => {}
                             }
                         }
-                        _ = shutdown_rx => {}
                     }
                 });
             })
             .map_err(|_| L3bLoopbackError::RuntimeUnavailable)?;
+        match ready_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let _ = worker.join();
+                return Err(error);
+            }
+            Err(_) => {
+                let _ = worker.join();
+                return Err(L3bLoopbackError::ServeFailed);
+            }
+        }
 
         tracing::debug!(listen_port = local_addr.port(), "L3b 回环服务已开始监听");
         Ok(Self {
@@ -529,6 +573,20 @@ async fn verify_upstream(base_url: &str, allow_loopback_llm: bool) -> Result<Ver
     })
 }
 
+/// 返回 IPv4-mapped 或 IPv4-compatible IPv6 所嵌入的 IPv4 地址。
+///
+/// `Ipv6Addr::to_ipv4_mapped` 只覆盖 `::ffff:a.b.c.d`；`::a.b.c.d` 的前 96 bit 同为零，
+/// 也必须进入同一 IPv4 SSRF 策略，不能作为普通公网 IPv6 放行。
+pub(crate) fn embedded_ipv4_address(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    ip.to_ipv4_mapped().or_else(|| {
+        let octets = ip.octets();
+        octets[..12]
+            .iter()
+            .all(|octet| *octet == 0)
+            .then(|| Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]))
+    })
+}
+
 /// 仅允许公网地址；显式开关只放行 loopback，绝不放行其它 private/link-local/metadata。
 pub(crate) fn is_allowed_upstream_ip(ip: IpAddr, allow_loopback_llm: bool) -> bool {
     match ip {
@@ -551,16 +609,17 @@ pub(crate) fn is_allowed_upstream_ip(ip: IpAddr, allow_loopback_llm: bool) -> bo
                 || ip == Ipv4Addr::new(169, 254, 169, 254))
         }
         IpAddr::V6(ip) => {
+            // 原生 IPv6 loopback 维持专用策略；否则 `::1` 会被误当成嵌入的 0.0.0.1。
             if ip.is_loopback() {
                 return allow_loopback_llm;
+            }
+            if let Some(embedded) = embedded_ipv4_address(ip) {
+                return is_allowed_upstream_ip(IpAddr::V4(embedded), allow_loopback_llm);
             }
             let segments = ip.segments();
             let unique_local = (segments[0] & 0xfe00) == 0xfc00;
             let link_local = (segments[0] & 0xffc0) == 0xfe80;
-            let ipv4_mapped = ip.to_ipv4_mapped().is_some_and(|mapped| {
-                !is_allowed_upstream_ip(IpAddr::V4(mapped), allow_loopback_llm)
-            });
-            !(ip.is_unspecified() || ip.is_multicast() || unique_local || link_local || ipv4_mapped)
+            !(ip.is_unspecified() || ip.is_multicast() || unique_local || link_local)
         }
     }
 }
@@ -576,4 +635,42 @@ fn is_exact_loopback(address: IpAddr) -> bool {
 /// 构造不包含内部错误细节的空 HTTP 响应。
 fn status_response(status: StatusCode) -> Response {
     (status, "").into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv6Addr};
+
+    use super::is_allowed_upstream_ip;
+
+    /// IPv4-compatible 与 IPv4-mapped IPv6 必须递归接受 IPv4 SSRF 策略审查。
+    #[test]
+    fn ipv4_embedded_ipv6_uses_ipv4_ssrf_classification() {
+        let compatible_loopback = "::127.0.0.1"
+            .parse::<Ipv6Addr>()
+            .expect("IPv4-compatible 测试地址必须可解析");
+        let compatible_private = "::192.168.1.10"
+            .parse::<Ipv6Addr>()
+            .expect("IPv4-compatible 私网地址必须可解析");
+        let mapped_metadata = "::ffff:169.254.169.254"
+            .parse::<Ipv6Addr>()
+            .expect("IPv4-mapped metadata 地址必须可解析");
+
+        assert!(
+            !is_allowed_upstream_ip(IpAddr::V6(compatible_loopback), false),
+            "默认策略必须拒绝 IPv4-compatible loopback"
+        );
+        assert!(
+            is_allowed_upstream_ip(IpAddr::V6(compatible_loopback), true),
+            "显式开发开关只能放行嵌入的 IPv4 loopback"
+        );
+        assert!(
+            !is_allowed_upstream_ip(IpAddr::V6(compatible_private), true),
+            "显式开发开关不得放行 IPv4-compatible 私网"
+        );
+        assert!(
+            !is_allowed_upstream_ip(IpAddr::V6(mapped_metadata), true),
+            "显式开发开关不得放行 IPv4-mapped metadata"
+        );
+    }
 }

@@ -124,9 +124,13 @@ impl fmt::Debug for KitCommand {
             } => formatter
                 .debug_struct("SetLlmChannel")
                 .field("kind", kind)
-                .field("base_url", base_url)
+                // URL 在请求校验前也可能含 query 秘密，日志只标记字段存在。
+                .field("base_url", &base_url.as_ref().map(|_| "[REDACTED]"))
                 .field("model_id", model_id)
-                .field("relay_base_url", relay_base_url)
+                .field(
+                    "relay_base_url",
+                    &relay_base_url.as_ref().map(|_| "[REDACTED]"),
+                )
                 .field("app_key", app_key)
                 .field("api_key", &api_key.as_ref().map(|_| "[REDACTED]"))
                 .field("access_token", &access_token.as_ref().map(|_| "[REDACTED]"))
@@ -735,9 +739,13 @@ impl fmt::Debug for SetLlmChannelCommand {
             .debug_struct("SetLlmChannelCommand")
             .field("cmd", &self.cmd)
             .field("kind", &self.kind)
-            .field("base_url", &self.base_url)
+            // serde DTO 可能在 URL 校验前被记录，不能回显其原始地址。
+            .field("base_url", &self.base_url.as_ref().map(|_| "[REDACTED]"))
             .field("model_id", &self.model_id)
-            .field("relay_base_url", &self.relay_base_url)
+            .field(
+                "relay_base_url",
+                &self.relay_base_url.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("app_key", &self.app_key)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .field(

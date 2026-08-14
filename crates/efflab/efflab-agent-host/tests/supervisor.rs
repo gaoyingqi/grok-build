@@ -21,6 +21,7 @@ fn config(home_root: PathBuf) -> HostRuntimeConfig {
         mcp_exec_root: home_root.join("mcp"),
         home_root,
         idle_after: Duration::from_secs(60),
+        l3b: efflab_agent_host::L3bRuntimeConfig::default(),
     }
 }
 

@@ -7,6 +7,8 @@ mod acp_runtime;
 mod app_port;
 mod config;
 mod event_sink;
+mod llm_channel;
+mod llm_loopback;
 mod projector;
 mod protocol;
 mod runtime;
@@ -15,11 +17,18 @@ mod supervisor;
 
 pub use acp_runtime::{AcpRuntime, Inbound, METHOD_NOT_FOUND, RequestId, RpcError, ValidatedReply};
 pub use app_port::{
-    ApprovedMcpSpec, HostApp, HostAppMentions, LlmChannelConfig, MentionId, ResolvedMention,
-    ScopeId, SealedSecret, SecretGuard,
+    ApprovedMcpSpec, HostApp, HostAppMentions, LlmChannelConfig, LlmSecretSlot, MentionId,
+    ResolvedMention, ScopeId, SealedSecret, SecretGuard,
 };
-pub use config::HostRuntimeConfig;
+pub use config::{HostRuntimeConfig, L3bRuntimeConfig};
 pub use event_sink::{KitEventSink, ValidatedKitEventSink};
+pub use llm_channel::{
+    ChannelChange, LlmChannelError, LlmChannelManager, LlmChannelService, SetLlmChannelRequest,
+};
+pub use llm_loopback::{
+    BindingContext, BindingToken, BindingTokenRegistry, L3bLoopback, L3bLoopbackError,
+    MAX_L3B_REQUEST_BODY_BYTES,
+};
 pub use projector::{ProjectError, Projector, apply_acp_notification};
 pub use protocol::{
     Capability, CapabilityLimits, KIT_SCHEMA_VERSION, KitBlock, KitCommand, KitError,
@@ -29,6 +38,6 @@ pub use protocol::{
 pub use runtime::HostRuntime;
 pub use supervisor::{
     ChildEnvironment, ChildLifecycle, ChildLifecycleOps, ProcessSlotMetadata, ProcessSlotState,
-    STDIN_CLOSE_GRACE, ScopePaths, ScopeSlot, Supervisor, SupervisorCapability, SupervisorError,
-    TERMINATE_GRACE, UnavailableReason, capability, sanitize,
+    STDIN_CLOSE_GRACE, ScopePaths, ScopeSlot, SidecarProcessInfo, Supervisor, SupervisorCapability,
+    SupervisorError, TERMINATE_GRACE, UnavailableReason, capability, sanitize,
 };

@@ -1,20 +1,27 @@
 //! Scope 隔离的 sidecar 进程监督基础设施。
 //!
-//! 本模块只冻结稳定 home/cwd、scope slot、受控子进程环境与退出生命周期；不在
-//! Task 5 中启动 sidecar、写权威配置或注入 L3b binding token。sidecar 私有 home 的
-//! `.efflab-sidecar.lock` 始终由 sidecar 自己持有，Host 只维护内存 process-slot metadata。
+//! 本模块冻结稳定 home/cwd、scope slot、受控子进程环境与退出生命周期；Task 7 在此
+//! 执行监听后注册 token、写权威配置、再启动 sidecar 的完整顺序。Task 7b 才会接管
+//! child 的 ACP stdio 读写。sidecar 私有 home 的 `.efflab-sidecar.lock` 始终由 sidecar
+//! 自己持有，Host 只维护内存 process-slot metadata。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use efflab_agent_contract::{SidecarModelSpec, render_authoritative_config};
 
 use crate::HostRuntimeConfig;
+use crate::llm_channel::LlmChannelManager;
+use crate::llm_loopback::{BindingToken, BindingTokenRegistry, L3bLoopback};
 
 /// 关闭 stdin 后等待 sidecar 自然退出的固定宽限期。
 pub const STDIN_CLOSE_GRACE: Duration = Duration::from_millis(3_500);
@@ -79,6 +86,16 @@ pub enum SupervisorError {
         /// 对应变量名，不包含敏感值。
         name: String,
     },
+    /// L3b 或 Channel 未处于可安全启动 sidecar 的状态。
+    LlmChannelUnavailable,
+    /// 同一 scope 已有正在启动或存活的 sidecar，禁止双进程竞争私有 home。
+    ScopeAlreadyRunning,
+    /// contract renderer 拒绝构造权威 config.toml。
+    ConfigRenderFailed,
+    /// Host 不能安全原子写入权威 config.toml。
+    ConfigWriteFailed,
+    /// 批量 restart 至少一个 scope 失败；新 Channel 已提交，调用方可重试。
+    RestartFailed,
     /// scope slot 的内部状态锁已中毒，不能安全继续复用。
     StateUnavailable,
     /// 生命周期底层操作失败；保留 I/O 分类但不记录环境内容。
@@ -110,6 +127,11 @@ impl fmt::Display for SupervisorError {
             Self::EnvironmentValueNotAllowed { .. } => {
                 formatter.write_str("子进程环境值形如用户 Key")
             }
+            Self::LlmChannelUnavailable => formatter.write_str("LLM Channel 或 L3b 不可用"),
+            Self::ScopeAlreadyRunning => formatter.write_str("scope 已有 sidecar 进程"),
+            Self::ConfigRenderFailed => formatter.write_str("权威 sidecar 配置渲染失败"),
+            Self::ConfigWriteFailed => formatter.write_str("权威 sidecar 配置写入失败"),
+            Self::RestartFailed => formatter.write_str("sidecar 批量重启失败"),
             Self::StateUnavailable => formatter.write_str("scope slot 状态不可用"),
             Self::Io { operation, source } => write!(formatter, "子进程{operation}失败: {source}"),
         }
@@ -168,7 +190,7 @@ pub enum ProcessSlotState {
 /// Host 独有的内存 process-slot metadata。
 ///
 /// 它绝不对应、创建、打开或竞争 `{GROK_HOME}/.efflab-sidecar.lock`；后者是 sidecar
-/// 进程的唯一资源锁。Task 5 没有真实 child，因此 `pid` 保持 `None`。
+/// 进程的唯一资源锁。未启动或 child 已退出时 `pid` 保持 `None`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSlotMetadata {
     /// 经校验后的不透明 scope 标识。
@@ -185,10 +207,39 @@ pub struct ProcessSlotMetadata {
     pub state: ProcessSlotState,
 }
 
+/// 已启动 child 与其 binding token 的私有所有权；不向外暴露 token 或 stdio。
+struct ManagedSidecar {
+    child: Child,
+    /// registry 保留 token 本体；child 所有权只保留失效所需的 registry 与 generation。
+    registry: Arc<BindingTokenRegistry>,
+    generation: u64,
+}
+
+/// scope slot 中不进入产品可观察 metadata 的启动协调状态。
+struct ScopeSlotRuntime {
+    child: Option<ManagedSidecar>,
+    has_started: bool,
+    launching: bool,
+}
+
+/// 真实 launch 后向未来 runtime 返回的非敏感进程描述。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarProcessInfo {
+    /// 所属 scope 标识。
+    pub scope_id: String,
+    /// OS child pid。
+    pub pid: u32,
+    /// 本次 sidecar process generation。
+    pub generation: u64,
+    /// 注册 token 时的 Channel revision。
+    pub channel_revision: u64,
+}
+
 /// 一个 scope 唯一对应的进程所有权槽。
 pub struct ScopeSlot {
     paths: ScopePaths,
     metadata: Mutex<ProcessSlotMetadata>,
+    runtime: Mutex<ScopeSlotRuntime>,
 }
 
 impl ScopeSlot {
@@ -208,8 +259,8 @@ impl ScopeSlot {
 
 /// 同一 Host 进程内的 scope slot 注册表。
 ///
-/// `Supervisor` 不在本 task 中调用 `Command::spawn`。它只为未来 Task 7 提供一 scope
-/// 一 child 的所有权边界、固定路径和 platform capability gate。
+/// `Supervisor` 在 Task 7 提供一 scope 一 child 的真实启动顺序、固定路径和 platform
+/// capability gate；ACP stdin/stdout 的协议 actor 仍由 Task 7b 接入。
 pub struct Supervisor {
     config: HostRuntimeConfig,
     app_id: String,
@@ -280,10 +331,476 @@ impl Supervisor {
                         current_session: None,
                         state: ProcessSlotState::Idle,
                     }),
+                    runtime: Mutex::new(ScopeSlotRuntime {
+                        child: None,
+                        has_started: false,
+                        launching: false,
+                    }),
                 })
             })
             .clone())
     }
+
+    /// 执行 Task 7 的真实 launch 顺序：L3b 已监听 → 注册 token → 写权威 TOML → spawn。
+    pub fn launch_sidecar(
+        &self,
+        scope: &str,
+        loopback: &L3bLoopback,
+        channel: &LlmChannelManager,
+    ) -> Result<SidecarProcessInfo, SupervisorError> {
+        if let SupervisorCapability::Unavailable { reason } = self.capability() {
+            return Err(SupervisorError::Unavailable { reason });
+        }
+        let (model_id, channel_revision) = channel
+            .sidecar_model()
+            .map_err(|_| SupervisorError::LlmChannelUnavailable)?;
+        let scope_id = sanitize(scope)?;
+        let slot = self.acquire(&scope_id)?;
+        let (paths, generation) = prepare_slot_launch(&slot)?;
+
+        // L3b 已经由 service 启动；先注册本代 token，后续任何失败都会立即使它失效。
+        let token = match loopback.register_binding(&scope_id, generation, channel_revision) {
+            Ok(token) => token,
+            Err(_) => {
+                clear_launching(&slot)?;
+                return Err(SupervisorError::LlmChannelUnavailable);
+            }
+        };
+        let registry = loopback.registry();
+        let result = self.spawn_registered_sidecar(
+            &slot,
+            &scope_id,
+            generation,
+            channel_revision,
+            &model_id,
+            loopback,
+            token.clone(),
+            Arc::clone(&registry),
+            paths,
+        );
+        if result.is_err() {
+            registry.invalidate_generation(&scope_id, generation);
+            let _ = clear_launching(&slot);
+        }
+        result
+    }
+
+    /// 返回真实存活的 scope；自然退出 child 会在此处同步失效其 binding token。
+    pub fn live_scope_ids(&self) -> Result<Vec<String>, SupervisorError> {
+        let slots: Vec<(String, Arc<ScopeSlot>)> = self
+            .slots
+            .lock()
+            .map_err(|_| SupervisorError::StateUnavailable)?
+            .iter()
+            .map(|(scope_id, slot)| (scope_id.clone(), Arc::clone(slot)))
+            .collect();
+        let mut live = Vec::new();
+        for (scope_id, slot) in slots {
+            if slot_is_live(&slot)? {
+                live.push(scope_id);
+            }
+        }
+        Ok(live)
+    }
+
+    /// drain 所有已存活 scope 后按当前 Channel revision 再启动；尽力覆盖所有 scope。
+    pub fn restart_live_scopes(
+        &self,
+        loopback: &L3bLoopback,
+        channel: &LlmChannelManager,
+    ) -> Result<(), SupervisorError> {
+        let scopes = self.live_scope_ids()?;
+        let mut failed = false;
+        for scope in &scopes {
+            if self.stop_scope(scope).is_err() {
+                failed = true;
+            }
+        }
+        for scope in &scopes {
+            if self.launch_sidecar(scope, loopback, channel).is_err() {
+                failed = true;
+            }
+        }
+        if failed {
+            Err(SupervisorError::RestartFailed)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// 关闭一 scope child 并立即使其 binding token 失效；不触碰 sidecar 的 home lock。
+    pub fn stop_scope(&self, scope: &str) -> Result<(), SupervisorError> {
+        let scope_id = sanitize(scope)?;
+        let slot = self
+            .slots
+            .lock()
+            .map_err(|_| SupervisorError::StateUnavailable)?
+            .get(&scope_id)
+            .cloned();
+        let Some(slot) = slot else {
+            return Ok(());
+        };
+        stop_slot(&slot)
+    }
+
+    /// 在已注册 token 后渲染/原子写 TOML，并以受控环境启动 sidecar。
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_registered_sidecar(
+        &self,
+        slot: &Arc<ScopeSlot>,
+        scope_id: &str,
+        generation: u64,
+        channel_revision: u64,
+        model_id: &str,
+        loopback: &L3bLoopback,
+        token: BindingToken,
+        registry: Arc<BindingTokenRegistry>,
+        paths: ScopePaths,
+    ) -> Result<SidecarProcessInfo, SupervisorError> {
+        prepare_scope_directories(&paths)?;
+        let agent_definition = paths.home.join("agents").join("efflab-default.md");
+        let rendered = render_authoritative_config(
+            &paths.home,
+            &agent_definition,
+            None,
+            &[SidecarModelSpec {
+                model: model_id.to_string(),
+                base_url: loopback.sidecar_base_url(),
+                name: "BYOK".to_string(),
+                api_backend: "chat_completions".to_string(),
+                env_key: "EFFLAB_L3B_BIND".to_string(),
+            }],
+        )
+        .map_err(|_| SupervisorError::ConfigRenderFailed)?;
+        write_authoritative_config(&paths.home.join("config.toml"), rendered.as_bytes())?;
+
+        // 仅此处把 binding token 注入 child；用户 Key 从不在 env、CLI 或 TOML 中出现。
+        let environment = ChildEnvironment::for_sidecar_with_binding(&paths.home, &token)?;
+        let mut command = Command::new(&self.config.sidecar_bin);
+        command
+            .arg("--stdio")
+            .arg("--grok-home")
+            .arg(&paths.home)
+            .arg("--session-cwd")
+            .arg(&paths.workspace)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        environment.apply(&mut command);
+        let child = command.spawn().map_err(|source| SupervisorError::Io {
+            operation: "spawn",
+            source,
+        })?;
+        let pid = child.id();
+        complete_slot_launch(
+            slot,
+            ManagedSidecar {
+                child,
+                registry,
+                generation,
+            },
+            pid,
+        )?;
+        // watcher 只观察这一 generation；child 自然退出后 token 无需等下一次 dispatch 即失效。
+        watch_sidecar_exit(Arc::clone(slot), generation);
+        tracing::debug!(
+            scope = %scope_id,
+            pid,
+            generation,
+            channel_revision,
+            "sidecar 已在 L3b/config 注册完成后启动"
+        );
+        Ok(SidecarProcessInfo {
+            scope_id: scope_id.to_string(),
+            pid,
+            generation,
+            channel_revision,
+        })
+    }
+}
+
+impl Drop for Supervisor {
+    /// Host 释放时回收仍由本进程持有的 child，避免遗留获得过 binding token 的 sidecar。
+    fn drop(&mut self) {
+        let slots = self
+            .slots
+            .lock()
+            .map(|slots| slots.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for slot in slots {
+            let _ = stop_slot(&slot);
+        }
+    }
+}
+
+/// 把 scope slot 置为独占 launching，并为本次 child 预留单调 generation。
+fn prepare_slot_launch(slot: &Arc<ScopeSlot>) -> Result<(ScopePaths, u64), SupervisorError> {
+    let mut runtime = slot
+        .runtime
+        .lock()
+        .map_err(|_| SupervisorError::StateUnavailable)?;
+    if runtime.launching {
+        return Err(SupervisorError::ScopeAlreadyRunning);
+    }
+    if let Some(process) = runtime.child.as_mut() {
+        match process.child.try_wait() {
+            Ok(None) => return Err(SupervisorError::ScopeAlreadyRunning),
+            Ok(Some(_)) => {
+                let process = runtime.child.take().expect("已检查 child 必定存在");
+                process
+                    .registry
+                    .invalidate_generation(&slot.metadata()?.scope_id, process.generation);
+            }
+            Err(source) => {
+                return Err(SupervisorError::Io {
+                    operation: "检查 child 状态",
+                    source,
+                });
+            }
+        }
+    }
+
+    let mut metadata = slot
+        .metadata
+        .lock()
+        .map_err(|_| SupervisorError::StateUnavailable)?;
+    if runtime.has_started {
+        metadata.generation = metadata.generation.saturating_add(1).max(1);
+    } else {
+        runtime.has_started = true;
+    }
+    metadata.pid = None;
+    metadata.state = ProcessSlotState::Idle;
+    runtime.launching = true;
+    Ok((slot.paths.clone(), metadata.generation))
+}
+
+/// 失败路径解除 launching 标志，保留 generation 消耗以确保旧 token 无法复活。
+fn clear_launching(slot: &Arc<ScopeSlot>) -> Result<(), SupervisorError> {
+    let mut runtime = slot
+        .runtime
+        .lock()
+        .map_err(|_| SupervisorError::StateUnavailable)?;
+    runtime.launching = false;
+    Ok(())
+}
+
+/// 完成 spawn 后把 child、token 与 metadata 一次性挂回 scope slot。
+fn complete_slot_launch(
+    slot: &Arc<ScopeSlot>,
+    process: ManagedSidecar,
+    pid: u32,
+) -> Result<(), SupervisorError> {
+    let generation = process.generation;
+    let mut runtime = slot
+        .runtime
+        .lock()
+        .map_err(|_| SupervisorError::StateUnavailable)?;
+    if !runtime.launching || runtime.child.is_some() {
+        return Err(SupervisorError::ScopeAlreadyRunning);
+    }
+    runtime.child = Some(process);
+    runtime.launching = false;
+    let mut metadata = slot
+        .metadata
+        .lock()
+        .map_err(|_| SupervisorError::StateUnavailable)?;
+    metadata.pid = Some(pid);
+    metadata.generation = generation;
+    metadata.state = ProcessSlotState::Idle;
+    Ok(())
+}
+
+/// 查询 slot 是否仍有运行中的 child；退出时同步回收 token 和 pid metadata。
+fn slot_is_live(slot: &Arc<ScopeSlot>) -> Result<bool, SupervisorError> {
+    let generation = {
+        let runtime = slot
+            .runtime
+            .lock()
+            .map_err(|_| SupervisorError::StateUnavailable)?;
+        runtime.child.as_ref().map(|process| process.generation)
+    };
+    match generation {
+        Some(generation) => slot_generation_is_live(slot, generation),
+        None => Ok(false),
+    }
+}
+
+/// 只观察特定 generation，避免旧 child watcher 误管理已经重启出的新进程。
+fn slot_generation_is_live(
+    slot: &Arc<ScopeSlot>,
+    generation: u64,
+) -> Result<bool, SupervisorError> {
+    let mut runtime = slot
+        .runtime
+        .lock()
+        .map_err(|_| SupervisorError::StateUnavailable)?;
+    let Some(process) = runtime.child.as_mut() else {
+        return Ok(false);
+    };
+    if process.generation != generation {
+        return Ok(false);
+    }
+    match process.child.try_wait() {
+        Ok(None) => Ok(true),
+        Ok(Some(_)) => {
+            let process = runtime.child.take().expect("已检查 child 必定存在");
+            process
+                .registry
+                .invalidate_generation(&slot.metadata()?.scope_id, process.generation);
+            let mut metadata = slot
+                .metadata
+                .lock()
+                .map_err(|_| SupervisorError::StateUnavailable)?;
+            metadata.pid = None;
+            metadata.state = ProcessSlotState::Idle;
+            Ok(false)
+        }
+        Err(source) => Err(SupervisorError::Io {
+            operation: "检查 child 状态",
+            source,
+        }),
+    }
+}
+
+/// 子进程自然退出时尽快使 binding token 失效，不等待下一个产品 dispatch。
+fn watch_sidecar_exit(slot: Arc<ScopeSlot>, generation: u64) {
+    let _ = thread::Builder::new()
+        .name("efflab-sidecar-exit-watch".to_string())
+        .spawn(move || {
+            loop {
+                match slot_generation_is_live(&slot, generation) {
+                    Ok(true) => thread::sleep(Duration::from_millis(50)),
+                    Ok(false) | Err(_) => break,
+                }
+            }
+        });
+}
+
+/// 关闭 child stdin 后给正常 EOF 固定宽限期，再升级为强制 kill。
+fn stop_slot(slot: &Arc<ScopeSlot>) -> Result<(), SupervisorError> {
+    let mut process = {
+        let mut runtime = slot
+            .runtime
+            .lock()
+            .map_err(|_| SupervisorError::StateUnavailable)?;
+        runtime.launching = false;
+        runtime.child.take()
+    };
+    let Some(process) = process.as_mut() else {
+        return Ok(());
+    };
+
+    // Task 7b 会先发送 session/cancel；Task 7 尚无 ACP actor，因此只能先关闭 stdin。
+    let _ = process.child.stdin.take();
+    let deadline = Instant::now() + STDIN_CLOSE_GRACE;
+    let mut exited = false;
+    while Instant::now() < deadline {
+        match process.child.try_wait() {
+            Ok(Some(_)) => {
+                exited = true;
+                break;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(source) => {
+                process
+                    .registry
+                    .invalidate_generation(&slot.metadata()?.scope_id, process.generation);
+                return Err(SupervisorError::Io {
+                    operation: "等待 child EOF 退出",
+                    source,
+                });
+            }
+        }
+    }
+    if !exited {
+        process.child.kill().map_err(|source| SupervisorError::Io {
+            operation: "终止 child",
+            source,
+        })?;
+        let _ = process.child.wait();
+    }
+    process
+        .registry
+        .invalidate_generation(&slot.metadata()?.scope_id, process.generation);
+    let mut metadata = slot
+        .metadata
+        .lock()
+        .map_err(|_| SupervisorError::StateUnavailable)?;
+    metadata.pid = None;
+    metadata.state = ProcessSlotState::Idle;
+    Ok(())
+}
+
+/// Host 在 renderer 写盘前创建自己的隔离目录，并拒绝被符号链接重定向。
+fn prepare_scope_directories(paths: &ScopePaths) -> Result<(), SupervisorError> {
+    for directory in [&paths.home, &paths.workspace] {
+        fs::create_dir_all(directory).map_err(|_| SupervisorError::ConfigWriteFailed)?;
+        let metadata =
+            fs::symlink_metadata(directory).map_err(|_| SupervisorError::ConfigWriteFailed)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(SupervisorError::ConfigWriteFailed);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+                .map_err(|_| SupervisorError::ConfigWriteFailed)?;
+        }
+    }
+    Ok(())
+}
+
+/// 原子物化 contract renderer 的完整 TOML；Host 是该文件的唯一写盘 owner。
+fn write_authoritative_config(path: &Path, content: &[u8]) -> Result<(), SupervisorError> {
+    let parent = path.parent().ok_or(SupervisorError::ConfigWriteFailed)?;
+    let parent_metadata =
+        fs::symlink_metadata(parent).map_err(|_| SupervisorError::ConfigWriteFailed)?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(SupervisorError::ConfigWriteFailed);
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(SupervisorError::ConfigWriteFailed);
+        }
+        Ok(_) => {}
+        // 只有不存在旧配置时才能继续创建；权限、I/O 等其它元数据错误必须 fail-closed。
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err(SupervisorError::ConfigWriteFailed),
+    }
+    let temporary = parent.join(format!(".config.toml.{}.tmp", std::process::id()));
+    let _ = fs::remove_file(&temporary);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .map_err(|_| SupervisorError::ConfigWriteFailed)?;
+    let write_result = (|| -> Result<(), SupervisorError> {
+        file.write_all(content)
+            .map_err(|_| SupervisorError::ConfigWriteFailed)?;
+        file.sync_all()
+            .map_err(|_| SupervisorError::ConfigWriteFailed)?;
+        fs::rename(&temporary, path).map_err(|_| SupervisorError::ConfigWriteFailed)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .map_err(|_| SupervisorError::ConfigWriteFailed)?;
+        }
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| SupervisorError::ConfigWriteFailed)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
 }
 
 /// 返回当前编译目标的 sidecar 监督能力，供尚未持有 `Supervisor` 的调用方查询。
@@ -353,6 +870,26 @@ impl ChildEnvironment {
             .iter()
             .filter_map(|name| env::var_os(name).map(|value| ((*name).to_owned(), value)));
         Self::from_whitelist(grok_home, inherited)
+    }
+
+    /// 在完整 launch 路径只注入唯一的 L3b binding token。
+    ///
+    /// 与 Task 5 的通用白名单不同，真实 sidecar 进程必须从完全清空的环境启动：
+    /// `--grok-home` 已由 CLI 显式传递，因而不保留 `GROK_HOME` 或任何平台变量。
+    /// 参数只能是 registry 生成的 [`BindingToken`]，避免调用方把任意用户文本当作
+    /// 业务环境变量注入；用户 Key、XAI Key 和代理变量均不可进入 child。
+    pub fn for_sidecar_with_binding(
+        grok_home: &Path,
+        binding_token: &BindingToken,
+    ) -> Result<Self, SupervisorError> {
+        // 保留路径形状校验，确保该完整启动入口仍只接受 Host 派生的私有 home。
+        validate_absolute_path(grok_home)?;
+        let mut variables = BTreeMap::new();
+        variables.insert(
+            OsString::from("EFFLAB_L3B_BIND"),
+            OsString::from(binding_token.as_bearer()),
+        );
+        Ok(Self { variables })
     }
 
     /// 读取已批准变量的值；该 API 不提供整个 map，避免调用方意外记录完整环境。

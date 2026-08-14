@@ -162,19 +162,22 @@ fn validate_sidecar_model_spec(model: &SidecarModelSpec) -> Result<()> {
     validate_l3b_base_url(&model.base_url)
 }
 
-/// 只接受 Host L3b 的精确 IPv4 回环根地址，避免把用户上游 URL 落入 sidecar 配置。
+/// 只接受 Host L3b 的精确 IPv4 或 IPv6 回环根地址，避免把用户上游 URL 落入 sidecar 配置。
 fn validate_l3b_base_url(base_url: &str) -> Result<()> {
-    let Some(authority_and_path) = base_url.strip_prefix("http://127.0.0.1:") else {
-        bail!("BYOK base_url 必须是 http://127.0.0.1:PORT/v1");
-    };
+    let authority_and_path = base_url
+        .strip_prefix("http://127.0.0.1:")
+        .or_else(|| base_url.strip_prefix("http://[::1]:"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("BYOK base_url 必须是 http://127.0.0.1:PORT/v1 或 http://[::1]:PORT/v1")
+        })?;
     let Some((port, path)) = authority_and_path.split_once('/') else {
-        bail!("BYOK base_url 必须是 http://127.0.0.1:PORT/v1");
+        bail!("BYOK base_url 必须是 http://127.0.0.1:PORT/v1 或 http://[::1]:PORT/v1");
     };
     let port = port
         .parse::<u16>()
         .context("BYOK base_url 的 PORT 必须是有效端口")?;
     if port == 0 || path != "v1" {
-        bail!("BYOK base_url 必须是 http://127.0.0.1:PORT/v1");
+        bail!("BYOK base_url 必须是 http://127.0.0.1:PORT/v1 或 http://[::1]:PORT/v1");
     }
     Ok(())
 }
@@ -596,6 +599,18 @@ mod tests {
                 "权威配置不得包含 {forbidden:?}: {rendered}"
             );
         }
+    }
+
+    /// IPv6 回环监听同样只能把精确 `::1` 地址写入 sidecar 模型合同。
+    #[test]
+    fn render_authoritative_config_accepts_exact_ipv6_l3b_base_url() {
+        let (_temporary, grok_home, agent_definition) = authoritative_paths();
+        let mut model = byok_model();
+        model.base_url = "http://[::1]:43123/v1".to_string();
+        let rendered = render_authoritative_config(&grok_home, &agent_definition, None, &[model])
+            .expect("精确 IPv6 L3b 回环 URL 必须可渲染");
+
+        assert!(rendered.contains("base_url = \"http://[::1]:43123/v1\""));
     }
 
     /// renderer 的每种受支持 MCP 形状都必须被只读 validator 接受，防止字段列表漂移。

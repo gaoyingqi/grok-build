@@ -1,7 +1,9 @@
 //! 产品领域端口与编译所需的最小 DTO。
 //!
-//! 这些类型只建立 M0 接缝；Channel 密封、MCP 启动和 mention 文本展开均留待后续
-//! 专项任务实现。
+//! 这些类型定义产品领域端口；Task 7 使用其中的 Channel 密封接缝，MCP 启动与
+//! mention 文本展开仍由后续专项任务实现。
+
+use std::fmt;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -33,8 +35,18 @@ pub struct ResolvedMention {
 pub struct ApprovedMcpSpec;
 
 /// 已密封秘密的产品存储载体；Host 不解释其内部字节。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// 密封数据仍可能在测试 adapter 中是可逆字节，因此故意不派生 `Debug`，避免任何
+/// 调试或错误链意外回显其内容。
+#[derive(Clone, PartialEq, Eq)]
 pub struct SealedSecret(Vec<u8>);
+
+impl fmt::Debug for SealedSecret {
+    /// 只标记密封载体存在，绝不暴露其长度或字节。
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SealedSecret([REDACTED])")
+    }
+}
 
 impl SealedSecret {
     /// 构造仅供产品 adapter 或测试实现使用的密封载体。
@@ -59,32 +71,125 @@ impl SecretGuard {
         Self(bytes)
     }
 
-    /// 仅在后续受控 L3b 出站路径中借用秘密字节；本任务不使用该方法。
+    /// 仅在受控 L3b 出站路径中借用秘密字节；不得用于日志、序列化或 sidecar 配置。
     pub fn expose(&self) -> &[u8] {
         &self.0
     }
 }
 
-/// 产品全局 LLM Channel 配置的最小占位类型；不包含具体业务语义。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LlmChannelConfig;
+/// Channel 密封秘密的产品存储用途。
+///
+/// 产品 adapter 可以覆写 [`HostApp::seal_llm_secret`] / [`HostApp::unseal_llm_secret`]
+/// 并据此使用不同的存储槽与 KDF salt；默认实现仍兼容既有通用密封端口。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmSecretSlot {
+    /// 用户自带模型的 API Key。
+    Byok,
+    /// 未来 Relay 的访问令牌。
+    Relay,
+}
+
+/// 产品全局 LLM Channel 的持久化配置。
+///
+/// 用户端点和模型标识是非敏感配置；秘密只保存为产品提供的 [`SealedSecret`]。
+/// M1 仅会激活 `Byok`，但 `Relay` 形状从第一天保留以免以后改变 Host/sidecar 合同。
+#[derive(Clone, PartialEq, Eq)]
+pub enum LlmChannelConfig {
+    /// 尚未配置通道；此时 Host 不监听 L3b，也不得拉起 sidecar。
+    Unconfigured,
+    /// 用户自带 Chat Completions 端点、模型与密封 API Key。
+    Byok {
+        /// 用户设置页提供的上游基础 URL；永不写入 sidecar TOML。
+        base_url: String,
+        /// 用户选择的 Chat Completions 模型标识。
+        model_id: String,
+        /// 仅由 Host 在受控出站路径中短暂解封的用户 API Key。
+        api_key: SealedSecret,
+    },
+    /// 预留的 Relay 通道；M1 保持 `enabled = false` 并 fail-closed。
+    Relay {
+        /// Relay Chat Completions 基础 URL。
+        relay_base_url: String,
+        /// 产品级应用标识，不是用户秘密。
+        app_key: String,
+        /// Relay 访问令牌的密封载体。
+        access_token: SealedSecret,
+        /// M1 固定为 false；true 必须报告 Relay 尚未实现。
+        enabled: bool,
+    },
+}
+
+impl fmt::Debug for LlmChannelConfig {
+    /// Channel 配置可能来自尚未校验的持久化数据；调试形状不回显 URL、app key 或密封载体。
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unconfigured => formatter.write_str("LlmChannelConfig::Unconfigured"),
+            Self::Byok {
+                model_id, api_key, ..
+            } => formatter
+                .debug_struct("LlmChannelConfig::Byok")
+                .field("base_url", &"[REDACTED]")
+                .field("model_id", model_id)
+                .field("api_key", api_key)
+                .finish(),
+            Self::Relay {
+                access_token,
+                enabled,
+                ..
+            } => formatter
+                .debug_struct("LlmChannelConfig::Relay")
+                .field("relay_base_url", &"[REDACTED]")
+                .field("app_key", &"[REDACTED]")
+                .field("access_token", access_token)
+                .field("enabled", enabled)
+                .finish(),
+        }
+    }
+}
+
+impl Default for LlmChannelConfig {
+    /// 缺省持久化状态是未配置，而不是任何内置模型回退。
+    fn default() -> Self {
+        Self::Unconfigured
+    }
+}
 
 /// 领域端口。不含 emit；事件运输由 [`crate::KitEventSink`] 独立承载。
 pub trait HostApp: Send + Sync {
     /// 返回稳定的产品标识。
     fn app_id(&self) -> &str;
 
-    /// 持久化产品全局的 Channel 配置；Task 1 不调用。
+    /// 持久化产品全局的 Channel 配置；Task 7 的提交事务只在密封成功后调用。
     fn persist_llm_channel(&self, cfg: &LlmChannelConfig) -> Result<()>;
 
-    /// 读取产品全局的 Channel 配置；Task 1 不调用。
+    /// 读取产品全局的 Channel 配置；Task 7 构造 Channel manager 时调用。
     fn load_llm_channel(&self) -> Result<LlmChannelConfig>;
 
-    /// 由产品密封一次性秘密；Task 1 不调用。
+    /// 由产品密封一次性秘密；默认槽位实现供兼容的产品 adapter 使用。
     fn seal_secret(&self, plain: &[u8]) -> Result<SealedSecret>;
 
-    /// 由产品解封秘密；Task 1 不调用。
+    /// 由产品解封秘密；L3b 认证并复核 revision 后才可调用。
     fn unseal_secret(&self, sealed: &SealedSecret) -> Result<SecretGuard>;
+
+    /// 按 Channel 槽位密封秘密。
+    ///
+    /// 默认保持与既有产品 adapter 的 `seal_secret` 兼容；需要 Byok / Relay 分槽分 salt
+    /// 的产品应覆写该方法，Host 永不自行持久化或记录明文。
+    fn seal_llm_secret(&self, _slot: LlmSecretSlot, plain: &[u8]) -> Result<SealedSecret> {
+        self.seal_secret(plain)
+    }
+
+    /// 按 Channel 槽位解封秘密。
+    ///
+    /// 默认保持与既有产品 adapter 的 `unseal_secret` 兼容；覆写实现必须在槽位不匹配时
+    /// fail-closed，避免 Byok 和 Relay 秘密互换使用。
+    fn unseal_llm_secret(
+        &self,
+        _slot: LlmSecretSlot,
+        sealed: &SealedSecret,
+    ) -> Result<SecretGuard> {
+        self.unseal_secret(sealed)
+    }
 
     /// 返回当前作用域可用的 MCP 规格；Task 1 不调用。
     fn mcp_for_scope(&self, scope: &ScopeId) -> Result<ApprovedMcpSpec>;

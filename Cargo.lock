@@ -2965,11 +2965,19 @@ name = "efflab-agent-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
+ "base64",
+ "blake3",
  "efflab-agent-contract",
  "libc",
+ "reqwest 0.12.24",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]

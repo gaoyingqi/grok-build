@@ -20,6 +20,7 @@ fn runtime_config() -> HostRuntimeConfig {
         sidecar_bin: PathBuf::from("/tmp/efflab-agent-host-test/sidecar"),
         mcp_exec_root: PathBuf::from("/tmp/efflab-agent-host-test/mcp"),
         idle_after: Duration::from_secs(60),
+        l3b: efflab_agent_host::L3bRuntimeConfig::default(),
     }
 }
 
@@ -293,6 +294,8 @@ fn set_llm_channel_debug_redacts_credentials() {
     let command = KitCommand::from_json_value(serde_json::json!({
         "cmd": "set_llm_channel",
         "kind": "byok",
+        "base_url": "https://example.test/v1?api_key=debug-url-secret",
+        "relay_base_url": "https://relay.test/v1?token=debug-relay-url-secret",
         "api_key": "debug-api-key-secret",
         "access_token": "debug-access-token-secret"
     }))
@@ -301,6 +304,22 @@ fn set_llm_channel_debug_redacts_credentials() {
     let rendered = format!("{command:?}");
     assert!(!rendered.contains("debug-api-key-secret"));
     assert!(!rendered.contains("debug-access-token-secret"));
+    assert!(
+        !rendered.contains("debug-url-secret") && !rendered.contains("debug-relay-url-secret"),
+        "未验证的 URL query 同样可能携带秘密，调试路径不得回显"
+    );
+
+    let persisted = LlmChannelConfig::Byok {
+        base_url: "https://example.test/v1?api_key=persisted-debug-url-secret".to_string(),
+        model_id: "test-model".to_string(),
+        api_key: SealedSecret::new(b"persisted-debug-key-secret".to_vec()),
+    };
+    let persisted_debug = format!("{persisted:?}");
+    assert!(
+        !persisted_debug.contains("persisted-debug-url-secret")
+            && !persisted_debug.contains("persisted-debug-key-secret"),
+        "持久化 Channel 配置的调试输出也不得回显任何可用凭据"
+    );
 }
 
 /// 事件在输入 serde 层应保持宽容；Host 出站边界再拒绝回合标识不变量违例。

@@ -1,8 +1,9 @@
 //! Efflab Agent Kit Host Runtime 的 M0 骨架。
 //!
-//! 本 crate 冻结 L1 Kit 线协议并提供最小的提交幂等语义；不连接 ACP、不启动
+//! 本 crate 冻结 L1 Kit 线协议、提供最小提交幂等语义与 ACP stdio 传输；不启动
 //! sidecar，也不实现 LLM Channel 业务。
 
+mod acp_runtime;
 mod app_port;
 mod config;
 mod event_sink;
@@ -10,6 +11,7 @@ mod protocol;
 mod runtime;
 mod submission;
 
+pub use acp_runtime::{AcpRuntime, Inbound, METHOD_NOT_FOUND, RequestId, RpcError, ValidatedReply};
 pub use app_port::{
     ApprovedMcpSpec, HostApp, HostAppMentions, LlmChannelConfig, MentionId, ResolvedMention,
     ScopeId, SealedSecret, SecretGuard,

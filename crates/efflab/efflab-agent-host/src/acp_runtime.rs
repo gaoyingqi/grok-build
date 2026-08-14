@@ -943,7 +943,10 @@ fn validate_reverse_reply(
     _policy: &HostPolicy,
 ) -> Result<()> {
     if let ValidatedReply::Result(result) = reply
-        && saved.method == "session/request_permission"
+        && matches!(
+            saved.method.as_str(),
+            "session/request_permission" | "x.ai/session/request_permission"
+        )
     {
         validate_permission_result(result, &saved.params)?;
     }

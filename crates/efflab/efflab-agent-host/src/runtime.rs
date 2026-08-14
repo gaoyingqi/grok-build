@@ -5,7 +5,7 @@
 //! 规定的回执时机，绝不在产品线程直接读取 sidecar stdout。
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -31,8 +31,12 @@ use crate::{METHOD_NOT_FOUND, ValidatedKitEventSink};
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(20);
 /// 同步 Kit 调用等待 actor 回执的总上限，覆盖初始化超时和后续 ACP 请求。
 const DISPATCH_REPLY_TIMEOUT: Duration = Duration::from_secs(25);
+/// MCP catalog 必须在产品调用超时之前降级；超时不杀 sidecar。
+const MCP_CATALOG_TIMEOUT: Duration = Duration::from_secs(20);
 /// actor 空闲轮询间隔；stdout reader 独立运行，因此该值不影响 ACP 收包顺序。
 const ACTOR_TICK: Duration = Duration::from_millis(5);
+/// ACP `session/new` / `session/load` 使用固定 Channel 槽名，不得泄漏供应商模型标识。
+const ACP_BYOK_MODEL_SLOT: &str = "byok";
 /// MCP catalog 中始终可安全自动许可的内置无副作用工具。
 const NOOP_TOOL: &str = "GrokBuild:efflab_noop";
 
@@ -52,6 +56,8 @@ pub struct HostRuntime {
     actors: Mutex<BTreeMap<String, Arc<ActorHandle>>>,
     /// 全局换通道与新 actor launch 的互斥门，防止旧 revision 与新 revision 交错。
     channel_transition: Mutex<()>,
+    /// 已提交配置下未能恢复的原 live scope；相同 Set 请求必须重试这些 scope。
+    restart_retry_scopes: Mutex<BTreeSet<String>>,
 }
 
 impl HostRuntime {
@@ -74,6 +80,7 @@ impl HostRuntime {
             submissions: Mutex::new(SubmissionMap::default()),
             actors: Mutex::new(BTreeMap::new()),
             channel_transition: Mutex::new(()),
+            restart_retry_scopes: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -231,17 +238,18 @@ impl HostRuntime {
                         return Err(error);
                     }
                 };
-                let result = request_actor(&actor, |reply| ActorCommand::Send {
-                    session_id: session_id.clone(),
-                    submission_id: submission_id.clone(),
-                    text,
-                    reply,
-                });
-                if result.is_err() {
-                    // 只有 actor 确认 prompt 已写入时才会返回 Send；其它错误可以安全重试。
-                    self.forget_submission(&scope_id, &session_id, &submission_id);
+                match request_send_actor(&actor, session_id.clone(), submission_id.clone(), text) {
+                    Ok(reply) => Ok(reply),
+                    Err(SendRequestError::BeforePrompt(error)) => {
+                        // actor 尚未取得写 prompt 所有权，撤销登记后原 submission 可安全重试。
+                        self.forget_submission(&scope_id, &session_id, &submission_id);
+                        Err(error)
+                    }
+                    Err(SendRequestError::PromptMayHaveBeenWritten(error)) => {
+                        // timeout 与写入竞争时保留幂等登记，避免重试制造第二次 prompt。
+                        Err(error)
+                    }
                 }
-                result
             }
         }
     }
@@ -257,6 +265,8 @@ impl HostRuntime {
             .commit_and_invalidate(request)
             .map_err(channel_error)?;
         if !change.changed {
+            // 已提交的相同请求不是空操作：它是此前失败 restart 的稳定重试入口。
+            self.retry_failed_restart_scopes()?;
             return Ok(KitReply::LlmChannelView {
                 channel: change.view,
             });
@@ -269,6 +279,11 @@ impl HostRuntime {
             .map_err(channel_error)?
             .into_iter()
             .collect::<BTreeSet<_>>();
+        let mut scopes = self
+            .restart_retry_scopes
+            .lock()
+            .map_err(|_| KitError::non_retryable("sidecar_unavailable", "restart 重试状态不可用"))?
+            .clone();
         // 先从 map 取走旧 actor，确保旧 binding 已失效后没有任何 actor 能继续使用旧 stdin。
         let previous = {
             let mut actors = self.actors.lock().map_err(|_| {
@@ -276,39 +291,103 @@ impl HostRuntime {
             })?;
             std::mem::take(&mut *actors).into_iter().collect::<Vec<_>>()
         };
-        let mut restart_failed = false;
-        let scopes = previous
-            .iter()
-            .filter(|(scope_id, _)| live_scopes.contains(scope_id))
-            .map(|(scope_id, _)| scope_id.clone())
-            .collect::<Vec<_>>();
-        for (scope_id, actor) in previous {
-            // stale actor 同样要清理 reader thread，但它不属于“部分 live restart 失败”。
-            if !actor.shutdown() && live_scopes.contains(&scope_id) {
-                restart_failed = true;
+        for (scope_id, _) in &previous {
+            if live_scopes.contains(scope_id) {
+                scopes.insert(scope_id.clone());
             }
         }
 
-        // 即使单个旧 actor drain 失败，也继续尝试其余 scope；新 committed view 不回滚。
+        let mut restart_failed = BTreeSet::new();
+        for (scope_id, actor) in previous {
+            // drain 无确认的 scope 仍尝试新代；若新代成功，下面会清除该失败标记。
+            if !actor.shutdown() && live_scopes.contains(&scope_id) {
+                restart_failed.insert(scope_id);
+            }
+        }
+
+        // 即使单个旧 actor drain/restart 失败，也继续尝试其余 scope；新 committed view 不回滚。
         for scope_id in scopes {
             match self.spawn_actor(&scope_id) {
-                Ok(actor) => {
-                    if let Ok(mut actors) = self.actors.lock() {
-                        actors.insert(scope_id, actor);
-                    } else {
-                        restart_failed = true;
+                Ok(actor) => match self.actors.lock() {
+                    Ok(mut actors) => {
+                        actors.insert(scope_id.clone(), actor);
+                        restart_failed.remove(&scope_id);
                     }
+                    Err(_) => {
+                        restart_failed.insert(scope_id);
+                    }
+                },
+                Err(_) => {
+                    restart_failed.insert(scope_id);
                 }
-                Err(_) => restart_failed = true,
             }
         }
 
-        if restart_failed {
+        let has_restart_failure = !restart_failed.is_empty();
+        *self.restart_retry_scopes.lock().map_err(|_| {
+            KitError::non_retryable("sidecar_unavailable", "restart 重试状态不可用")
+        })? = restart_failed;
+        if has_restart_failure {
             return Err(LlmChannelError::RestartFailed.as_kit_error());
         }
         Ok(KitReply::LlmChannelView {
             channel: change.view,
         })
+    }
+
+    /// 重试上一次已提交但未恢复成功的 scope；不扫描或复活任何其它 idle/dead scope。
+    fn retry_failed_restart_scopes(&self) -> Result<(), KitError> {
+        let scopes = self
+            .restart_retry_scopes
+            .lock()
+            .map_err(|_| KitError::non_retryable("sidecar_unavailable", "restart 重试状态不可用"))?
+            .clone();
+        if scopes.is_empty() {
+            return Ok(());
+        }
+
+        let mut remaining = BTreeSet::new();
+        for scope_id in scopes {
+            let already_recovered = {
+                let mut actors = self.actors.lock().map_err(|_| {
+                    KitError::non_retryable("sidecar_unavailable", "scope actor 注册表不可用")
+                })?;
+                match actors.get(&scope_id) {
+                    Some(actor) if actor.accepting.load(Ordering::Acquire) => true,
+                    _ => {
+                        actors.remove(&scope_id);
+                        false
+                    }
+                }
+            };
+            if already_recovered {
+                continue;
+            }
+
+            match self.spawn_actor(&scope_id) {
+                Ok(actor) => match self.actors.lock() {
+                    Ok(mut actors) => {
+                        actors.insert(scope_id.clone(), actor);
+                    }
+                    Err(_) => {
+                        remaining.insert(scope_id);
+                    }
+                },
+                Err(_) => {
+                    remaining.insert(scope_id);
+                }
+            }
+        }
+
+        let has_restart_failure = !remaining.is_empty();
+        *self.restart_retry_scopes.lock().map_err(|_| {
+            KitError::non_retryable("sidecar_unavailable", "restart 重试状态不可用")
+        })? = remaining;
+        if has_restart_failure {
+            Err(LlmChannelError::RestartFailed.as_kit_error())
+        } else {
+            Ok(())
+        }
     }
 
     /// 取得或新建一个 scope actor；本入口与 SetLlmChannel 共享全局换代门。
@@ -339,11 +418,6 @@ impl HostRuntime {
             .app
             .mcp_for_scope(&ScopeId(scope_id.to_string()))
             .map_err(|_| KitError::non_retryable("sidecar_unavailable", "MCP 批准规格不可用"))?;
-        let model_id = service
-            .view()
-            .map_err(channel_error)?
-            .model_id
-            .ok_or_else(|| LlmChannelError::Unconfigured.as_kit_error())?;
         tracing::debug!(scope = %scope_id, "正在启动 scope ACP IO actor");
         let launched = service
             .launch_scope_with_stdio(scope_id)
@@ -354,7 +428,7 @@ impl HostRuntime {
             sidecar_pid = launched.info.pid,
             "scope sidecar 已移交给 ACP IO actor"
         );
-        let policy = match host_policy(&launched, &model_id) {
+        let policy = match host_policy(&launched) {
             Ok(policy) => policy,
             Err(error) => {
                 // policy 失败时 stdio 即将关闭；同时让 Supervisor 立即回收已注册的 child/token。
@@ -369,7 +443,6 @@ impl HostRuntime {
             scope_id.to_string(),
             acp,
             policy,
-            model_id,
             service,
             Arc::clone(&self.sink),
             receiver,
@@ -476,7 +549,13 @@ enum ActorCommand {
         session_id: String,
         submission_id: String,
         text: String,
+        ticket: SendTicket,
         reply: ReplySender,
+    },
+    /// 同步调用在写 prompt 前超时后的撤销通知；不产生 Kit 回复。
+    AbandonSend {
+        session_id: String,
+        submission_id: String,
     },
     Cancel {
         session_id: String,
@@ -488,6 +567,54 @@ enum ActorCommand {
 }
 
 type ReplySender = SyncSender<Result<KitReply, KitError>>;
+
+/// Send 调用方与 actor 之间的写入所有权票据，防止已超时的 catalog waiter 迟到写 prompt。
+#[derive(Clone)]
+struct SendTicket {
+    state: Arc<AtomicU8>,
+}
+
+impl SendTicket {
+    const WAITING: u8 = 0;
+    const CLAIMED: u8 = 1;
+    const ABANDONED: u8 = 2;
+
+    /// 新建仍可由调用方撤销的 Send 票据。
+    fn new() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(Self::WAITING)),
+        }
+    }
+
+    /// actor 在实际写 prompt 前独占所有权；已撤销的调用绝不能再写入。
+    fn claim_for_prompt(&self) -> bool {
+        self.state
+            .compare_exchange(
+                Self::WAITING,
+                Self::CLAIMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// 调用方超时时尝试撤销；返回 false 表示 actor 已可能写入 prompt。
+    fn abandon(&self) -> bool {
+        self.state
+            .compare_exchange(
+                Self::WAITING,
+                Self::ABANDONED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// 判断调用方是否已经赢得撤销竞争。
+    fn is_abandoned(&self) -> bool {
+        self.state.load(Ordering::Acquire) == Self::ABANDONED
+    }
+}
 
 /// actor 中等待 sidecar response 的请求分类。
 enum PendingRpc {
@@ -514,7 +641,14 @@ enum PendingRpc {
 struct PendingSend {
     submission_id: String,
     text: String,
+    ticket: SendTicket,
     reply: ReplySender,
+}
+
+/// 每个 session 的 catalog request 及其有限等待期限；迟到响应必须被忽略。
+struct PendingCatalog {
+    request_id: RequestId,
+    deadline: Instant,
 }
 
 /// 已写 prompt 的回合状态；cancel 不得抢先清掉它。
@@ -528,7 +662,6 @@ struct ScopeActor {
     scope_id: String,
     acp: AcpRuntime,
     policy: HostPolicy,
-    model_id: String,
     service: Arc<LlmChannelService>,
     sink: Arc<dyn KitEventSink>,
     receiver: Receiver<ActorCommand>,
@@ -546,7 +679,7 @@ struct ScopeActor {
     loading_sessions: BTreeSet<String>,
     in_flight: BTreeMap<String, InFlightTurn>,
     cancel_requested: BTreeSet<String>,
-    catalog_pending: BTreeSet<String>,
+    catalog_pending: BTreeMap<String, PendingCatalog>,
     catalog_waiting: BTreeMap<String, VecDeque<ActorCommand>>,
     buffers: BTreeMap<String, Vec<KitProductEvent>>,
     terminal_turns: BTreeSet<(String, String)>,
@@ -561,7 +694,6 @@ impl ScopeActor {
         scope_id: String,
         acp: AcpRuntime,
         policy: HostPolicy,
-        model_id: String,
         service: Arc<LlmChannelService>,
         sink: Arc<dyn KitEventSink>,
         receiver: Receiver<ActorCommand>,
@@ -574,7 +706,6 @@ impl ScopeActor {
             scope_id,
             acp,
             policy,
-            model_id,
             service,
             sink,
             receiver,
@@ -591,7 +722,7 @@ impl ScopeActor {
             loading_sessions: BTreeSet::new(),
             in_flight: BTreeMap::new(),
             cancel_requested: BTreeSet::new(),
-            catalog_pending: BTreeSet::new(),
+            catalog_pending: BTreeMap::new(),
             catalog_waiting: BTreeMap::new(),
             buffers: BTreeMap::new(),
             terminal_turns: BTreeSet::new(),
@@ -631,6 +762,10 @@ impl ScopeActor {
                 self.enter_dead(sidecar_unavailable("sidecar initialize 超时"));
                 continue;
             }
+            self.expire_mcp_catalogs();
+            if self.dead {
+                continue;
+            }
             if self.should_idle_stop() {
                 self.idle_stop_and_exit();
                 return;
@@ -665,7 +800,6 @@ impl ScopeActor {
                     "protocolVersion": 1,
                     "client": { "name": "efflab-agent-host", "mcpServers": [] },
                     "capabilities": { "terminal": false, "fs": false },
-                    "_meta": { "modelId": self.model_id },
                 }),
                 &self.policy,
             )
@@ -771,7 +905,7 @@ impl ScopeActor {
 
     /// 处理 M1 必须回复的 reverse RPC，权限选择只使用本次 options 中的精确 id。
     fn handle_reverse_request(&mut self, id: RequestId, method: &str, params: &Value) {
-        if method == "session/request_permission" {
+        if is_permission_request(method) {
             let session_id = params
                 .get("sessionId")
                 .and_then(Value::as_str)
@@ -846,26 +980,40 @@ impl ScopeActor {
 
     /// 命令在 initialize 前排队，初始化成功后按到达顺序恢复。
     fn handle_command(&mut self, command: ActorCommand) {
-        if !self.initialized {
-            self.deferred.push_back(command);
-            return;
-        }
         match command {
-            ActorCommand::NewSession { reply } => self.start_new_session(reply),
-            ActorCommand::ListSessions { cursor, reply } => self.start_list_sessions(cursor, reply),
-            ActorCommand::ResumeSession { session_id, reply } => {
-                self.resume_session(session_id, reply)
-            }
-            ActorCommand::Send {
+            ActorCommand::AbandonSend {
                 session_id,
                 submission_id,
-                text,
-                reply,
-            } => self.send_prompt(session_id, submission_id, text, reply),
-            ActorCommand::Cancel { session_id, reply } => self.cancel_session(session_id, reply),
-            ActorCommand::Shutdown { reply } => {
-                self.shutdown_and_exit();
-                let _ = reply.send(());
+            } => self.abandon_catalog_waiter(&session_id, &submission_id),
+            command => {
+                if !self.initialized {
+                    self.deferred.push_back(command);
+                    return;
+                }
+                match command {
+                    ActorCommand::NewSession { reply } => self.start_new_session(reply),
+                    ActorCommand::ListSessions { cursor, reply } => {
+                        self.start_list_sessions(cursor, reply)
+                    }
+                    ActorCommand::ResumeSession { session_id, reply } => {
+                        self.resume_session(session_id, reply)
+                    }
+                    ActorCommand::Send {
+                        session_id,
+                        submission_id,
+                        text,
+                        ticket,
+                        reply,
+                    } => self.send_prompt(session_id, submission_id, text, ticket, reply),
+                    ActorCommand::AbandonSend { .. } => {}
+                    ActorCommand::Cancel { session_id, reply } => {
+                        self.cancel_session(session_id, reply)
+                    }
+                    ActorCommand::Shutdown { reply } => {
+                        self.shutdown_and_exit();
+                        let _ = reply.send(());
+                    }
+                }
             }
         }
     }
@@ -882,7 +1030,7 @@ impl ScopeActor {
         let params = json!({
             "cwd": self.policy.expected_cwd,
             "mcpServers": [],
-            "_meta": { "modelId": self.model_id },
+            "_meta": { "modelId": ACP_BYOK_MODEL_SLOT },
         });
         match self
             .acp
@@ -924,19 +1072,32 @@ impl ScopeActor {
 
     /// 热 resume 重放内存；冷 resume 写 load 后立刻 accepted，结果走事件栅栏。
     fn resume_session(&mut self, session_id: String, reply: ReplySender) {
-        if self.active_sessions.contains(&session_id) {
-            self.hot_resume(&session_id);
-            let _ = reply.send(Ok(KitReply::ResumeSession {
-                accepted: true,
-                session_id,
-            }));
-            return;
-        }
         if !self.in_flight.is_empty() {
+            // Prompting 时仅允许恢复同一 active session；其它 active 或冷会话均不得绕过 busy 门。
+            if self.in_flight.contains_key(&session_id)
+                && self.active_sessions.contains(&session_id)
+            {
+                let _ = reply.send(Ok(KitReply::ResumeSession {
+                    accepted: true,
+                    session_id: session_id.clone(),
+                }));
+                // 产品回执必须先于可能被慢 sink 阻塞的 replay 投影。
+                self.hot_resume(&session_id);
+                return;
+            }
             let _ = reply.send(Err(KitError::non_retryable(
                 "session_busy",
                 "当前 scope 正在生成，不能恢复其它会话",
             )));
+            return;
+        }
+        if self.active_sessions.contains(&session_id) {
+            let _ = reply.send(Ok(KitReply::ResumeSession {
+                accepted: true,
+                session_id: session_id.clone(),
+            }));
+            // 无 in-flight 的热恢复同样先回执，保持所有 hot path 的时序一致。
+            self.hot_resume(&session_id);
             return;
         }
         match self.start_load(&session_id, None) {
@@ -959,8 +1120,13 @@ impl ScopeActor {
         session_id: String,
         submission_id: String,
         text: String,
+        ticket: SendTicket,
         reply: ReplySender,
     ) {
+        // API 调用已在 catalog/load 等待期间超时的命令绝不能在稍后写入 sidecar stdin。
+        if ticket.is_abandoned() {
+            return;
+        }
         if self.in_flight.contains_key(&session_id) || self.loading_sessions.contains(&session_id) {
             let _ = reply.send(Err(KitError::non_retryable(
                 "turn_in_progress",
@@ -974,6 +1140,7 @@ impl ScopeActor {
             let pending = PendingSend {
                 submission_id,
                 text,
+                ticket,
                 reply,
             };
             if let Err(error) = self.start_load(&session_id, Some(pending)) {
@@ -983,7 +1150,7 @@ impl ScopeActor {
             }
             return;
         }
-        if self.catalog_pending.contains(&session_id) {
+        if self.catalog_pending.contains_key(&session_id) {
             self.catalog_waiting
                 .entry(session_id.clone())
                 .or_default()
@@ -991,11 +1158,12 @@ impl ScopeActor {
                     session_id: session_id.clone(),
                     submission_id,
                     text,
+                    ticket,
                     reply,
                 });
             return;
         }
-        self.write_prompt(session_id, submission_id, text, reply);
+        self.write_prompt(session_id, submission_id, text, ticket, reply);
     }
 
     /// 真正写 prompt 前消费 pre-cancel；已发 prompt 的 in-flight 只能在 result 后清除。
@@ -1004,8 +1172,13 @@ impl ScopeActor {
         session_id: String,
         submission_id: String,
         text: String,
+        ticket: SendTicket,
         reply: ReplySender,
     ) {
+        // 与调用方 timeout 竞争时，只有抢到票据的 actor 可以进入 prompt 写入路径。
+        if !ticket.claim_for_prompt() {
+            return;
+        }
         if self.cancel_requested.remove(&session_id) {
             self.emit_turn_status(&session_id, &submission_id, "cancelled", "回合已取消");
             let _ = reply.send(Ok(send_reply(&session_id, &submission_id, false)));
@@ -1055,12 +1228,15 @@ impl ScopeActor {
             Ok(()) => {
                 // 只有通知已经写入 sidecar，才向本地状态和产品事件声明该回合已取消。
                 self.cancel_requested.insert(session_id.clone());
-                if let Some(in_flight) = self.in_flight.get_mut(&session_id) {
+                let cancelled_submission = self.in_flight.get_mut(&session_id).map(|in_flight| {
                     in_flight.cancelled = true;
-                    let submission_id = in_flight.submission_id.clone();
+                    in_flight.submission_id.clone()
+                });
+                // 先解除产品调用，再让同步 sink 投影取消状态，避免回执被事件运输阻塞。
+                let _ = reply.send(Ok(KitReply::Cancel { accepted: true }));
+                if let Some(submission_id) = cancelled_submission {
                     self.emit_turn_status(&session_id, &submission_id, "cancelled", "回合已取消");
                 }
-                let _ = reply.send(Ok(KitReply::Cancel { accepted: true }));
             }
             Err(_) => {
                 let _ = reply.send(Err(sidecar_unavailable("无法写入 session/cancel")));
@@ -1082,7 +1258,7 @@ impl ScopeActor {
             "sessionId": session_id,
             "cwd": self.policy.expected_cwd,
             "mcpServers": [],
-            "_meta": { "modelId": self.model_id },
+            "_meta": { "modelId": ACP_BYOK_MODEL_SLOT },
         });
         match self
             .acp
@@ -1196,6 +1372,7 @@ impl ScopeActor {
                 session_id,
                 pending.submission_id,
                 pending.text,
+                pending.ticket,
                 pending.reply,
             );
         }
@@ -1263,11 +1440,7 @@ impl ScopeActor {
 
     /// 请求每个新/冷恢复会话的 catalog；空批准集的失败只是观察失败而非聊天阻塞。
     fn start_mcp_catalog(&mut self, session_id: &str) {
-        self.catalog_pending.insert(session_id.to_string());
-        let params = json!({
-            "sessionId": session_id,
-            "_meta": { "modelId": self.model_id },
-        });
+        let params = json!({ "sessionId": session_id });
         match self
             .acp
             .request_validated("x.ai/mcp/list", params, &self.policy)
@@ -1279,12 +1452,49 @@ impl ScopeActor {
                         session_id: session_id.to_string(),
                     },
                 );
+                self.catalog_pending.insert(
+                    session_id.to_string(),
+                    PendingCatalog {
+                        request_id: id,
+                        deadline: Instant::now() + MCP_CATALOG_TIMEOUT,
+                    },
+                );
             }
             Err(_) => {
-                self.catalog_pending.remove(session_id);
                 // catalog 的 JSON-RPC error 可以降级，但连查询都写不进 stdin 时 sidecar
                 // 已不可信，不能绕过 gate 继续写 prompt。
                 self.enter_dead(sidecar_unavailable("无法写入 MCP catalog 请求"));
+            }
+        }
+    }
+
+    /// 到达冻结 deadline 后按 catalog error 降级，并从 request 账本移除以丢弃迟到响应。
+    fn expire_mcp_catalogs(&mut self) {
+        let now = Instant::now();
+        let expired = self
+            .catalog_pending
+            .iter()
+            .filter(|(_, pending)| pending.deadline <= now)
+            .map(|(session_id, pending)| (session_id.clone(), pending.request_id))
+            .collect::<Vec<_>>();
+        for (session_id, request_id) in expired {
+            self.catalog_pending.remove(&session_id);
+            if matches!(
+                self.pending.get(&request_id),
+                Some(PendingRpc::McpCatalog { session_id: pending_session }) if pending_session == &session_id
+            ) {
+                self.pending.remove(&request_id);
+            }
+            self.finish_mcp_catalog(
+                session_id,
+                Err(RpcError {
+                    code: -1,
+                    message: "catalog timeout".to_string(),
+                    data: None,
+                }),
+            );
+            if self.dead {
+                return;
             }
         }
     }
@@ -1297,6 +1507,29 @@ impl ScopeActor {
             if self.dead {
                 return;
             }
+        }
+    }
+
+    /// caller timeout 后移除 catalog gate 中尚未获得 prompt 写入所有权的 Send。
+    fn abandon_catalog_waiter(&mut self, session_id: &str, submission_id: &str) {
+        let empty = match self.catalog_waiting.get_mut(session_id) {
+            Some(waiting) => {
+                waiting.retain(|command| {
+                    !matches!(
+                        command,
+                        ActorCommand::Send {
+                            session_id: queued_session,
+                            submission_id: queued_submission,
+                            ..
+                        } if queued_session == session_id && queued_submission == submission_id
+                    )
+                });
+                waiting.is_empty()
+            }
+            None => false,
+        };
+        if empty {
+            self.catalog_waiting.remove(session_id);
         }
     }
 
@@ -1538,6 +1771,51 @@ fn request_actor(
         .map_err(|_| sidecar_unavailable("等待 sidecar 回执超时"))?
 }
 
+/// Send timeout 的两种所有权结局：未写入时可撤销登记，已取得票据时必须保留幂等键。
+enum SendRequestError {
+    BeforePrompt(KitError),
+    PromptMayHaveBeenWritten(KitError),
+}
+
+/// 发送 Send 并在调用者超时前后与 actor 原子竞争 prompt 写入票据。
+fn request_send_actor(
+    actor: &ActorHandle,
+    session_id: String,
+    submission_id: String,
+    text: String,
+) -> Result<KitReply, SendRequestError> {
+    let (reply, receiver) = mpsc::sync_channel(1);
+    let ticket = SendTicket::new();
+    actor
+        .sender
+        .send(ActorCommand::Send {
+            session_id: session_id.clone(),
+            submission_id: submission_id.clone(),
+            text,
+            ticket: ticket.clone(),
+            reply,
+        })
+        .map_err(|_| SendRequestError::BeforePrompt(sidecar_unavailable("scope actor 已退出")))?;
+
+    match receiver.recv_timeout(DISPATCH_REPLY_TIMEOUT) {
+        Ok(Ok(reply)) => Ok(reply),
+        Ok(Err(error)) => Err(SendRequestError::BeforePrompt(error)),
+        Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {
+            let error = sidecar_unavailable("等待 sidecar 回执超时");
+            if ticket.abandon() {
+                // 票据先获撤销，再投递队列清理；即使后者稍晚到达也不能产生幽灵 prompt。
+                let _ = actor.sender.send(ActorCommand::AbandonSend {
+                    session_id,
+                    submission_id,
+                });
+                Err(SendRequestError::BeforePrompt(error))
+            } else {
+                Err(SendRequestError::PromptMayHaveBeenWritten(error))
+            }
+        }
+    }
+}
+
 /// 在 actor 异常终止或 dead 状态下统一回绝尚未完成的外部命令。
 fn send_command_error(command: ActorCommand, error: KitError) {
     match command {
@@ -1548,6 +1826,7 @@ fn send_command_error(command: ActorCommand, error: KitError) {
         | ActorCommand::Cancel { reply, .. } => {
             let _ = reply.send(Err(error));
         }
+        ActorCommand::AbandonSend { .. } => {}
         ActorCommand::Shutdown { reply } => {
             let _ = reply.send(());
         }
@@ -1555,16 +1834,14 @@ fn send_command_error(command: ActorCommand, error: KitError) {
 }
 
 /// 生成 HostPolicy：所有 `_meta` 许可显式按 method 列出，不能跨 method 泄漏。
-fn host_policy(launched: &LaunchedScope, model_id: &str) -> Result<HostPolicy, KitError> {
+fn host_policy(launched: &LaunchedScope) -> Result<HostPolicy, KitError> {
     let cwd = std::fs::canonicalize(&launched.paths.workspace)
         .map_err(|_| sidecar_unavailable("scope workspace 不可用"))?;
     Ok(HostPolicy::new(cwd)
-        .with_meta_key_for("initialize", "modelId")
         .with_meta_key_for("session/new", "modelId")
         .with_meta_key_for("session/load", "modelId")
-        .with_meta_key_for("x.ai/mcp/list", "modelId")
         .with_meta_key_for("session/prompt", "promptId")
-        .with_model_id(model_id.to_string()))
+        .with_model_id(ACP_BYOK_MODEL_SLOT))
 }
 
 /// 在登记 submission 或拉起 sidecar 前拒绝明显无效的 Send，避免失败路径占用幂等键。
@@ -1611,6 +1888,14 @@ fn unavailable_reason_name(reason: UnavailableReason) -> &'static str {
     match reason {
         UnavailableReason::SidecarHardeningUnavailable => "sidecar_hardening_unavailable",
     }
+}
+
+/// direct 与 `_x.ai/` wrapper 解码后的 permission 共享同一严格选择和回复逻辑。
+fn is_permission_request(method: &str) -> bool {
+    matches!(
+        method,
+        "session/request_permission" | "x.ai/session/request_permission"
+    )
 }
 
 /// 只接受本次 permission options 明确出现的精确 optionId，不按 kind 或数组下标猜测。

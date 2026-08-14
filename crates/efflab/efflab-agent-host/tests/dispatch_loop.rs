@@ -28,6 +28,12 @@ use serde_json::{Value, json};
 const TEST_TIMEOUT: Duration = Duration::from_secs(8);
 /// `session/prompt` result 人为延迟，用来锁定 dispatch 不得等待该 result。
 const DELAYED_PROMPT_RESULT: Duration = Duration::from_millis(700);
+/// 故意阻塞同步 sink 的时长；回执必须先于任何事件运输返回。
+const SLOW_SINK_DELAY: Duration = Duration::from_millis(250);
+/// 断言 actor 已写出通知或决定热恢复后，Kit 回执不得等待慢 sink。
+const IMMEDIATE_REPLY_TIMEOUT: Duration = Duration::from_millis(150);
+/// MCP catalog 合同 deadline 为 20 秒；为调度保留少量余量但必须早于 25 秒 API 超时。
+const MCP_CATALOG_REPLY_TIMEOUT: Duration = Duration::from_secs(22);
 
 /// 已配置或未配置 Channel 的最小产品端口；测试凭据只停留在内存中。
 struct FakeApp {
@@ -102,14 +108,33 @@ impl HostApp for FakeApp {
     }
 }
 
-/// 内存事件运输端口；HostRuntime 仍会在其外层执行产品事件验证。
-#[derive(Default)]
+/// 内存事件运输端口；可注入延迟以验证 actor 不会把产品回执绑在同步投影上。
 struct MemorySink {
     events: Arc<Mutex<Vec<KitProductEvent>>>,
+    delay: Duration,
+}
+
+impl Default for MemorySink {
+    fn default() -> Self {
+        Self::with_delay(Duration::from_millis(0))
+    }
+}
+
+impl MemorySink {
+    /// 构造带固定投影延迟的测试 sink；延迟不改变事件记录顺序。
+    fn with_delay(delay: Duration) -> Self {
+        Self {
+            events: Arc::new(Mutex::new(Vec::new())),
+            delay,
+        }
+    }
 }
 
 impl KitEventSink for MemorySink {
     fn emit(&self, event: KitProductEvent) -> Result<()> {
+        if !self.delay.is_zero() {
+            thread::sleep(self.delay);
+        }
         self.events.lock().expect("事件锁必须可用").push(event);
         Ok(())
     }
@@ -133,6 +158,16 @@ impl Harness {
         expected_tools: impl IntoIterator<Item = String>,
         idle_after: Duration,
     ) -> Self {
+        Self::configured_with_sink_delay(mode, expected_tools, idle_after, Duration::from_millis(0))
+    }
+
+    /// 构造带可控同步 sink 的运行时，用于锁定产品回执与事件投影的顺序。
+    fn configured_with_sink_delay(
+        mode: &str,
+        expected_tools: impl IntoIterator<Item = String>,
+        idle_after: Duration,
+        sink_delay: Duration,
+    ) -> Self {
         let temporary = tempfile::tempdir().expect("必须能创建 dispatch loop 临时目录");
         let root = temporary.path();
         let sidecar = root.join("fake-sidecar.sh");
@@ -141,7 +176,7 @@ impl Harness {
         let captured = root.join("sidecar-wire.jsonl");
         write_fake_sidecar(&sidecar, &started, &exited, &captured, mode);
 
-        let sink = MemorySink::default();
+        let sink = MemorySink::with_delay(sink_delay);
         let events = Arc::clone(&sink.events);
         let runtime = Arc::new(HostRuntime::new(
             FakeApp::byok(expected_tools),
@@ -263,6 +298,11 @@ test -f "$home/config.toml" || exit 42
 /usr/bin/printf '%s\n' 'started' >> "$started"
 pending_prompt_id=""
 pending_permission_session=""
+new_session_count=0
+permission_method='session/request_permission'
+case "$mode" in
+  *_wrapper) permission_method='_x.ai/session/request_permission' ;;
+esac
 while IFS= read -r line; do
   /usr/bin/printf '%s\n' "$line" >> "$captured"
   id=$(/usr/bin/printf '%s\n' "$line" | /usr/bin/sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
@@ -277,7 +317,13 @@ while IFS= read -r line; do
       /usr/bin/printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
       ;;
     *'"method":"session/new"'*)
-      /usr/bin/printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sidecar-session"}}\n' "$id"
+      new_session_count=$((new_session_count + 1))
+      if [ "$new_session_count" -eq 1 ]; then
+        new_session_id='sidecar-session'
+      else
+        new_session_id="sidecar-session-$new_session_count"
+      fi
+      /usr/bin/printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"%s"}}\n' "$id" "$new_session_id"
       ;;
     *'"method":"session/list"'*)
       /usr/bin/printf '{"jsonrpc":"2.0","id":%s,"result":{"sessions":[{"sessionId":"sidecar-session","title":"来自 sidecar 的标题","updatedAt":"2026-08-14T00:00:00Z"},{"sessionId":"untitled-session","updatedAt":"2026-08-13T00:00:00Z"}],"nextCursor":"next-page"}}\n' "$id"
@@ -303,6 +349,11 @@ while IFS= read -r line; do
         mcp_error)
           /usr/bin/printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32001,"message":"catalog failed"}}\n' "$id"
           ;;
+        mcp_late)
+          # 晚于 20 秒 catalog deadline、早于原有 25 秒调用上限，验证 Host 自行降级。
+          /bin/sleep 23
+          /usr/bin/printf '{"jsonrpc":"2.0","id":%s,"result":{"result":{"servers":[]}}}\n' "$id"
+          ;;
         noop_only)
           /usr/bin/printf '{"jsonrpc":"2.0","id":%s,"result":{"result":{"servers":[{"name":"builtin","session":{"status":"ready","tools":[{"name":"GrokBuild:efflab_noop","enabled":true}]}}]}}}\n' "$id"
           ;;
@@ -312,19 +363,19 @@ while IFS= read -r line; do
       esac
       ;;
     *'"method":"session/cancel"'*)
-      if [ "$mode" = "permission_after_cancel" ] && [ -n "$pending_prompt_id" ]; then
-        /usr/bin/printf '{"jsonrpc":"2.0","id":900,"method":"session/request_permission","params":{"sessionId":"%s","toolCall":{"toolCallId":"tool-1","title":"GrokBuild:efflab_noop"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"reject-once","name":"Reject once","kind":"reject_once"},{"optionId":"enable-always-approve","name":"Always","kind":"allow_once"}]}}\n' "$pending_permission_session"
+      if { [ "$mode" = "permission_after_cancel" ] || [ "$mode" = "permission_after_cancel_wrapper" ]; } && [ -n "$pending_prompt_id" ]; then
+        /usr/bin/printf '{"jsonrpc":"2.0","id":900,"method":"%s","params":{"sessionId":"%s","toolCall":{"toolCallId":"tool-1","title":"GrokBuild:efflab_noop"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"reject-once","name":"Reject once","kind":"reject_once"},{"optionId":"enable-always-approve","name":"Always","kind":"allow_once"}]}}\n' "$permission_method" "$pending_permission_session"
       fi
       ;;
     *'"method":"session/prompt"'*)
-      if [ "$mode" = "permission_after_cancel" ]; then
+      if [ "$mode" = "permission_after_cancel" ] || [ "$mode" = "permission_after_cancel_wrapper" ]; then
         pending_prompt_id="$id"
         pending_permission_session="$session"
-      elif [ "$mode" = "permission" ] || [ "$mode" = "permission_unknown" ]; then
+      elif [ "$mode" = "permission" ] || [ "$mode" = "permission_wrapper" ] || [ "$mode" = "permission_unknown" ] || [ "$mode" = "permission_unknown_wrapper" ]; then
         pending_prompt_id="$id"
         title='GrokBuild:efflab_noop'
-        if [ "$mode" = "permission_unknown" ]; then title='unexpected_tool'; fi
-        /usr/bin/printf '{"jsonrpc":"2.0","id":900,"method":"session/request_permission","params":{"sessionId":"%s","toolCall":{"toolCallId":"tool-1","title":"%s"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"reject-once","name":"Reject once","kind":"reject_once"},{"optionId":"enable-always-approve","name":"Always","kind":"allow_once"}]}}\n' "$session" "$title"
+        if [ "$mode" = "permission_unknown" ] || [ "$mode" = "permission_unknown_wrapper" ]; then title='unexpected_tool'; fi
+        /usr/bin/printf '{"jsonrpc":"2.0","id":900,"method":"%s","params":{"sessionId":"%s","toolCall":{"toolCallId":"tool-1","title":"%s"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"reject-once","name":"Reject once","kind":"reject_once"},{"optionId":"enable-always-approve","name":"Always","kind":"allow_once"}]}}\n' "$permission_method" "$session" "$title"
       else
         /usr/bin/printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"实时回答"}},"_meta":{"promptId":"%s","eventId":"live-event"}}}\n' "$session" "$(/usr/bin/printf '%s\n' "$line" | /usr/bin/sed -n 's/.*"promptId":"\([^"]*\)".*/\1/p')"
         if [ "$mode" = "hold_prompt" ]; then /bin/sleep 0.7; fi
@@ -434,14 +485,17 @@ fn launch_handshake_new_session_and_empty_mcp_catalog_are_wired_through_real_std
         json!({ "terminal": false, "fs": false })
     );
     assert_eq!(initialize["params"]["client"]["mcpServers"], json!([]));
-    assert_eq!(initialize["params"]["_meta"]["modelId"], "fake-byok-model");
+    assert!(
+        initialize["params"].get("_meta").is_none(),
+        "initialize 不得携带任何 _meta"
+    );
 
     let new_session = wire
         .iter()
         .find(|item| item["method"] == "session/new")
         .expect("initialize 成功后必须发送 session/new");
     assert_eq!(new_session["params"]["mcpServers"], json!([]));
-    assert_eq!(new_session["params"]["_meta"]["modelId"], "fake-byok-model");
+    assert_eq!(new_session["params"]["_meta"], json!({ "modelId": "byok" }));
     assert!(
         new_session["params"]["cwd"]
             .as_str()
@@ -453,7 +507,10 @@ fn launch_handshake_new_session_and_empty_mcp_catalog_are_wired_through_real_std
         .find(|item| item["method"] == "_x.ai/mcp/list")
         .expect("NewSession 后必须请求 MCP catalog");
     assert_eq!(catalog["params"]["sessionId"], json!(&session_id));
-    assert_eq!(catalog["params"]["_meta"]["modelId"], "fake-byok-model");
+    assert!(
+        catalog["params"].get("_meta").is_none(),
+        "MCP catalog 不得携带任何 _meta"
+    );
 
     // 批准集为空时只有 noop 的 catalog 必须通过，随后对话仍可继续。
     assert_send(
@@ -681,6 +738,13 @@ fn idempotency_mentions_and_cancel_keep_prompt_wire_and_inflight_state_correct()
         prompt_count,
         "预先 cancel 后不得写 prompt"
     );
+    wait_until(|| {
+        harness.events().iter().any(|event| {
+            matches!(&event.block, KitBlock::Status { code, .. } if code == "cancelled")
+                && event.turn_id.as_deref() == Some("pre-cancel")
+                && event.submission_id.as_deref() == Some("pre-cancel")
+        })
+    });
 }
 
 /// TC-LIST：只依赖标准 session/list 的 sidecar 返回值，绝不扫描本地 session 文件。
@@ -790,6 +854,9 @@ fn cold_and_hot_resume_obey_load_timing_replay_fence_and_session_busy_rules() {
 
     let hot = Harness::configured("hold_prompt", [], Duration::from_secs(60));
     let session_id = hot.new_session("scope-a");
+    // 第二个 session 已在同一个 actor 中 active；它不是冷恢复路径的占位值。
+    let other_active_session = hot.new_session("scope-a");
+    assert_ne!(session_id, other_active_session);
     assert_send(
         hot.runtime
             .dispatch(send(&session_id, "hot-turn", "正在生成", None))
@@ -852,10 +919,103 @@ fn cold_and_hot_resume_obey_load_timing_replay_fence_and_session_busy_rules() {
         .runtime
         .dispatch(KitCommand::ResumeSession {
             scope_id: "scope-a".to_string(),
-            session_id: "another-session".to_string(),
+            session_id: other_active_session,
         })
-        .expect_err("Prompting 时恢复另一 session 必须被拒绝");
+        .expect_err("Prompting 时恢复另一个已 active session 必须被拒绝");
     assert_eq!(busy.code, "session_busy");
+}
+
+/// TC-HOT / TC-CANCEL：完成 ACP 写入或热恢复决策后，回执绝不能等待同步 sink 的事件投影。
+#[test]
+fn hot_resume_and_inflight_cancel_reply_before_slow_sink_projection() {
+    let hot = Harness::configured_with_sink_delay(
+        "hold_prompt",
+        [],
+        Duration::from_secs(60),
+        SLOW_SINK_DELAY,
+    );
+    let hot_session = hot.new_session("scope-a");
+    assert_send(
+        hot.runtime
+            .dispatch(send(&hot_session, "slow-hot", "慢 sink 热恢复", None))
+            .expect("热恢复前的 prompt 必须写入"),
+        false,
+        &hot_session,
+        "slow-hot",
+    );
+    wait_until(|| {
+        hot.events().iter().any(|event| {
+            matches!(
+                &event.block,
+                KitBlock::Assistant { markdown, streaming }
+                    if markdown == "实时回答" && *streaming
+            )
+        })
+    });
+
+    let (hot_reply, hot_result) = mpsc::sync_channel(1);
+    let hot_runtime = Arc::clone(&hot.runtime);
+    let hot_resume_session = hot_session.clone();
+    thread::spawn(move || {
+        let _ = hot_reply.send(hot_runtime.dispatch(KitCommand::ResumeSession {
+            scope_id: "scope-a".to_string(),
+            session_id: hot_resume_session,
+        }));
+    });
+    assert_eq!(
+        hot_result
+            .recv_timeout(IMMEDIATE_REPLY_TIMEOUT)
+            .expect("热 Resume 不得等待 replay sink")
+            .expect("热 Resume 必须被接受"),
+        KitReply::ResumeSession {
+            accepted: true,
+            session_id: hot_session,
+        }
+    );
+
+    let cancel = Harness::configured_with_sink_delay(
+        "hold_prompt",
+        [],
+        Duration::from_secs(60),
+        SLOW_SINK_DELAY,
+    );
+    let cancel_session = cancel.new_session("scope-a");
+    assert_send(
+        cancel
+            .runtime
+            .dispatch(send(&cancel_session, "slow-cancel", "慢 sink 取消", None))
+            .expect("Cancel 前的 prompt 必须写入"),
+        false,
+        &cancel_session,
+        "slow-cancel",
+    );
+    wait_until(|| {
+        cancel.events().iter().any(|event| {
+            matches!(
+                &event.block,
+                KitBlock::Assistant { markdown, streaming }
+                    if markdown == "实时回答" && *streaming
+            )
+        })
+    });
+
+    let (cancel_reply, cancel_result) = mpsc::sync_channel(1);
+    let cancel_runtime = Arc::clone(&cancel.runtime);
+    let cancel_request_session = cancel_session.clone();
+    thread::spawn(move || {
+        let _ = cancel_reply.send(cancel_runtime.dispatch(KitCommand::Cancel {
+            scope_id: "scope-a".to_string(),
+            session_id: cancel_request_session,
+        }));
+    });
+    cancel.wait_for_method("session/cancel");
+    assert_eq!(
+        cancel_result
+            .recv_timeout(IMMEDIATE_REPLY_TIMEOUT)
+            .expect("in-flight Cancel 不得等待 cancelled 状态 sink")
+            .expect("in-flight Cancel 必须被接受"),
+        KitReply::Cancel { accepted: true }
+    );
 }
 
 /// TC-PERM：只能按本次 options 精确选择连字符 allow-once；未知工具走 reject-once。
@@ -957,6 +1117,102 @@ fn reverse_permission_selects_only_current_allow_once_or_reject_once() {
     );
 }
 
+/// TC-PERM wrapper：`_x.ai/session/request_permission` 解码后必须与 direct wire 共用严格选择逻辑。
+#[test]
+fn wrapped_reverse_permission_selects_approved_unknown_and_cancelled_outcomes() {
+    let approved = Harness::configured("permission_wrapper", [], Duration::from_secs(60));
+    let session_id = approved.new_session("scope-a");
+    approved
+        .runtime
+        .dispatch(send(&session_id, "wrapped-approved", "包装批准", None))
+        .expect("包装 permission 的 prompt 必须成功");
+    wait_until(|| {
+        approved.captured.exists()
+            && fs::read_to_string(&approved.captured)
+                .map(|wire| wire.contains("\"id\":900") && wire.contains("allow-once"))
+                .unwrap_or(false)
+    });
+    let approved_reply = approved
+        .wire()
+        .into_iter()
+        .find(|item| item["id"] == 900 && item.get("result").is_some())
+        .expect("Host 必须回复包装的 approved permission request");
+    assert_eq!(
+        approved_reply["result"]["outcome"],
+        json!({ "outcome": "selected", "optionId": "allow-once" })
+    );
+
+    let unknown = Harness::configured("permission_unknown_wrapper", [], Duration::from_secs(60));
+    let unknown_session = unknown.new_session("scope-a");
+    unknown
+        .runtime
+        .dispatch(send(
+            &unknown_session,
+            "wrapped-unknown",
+            "包装未知工具",
+            None,
+        ))
+        .expect("包装未知 permission 的 prompt 必须成功");
+    wait_until(|| {
+        unknown.captured.exists()
+            && fs::read_to_string(&unknown.captured)
+                .map(|wire| wire.contains("\"id\":900") && wire.contains("reject-once"))
+                .unwrap_or(false)
+    });
+    let unknown_reply = unknown
+        .wire()
+        .into_iter()
+        .find(|item| item["id"] == 900 && item.get("result").is_some())
+        .expect("Host 必须回复包装的 unknown permission request");
+    assert_eq!(
+        unknown_reply["result"]["outcome"],
+        json!({ "outcome": "selected", "optionId": "reject-once" })
+    );
+
+    let cancelled = Harness::configured(
+        "permission_after_cancel_wrapper",
+        [],
+        Duration::from_secs(60),
+    );
+    let cancelled_session = cancelled.new_session("scope-a");
+    cancelled
+        .runtime
+        .dispatch(send(
+            &cancelled_session,
+            "wrapped-cancelled",
+            "包装取消后权限",
+            None,
+        ))
+        .expect("包装 cancel permission 的 prompt 必须成功");
+    assert_eq!(
+        cancelled
+            .runtime
+            .dispatch(KitCommand::Cancel {
+                scope_id: "scope-a".to_string(),
+                session_id: cancelled_session,
+            })
+            .expect("Cancel 必须先于包装 permission 写出"),
+        KitReply::Cancel { accepted: true }
+    );
+    wait_until(|| {
+        cancelled.captured.exists()
+            && fs::read_to_string(&cancelled.captured)
+                .map(|wire| {
+                    wire.contains("\"id\":900") && wire.contains("\"outcome\":\"cancelled\"")
+                })
+                .unwrap_or(false)
+    });
+    let cancelled_reply = cancelled
+        .wire()
+        .into_iter()
+        .find(|item| item["id"] == 900 && item.get("result").is_some())
+        .expect("Host 必须回复包装的 cancelled permission request");
+    assert_eq!(
+        cancelled_reply["result"]["outcome"],
+        json!({ "outcome": "cancelled" })
+    );
+}
+
 /// TC-HP（MCP 分支）：空集失败不挡聊天；非空期望缺失发 mcp_failed；额外工具 kill。
 #[test]
 fn mcp_catalog_gates_extra_tools_but_keeps_missing_or_empty_catalog_nonblocking() {
@@ -1007,6 +1263,67 @@ fn mcp_catalog_gates_extra_tools_but_keeps_missing_or_empty_catalog_nonblocking(
     );
 }
 
+/// TC-HP deadline：catalog 无响应时按空 catalog 降级，迟到 response 不得释放第二次 prompt。
+#[test]
+fn mcp_catalog_timeout_degrades_before_late_response_and_preserves_submission_idempotency() {
+    let harness = Harness::configured(
+        "mcp_late",
+        ["purelab__search_tracks".to_string()],
+        Duration::from_secs(60),
+    );
+    let session_id = harness.new_session("scope-a");
+
+    let start = Instant::now();
+    assert_send(
+        harness
+            .runtime
+            .dispatch(send(
+                &session_id,
+                "late-catalog",
+                "catalog 超时后继续",
+                None,
+            ))
+            .expect("catalog timeout 必须按空 catalog 降级并写 prompt"),
+        false,
+        &session_id,
+        "late-catalog",
+    );
+    assert!(
+        start.elapsed() < MCP_CATALOG_REPLY_TIMEOUT,
+        "catalog timeout 必须早于迟到 response 和 API 调用上限"
+    );
+    let failure = wait_for_status(&harness, "mcp_failed");
+    assert_eq!(failure.turn_id, None);
+    assert_eq!(failure.submission_id, None);
+
+    // fake 在 23 秒后才消费已写入的 prompt；此时 catalog response 已不属于 pending 请求。
+    harness.wait_for_method("session/prompt");
+    assert_eq!(
+        harness.method_count("session/prompt"),
+        1,
+        "catalog timeout 只允许原 submission 写入一次 prompt"
+    );
+    assert_send(
+        harness
+            .runtime
+            .dispatch(send(
+                &session_id,
+                "late-catalog",
+                "catalog 超时后继续",
+                None,
+            ))
+            .expect("迟到 catalog response 后原 submission 重试必须稳定幂等"),
+        true,
+        &session_id,
+        "late-catalog",
+    );
+    assert_eq!(
+        harness.method_count("session/prompt"),
+        1,
+        "迟到 catalog response 或 retry 均不得制造幽灵 prompt"
+    );
+}
+
 /// TC-IDLE / TC-AUTO：idle kill 后 Send 必须冷 load+replay 再写 prompt，load 失败可观察。
 #[test]
 fn idle_restart_auto_loads_before_prompt_and_reports_session_not_found() {
@@ -1038,6 +1355,11 @@ fn idle_restart_auto_loads_before_prompt_and_reports_session_not_found() {
         .iter()
         .position(|item| item["method"] == "session/load")
         .expect("idle 后旧 session 必须先 session/load");
+    assert_eq!(
+        wire[load_position]["params"]["_meta"],
+        json!({ "modelId": "byok" }),
+        "session/load 只能发送 ACP Channel 槽名，而不是供应商模型标识"
+    );
     let prompt_position = wire
         .iter()
         .rposition(|item| item["method"] == "session/prompt")
@@ -1104,6 +1426,7 @@ fn channel_change_restarts_live_scopes_and_preserves_committed_view_after_restar
     // 第二次测试用故意移除 executable 模拟部分 restart 失败；新 view 不得回退。
     let failing = Harness::configured("basic", [], Duration::from_secs(60));
     let _ = failing.new_session("scope-a");
+    let original_sidecar = fs::read(&failing.sidecar).expect("必须能备份测试 executable");
     fs::remove_file(&failing.sidecar).expect("必须能移除二次 spawn 的测试 executable");
     let error = failing
         .runtime
@@ -1134,5 +1457,46 @@ fn channel_change_restarts_live_scopes_and_preserves_committed_view_after_restar
                 model_id: Some("fake-byok-model".to_string()),
             }
         }
+    );
+
+    // 相同请求在配置已提交后仍必须重试此前失败的 live scope，而不是空操作。
+    let starts_before_retry = fs::read_to_string(&failing.started)
+        .expect("必须能读取失败前启动记录")
+        .lines()
+        .count();
+    fs::write(&failing.sidecar, original_sidecar).expect("必须能恢复测试 executable");
+    fs::set_permissions(&failing.sidecar, fs::Permissions::from_mode(0o700))
+        .expect("恢复后的 fake sidecar 必须可执行");
+    failing
+        .runtime
+        .dispatch(KitCommand::SetLlmChannel {
+            kind: None,
+            base_url: None,
+            model_id: None,
+            relay_base_url: None,
+            app_key: None,
+            api_key: Some("new-test-key".to_string()),
+            access_token: None,
+            client_request_id: Some("channel-failure".to_string()),
+        })
+        .expect("相同 Set 必须重试已失败的 scope restart");
+    wait_until(|| {
+        fs::read_to_string(&failing.started)
+            .map(|started| started.lines().count() == starts_before_retry + 1)
+            .unwrap_or(false)
+    });
+    assert_send(
+        failing
+            .runtime
+            .dispatch(send(
+                "sidecar-session",
+                "recovered-after-retry",
+                "恢复后可继续服务",
+                None,
+            ))
+            .expect("重试后的 scope 必须可再次服务"),
+        false,
+        "sidecar-session",
+        "recovered-after-retry",
     );
 }

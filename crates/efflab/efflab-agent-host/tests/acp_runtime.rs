@@ -43,6 +43,14 @@ while IFS= read -r line; do
 done
 "#;
 
+/// 包装 permission request 也必须保留 option 账本，不能因逻辑名变化跳过校验。
+const WRAPPED_PERMISSION_REQUEST: &str = r#"
+printf '%s\n' '{"jsonrpc":"2.0","id":19,"method":"_x.ai/session/request_permission","params":{"sessionId":"session-1","toolCall":{"toolCallId":"tool-1","title":"Run test"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"}]}}'
+while IFS= read -r line; do
+    printf '%s\n' "$line" >&2
+done
+"#;
+
 /// 注入一个扩展 reverse request，模拟暂未支持的 sidecar 扩展。
 const UNKNOWN_REVERSE_REQUEST: &str = r#"
 printf '%s\n' '{"jsonrpc":"2.0","id":23,"method":"_x.ai/not_available","params":{}}'
@@ -395,6 +403,35 @@ fn reverse_requests_decode_and_permission_reply_uses_saved_options() {
         }
         other => panic!("预期 ACP extension reverse request，实际: {other:?}"),
     }
+
+    drop(runtime);
+    peer.finish();
+}
+
+/// `_x.ai/session/request_permission` 解码后的逻辑名同样必须校验本次 options[]。
+#[test]
+fn wrapped_permission_reply_rejects_option_not_offered_by_the_saved_request() {
+    let (runtime, peer) = runtime_with_peer(WRAPPED_PERMISSION_REQUEST);
+    let permission_id = match next_inbound(&runtime) {
+        Inbound::Request { id, method, params } => {
+            assert_eq!(method, "x.ai/session/request_permission");
+            assert_eq!(params["options"][0]["optionId"], "allow-once");
+            id
+        }
+        other => panic!("预期包装 permission reverse request，实际: {other:?}"),
+    };
+
+    let invalid = runtime.reply_validated(
+        permission_id,
+        ValidatedReply::Result(json!({
+            "outcome": { "outcome": "selected", "optionId": "not-offered" }
+        })),
+        &policy(),
+    );
+    assert!(
+        invalid.is_err(),
+        "包装 permission 也必须拒绝不属于保存 options[] 的 optionId"
+    );
 
     drop(runtime);
     peer.finish();

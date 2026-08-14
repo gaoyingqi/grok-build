@@ -660,6 +660,54 @@ fn http_ipv4_compatible_ipv6_loopback_is_forwarded_when_development_flag_enabled
     upstream.join().expect("IPv4 上游线程必须退出");
 }
 
+/// 原生 IPv6 `::1` 必须按回环地址保留，不能按 IPv4-compatible 地址归一化。
+#[test]
+fn http_native_ipv6_loopback_is_forwarded_when_development_flag_enabled() {
+    let listener = TcpListener::bind("[::1]:0").expect("必须能绑定原生 IPv6 测试上游");
+    let port = listener
+        .local_addr()
+        .expect("必须能读取原生 IPv6 测试监听端口")
+        .port();
+    let (received_tx, received_rx) = mpsc::channel();
+    let upstream = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("上游必须接收 L3b 连接");
+        let headers = read_http_request(&mut stream);
+        received_tx
+            .send(headers)
+            .expect("测试必须接收原生 IPv6 上游请求");
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            )
+            .expect("上游必须能返回成功响应");
+        stream.flush().expect("上游成功响应必须刷新");
+    });
+
+    let app = Arc::new(FakeApp::byok(
+        format!("http://[::1]:{port}/v1"),
+        "test-model",
+        "test-user-key",
+    ));
+    let manager = manager(app, true);
+    let loopback = loopback(Arc::clone(&manager), true);
+    let token = register(&loopback, &manager, "scope-a", 1);
+    let mut downstream = open_chat_request(loopback.local_addr(), &token, "{\"stream\":false}");
+
+    assert_eq!(
+        status_code(&read_to_end(&mut downstream)),
+        200,
+        "显式允许时原生 IPv6 loopback HTTP 必须可用"
+    );
+    assert!(
+        received_rx
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("上游必须收到转发请求")
+            .contains("POST /v1/chat/completions HTTP/1.1"),
+        "L3b 必须把请求转发至原生 IPv6 loopback 上游"
+    );
+    upstream.join().expect("IPv6 上游线程必须退出");
+}
+
 /// SetLlmChannel 的空更新不可改变 committed view；端点、模型或类型变化必须带新 Key。
 #[test]
 fn channel_set_requires_new_secret_for_identity_changes_and_allows_key_rotation() {

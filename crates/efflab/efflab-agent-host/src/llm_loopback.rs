@@ -461,7 +461,7 @@ async fn chat_completions(State(state): State<Arc<LoopbackState>>, request: Requ
     };
 
     // 每个请求新建 client 并在此前重解析全部地址：不复用旧 DNS 或连接池地址。
-    // URL 的 hostname 未变，因此 reqwest/rustls 仍以原 hostname 做 HTTPS SNI/证书校验。
+    // HTTPS URL 的 authority 未改写，因此 reqwest/rustls 仍以原 hostname 做 SNI/证书校验。
     let client = match reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -533,18 +533,23 @@ async fn verify_upstream(base_url: &str, allow_loopback_llm: bool) -> Result<Ver
     {
         return Err(());
     }
-    // IPv4-compatible/mapped IPv6 在部分内核没有可路由的 IPv6 路径；将 URL 规范为
-    // 等价的嵌入 IPv4 literal，使设置和请求阶段按同一地址语义处理。
-    if let Some(url::Host::Ipv6(address)) = chat_completions_url.host() {
-        if let Some(embedded) = embedded_ipv4_address(address) {
-            let embedded = embedded.to_string();
-            chat_completions_url
-                .set_host(Some(embedded.as_str()))
-                .map_err(|_| ())?;
+    // 仅在显式允许的明文 HTTP 开发例外中，将 IPv4-compatible/mapped IPv6 降级为
+    // 嵌入 IPv4 literal，以兼容没有可路由 IPv6 路径的平台。原生 `::1` 必须保留；
+    // HTTPS 的 authority 也绝不能改写，否则会改变 TLS SNI 与证书 SAN 身份语义。
+    if chat_completions_url.scheme() == "http" && allow_loopback_llm {
+        if let Some(url::Host::Ipv6(address)) = chat_completions_url.host() {
+            if !address.is_loopback() {
+                if let Some(embedded) = embedded_ipv4_address(address) {
+                    let embedded = embedded.to_string();
+                    chat_completions_url
+                        .set_host(Some(embedded.as_str()))
+                        .map_err(|_| ())?;
+                }
+            }
         }
     }
-    // reqwest 的 resolver 以不带 IPv6 方括号的 host 查找覆盖地址；未规范化的 URL
-    // 仍保持原 host，因而 HTTPS 时的 SNI/证书校验语义不变。
+    // reqwest 的 resolver 以不带 IPv6 方括号的 host 查找覆盖地址；HTTPS URL 始终保持
+    // 原始 host，因而 HTTPS 时的 SNI/证书校验语义不变。
     let hostname = match chat_completions_url.host().ok_or(())? {
         url::Host::Ipv4(address) => address.to_string(),
         url::Host::Ipv6(address) => address.to_string(),
@@ -663,7 +668,7 @@ fn status_response(status: StatusCode) -> Response {
 mod tests {
     use std::net::{IpAddr, Ipv6Addr};
 
-    use super::is_allowed_upstream_ip;
+    use super::{is_allowed_upstream_ip, verify_upstream};
 
     /// IPv4-compatible 与 IPv4-mapped IPv6 必须递归接受 IPv4 SSRF 策略审查。
     #[test]
@@ -694,5 +699,41 @@ mod tests {
             !is_allowed_upstream_ip(IpAddr::V6(mapped_metadata), true),
             "显式开发开关不得放行 IPv4-mapped metadata"
         );
+    }
+
+    /// HTTPS 的 IPv6 literal authority 必须保留，避免改变 TLS SNI/证书身份语义。
+    #[test]
+    fn https_ipv4_compatible_ipv6_keeps_original_authority() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("测试 Tokio runtime 必须可构造");
+        let verified = runtime
+            .block_on(verify_upstream("https://[::127.0.0.1]:9443/v1", true))
+            .expect("显式允许的 IPv4-compatible IPv6 HTTPS URL 必须通过地址审查");
+
+        let expected_ipv6 = "::127.0.0.1"
+            .parse::<Ipv6Addr>()
+            .expect("IPv4-compatible IPv6 测试地址必须可解析");
+        // `Url` 可规范化 IPv6 的文本表示，但绝不能把 IPv6 authority 改为 IPv4。
+        assert_eq!(
+            verified.chat_completions_url.host(),
+            Some(url::Host::Ipv6(expected_ipv6)),
+            "HTTPS 请求 URL 必须保留原始 IPv6 authority 的地址身份"
+        );
+        assert_eq!(
+            verified
+                .hostname
+                .parse::<Ipv6Addr>()
+                .expect("resolver 覆盖键必须保持 IPv6 literal"),
+            expected_ipv6,
+            "resolver 覆盖键必须保留原始 IPv6 hostname 的地址身份"
+        );
+        assert_eq!(
+            verified.address.ip(),
+            IpAddr::V6(expected_ipv6),
+            "HTTPS 连接地址不得被改写为不同的 IPv4 authority"
+        );
+        assert_eq!(verified.address.port(), 9443);
     }
 }

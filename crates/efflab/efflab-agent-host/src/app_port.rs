@@ -1,7 +1,7 @@
 //! 产品领域端口与编译所需的最小 DTO。
 //!
-//! 这些类型定义产品领域端口；Task 7 使用其中的 Channel 密封接缝，MCP 启动与
-//! mention 文本展开仍由后续专项任务实现。
+//! 这些类型定义产品领域端口；Task 7 使用其中的 Channel 密封接缝，HostRuntime
+//! 通过 mention 端口解析已授权领域对象，MCP 启动仍由后续专项任务实现。
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -22,7 +22,7 @@ pub struct MentionId {
     pub id: String,
 }
 
-/// 产品将 mention 解析后的最小结果；具体文本拼装不属于本任务。
+/// 产品将 mention 解析后的最小结果；Host 验证标识后只把展示文本拼入 prompt。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedMention {
     /// 原始领域标识。
@@ -229,7 +229,10 @@ pub trait HostApp: Send + Sync {
 
 /// 产品按领域解析 `@` mention 的独立端口。
 pub trait HostAppMentions: Send + Sync {
-    /// 将已授权 scope 中的标识解析成安全文本；Task 1 不调用。
+    /// 将已授权 scope 中的标识按输入顺序一一解析成安全展示文本。
+    ///
+    /// 未知、跨 scope 或无权访问的标识必须返回错误；Host 还会复核返回数量、原始标识
+    /// 和展示文本安全性，避免产品端口的异常结果进入模型 prompt。
     fn resolve_mentions(&self, scope: &ScopeId, ids: &[MentionId]) -> Result<Vec<ResolvedMention>>;
 }
 

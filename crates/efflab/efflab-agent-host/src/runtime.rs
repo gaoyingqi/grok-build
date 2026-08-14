@@ -225,7 +225,7 @@ impl HostRuntime {
         }))
     }
 
-    /// 对 Send 执行稳定幂等登记后，把实际 sidecar 写入交给对应 scope actor。
+    /// 先解析并门禁 mention，再以原始字段登记稳定幂等键，最后把安全文本交给 scope actor。
     fn dispatch_send(
         &self,
         scope_id: String,
@@ -235,11 +235,13 @@ impl HostRuntime {
         mentions: Vec<crate::MentionId>,
     ) -> Result<KitReply, KitError> {
         validate_send_input(&scope_id, &session_id, &submission_id, &text)?;
+        let prompt_text = self.resolve_send_prompt_text(&scope_id, &text, &mentions)?;
         self.require_conversation_channel()?;
         let decision = self
             .submissions
             .lock()
             .map_err(|_| KitError::non_retryable("sidecar_unavailable", "提交映射不可用"))?
+            // 指纹只依赖提交 wire 的原始 text 与排序后的 mention id，不能依赖可变展示文本。
             .record(&scope_id, &session_id, &submission_id, &text, &mentions);
 
         match decision {
@@ -262,7 +264,12 @@ impl HostRuntime {
                         return Err(error);
                     }
                 };
-                match request_send_actor(&actor, session_id.clone(), submission_id.clone(), text) {
+                match request_send_actor(
+                    &actor,
+                    session_id.clone(),
+                    submission_id.clone(),
+                    prompt_text,
+                ) {
                     Ok(reply) => Ok(reply),
                     Err(SendRequestError::BeforePrompt(error)) => {
                         // actor 尚未取得写 prompt 所有权，撤销登记后原 submission 可安全重试。
@@ -276,6 +283,42 @@ impl HostRuntime {
                 }
             }
         }
+    }
+
+    /// 将非空 mention 解析成展示文本，并在创建 actor 前实施最终安全门禁。
+    fn resolve_send_prompt_text(
+        &self,
+        scope_id: &str,
+        text: &str,
+        mentions: &[crate::MentionId],
+    ) -> Result<String, KitError> {
+        if mentions.is_empty() {
+            return Ok(text.to_string());
+        }
+
+        let resolver = self.app.mentions().ok_or_else(invalid_mentions_request)?;
+        let resolved = resolver
+            .resolve_mentions(&ScopeId(scope_id.to_string()), mentions)
+            .map_err(|_| invalid_mentions_request())?;
+        if resolved.len() != mentions.len()
+            || resolved.iter().zip(mentions).any(|(resolved, requested)| {
+                resolved.id != *requested || !is_safe_mention_expansion(&resolved.text)
+            })
+        {
+            return Err(invalid_mentions_request());
+        }
+
+        // 保持产品返回的已审核顺序，避免 Host 擅自重排用户选择的曲库条目。
+        let expanded = resolved
+            .iter()
+            .map(|mention| mention.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prompt_text = format!("{text}\n\n{expanded}");
+        // 原始 text 已在上方校验；这里专门覆盖 resolver 拼入内容后的完整 prompt。
+        validate_prompt_text(&prompt_text).map_err(|_| invalid_mentions_request())?;
+
+        Ok(prompt_text)
     }
 
     /// 实施全局 Channel 事务：先提交/失效，再 drain 与重建全部先前存活 scope。
@@ -1876,6 +1919,69 @@ fn host_policy(launched: &LaunchedScope) -> Result<HostPolicy, KitError> {
         .with_meta_key_for("session/load", "modelId")
         .with_meta_key_for("session/prompt", "promptId")
         .with_model_id(ACP_BYOK_MODEL_SLOT))
+}
+
+/// 将 resolver 的失败或不可信返回统一收敛为不泄漏领域数据的客户端错误。
+fn invalid_mentions_request() -> KitError {
+    KitError::non_retryable(
+        "invalid_request",
+        "Send mention 无法解析或文本不符合安全策略",
+    )
+}
+
+/// 校验产品提供的单个展示文本，补足通用 prompt 门刻意允许的正文绝对路径。
+///
+/// 通用门允许用户正常提及「/Volumes/...」等正文；但 resolver 仅应返回已审核的
+/// 中文展示信息，所以任何 `@`、file URI 或跨平台绝对路径形式都必须失败关闭。
+fn is_safe_mention_expansion(text: &str) -> bool {
+    !text.trim().is_empty()
+        && !text.contains('@')
+        && !contains_mention_file_uri(text)
+        && !contains_absolute_mention_path(text)
+}
+
+/// 以 ASCII 大小写不敏感方式识别展示文本中任意位置的 `file://`。
+fn contains_mention_file_uri(text: &str) -> bool {
+    const FILE_URI: &[u8] = b"file://";
+    text.as_bytes()
+        .windows(FILE_URI.len())
+        .any(|candidate| candidate.eq_ignore_ascii_case(FILE_URI))
+}
+
+/// 检测 POSIX 根路径、Windows 根路径、UNC 和盘符路径，且不依赖当前宿主平台。
+fn contains_absolute_mention_path(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    for (offset, character) in text.char_indices() {
+        let next_offset = offset + character.len_utf8();
+        if matches!(character, '/' | '\\')
+            && bytes
+                .get(next_offset)
+                .is_some_and(|next| !next.is_ascii_whitespace())
+            && is_mention_path_boundary(text[..offset].chars().next_back())
+        {
+            return true;
+        }
+        if character.is_ascii_alphabetic()
+            && bytes.get(offset + 1) == Some(&b':')
+            && bytes
+                .get(offset + 2)
+                .is_some_and(|next| matches!(*next, b'/' | b'\\'))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// 路径起点只能出现在开头或文本边界，避免把普通 `AC/DC` 曲名误判为绝对路径。
+fn is_mention_path_boundary(previous: Option<char>) -> bool {
+    match previous {
+        None => true,
+        Some(character) => {
+            !character.is_ascii_alphanumeric() && !matches!(character, '_' | '-' | '.')
+        }
+    }
 }
 
 /// 在登记 submission 或拉起 sidecar 前拒绝明显无效的 Send，避免失败路径占用幂等键。

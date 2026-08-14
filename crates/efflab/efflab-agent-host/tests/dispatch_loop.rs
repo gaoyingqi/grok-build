@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use efflab_agent_host::{
-    ApprovedMcpSpec, HostApp, HostRuntime, HostRuntimeConfig, KitBlock, KitCommand, KitEventSink,
-    KitProductEvent, KitReply, LlmChannelConfig, LlmChannelKind, LlmSecretSlot, MentionId, Origin,
-    ScopeId, SealedSecret, SecretGuard,
+    ApprovedMcpSpec, HostApp, HostAppMentions, HostRuntime, HostRuntimeConfig, KitBlock,
+    KitCommand, KitEventSink, KitProductEvent, KitReply, LlmChannelConfig, LlmChannelKind,
+    LlmSecretSlot, MentionId, Origin, ResolvedMention, ScopeId, SealedSecret, SecretGuard,
 };
 use serde_json::{Value, json};
 
@@ -37,15 +37,31 @@ const TEST_MCP_CATALOG_TIMEOUT: Duration = Duration::from_millis(15);
 /// fake sidecar 的迟到 catalog response；必须晚于测试 deadline，但无需真实等待 23 秒。
 const LATE_MCP_CATALOG_RESPONSE: Duration = Duration::from_millis(200);
 
+/// mention 端口的测试行为；每种分支都只在本集成测试中构造。
+enum MentionMode {
+    /// 产品没有声明 mention 能力。
+    Unsupported,
+    /// 返回与请求一一对应的安全中文展示文本。
+    Resolve,
+    /// 模拟未知或跨 scope 标识被产品端口拒绝。
+    Reject,
+    /// 模拟产品错误返回的不安全展示文本，供 Host 最终门禁回归测试使用。
+    Unsafe(String),
+}
+
 /// 已配置或未配置 Channel 的最小产品端口；测试凭据只停留在内存中。
 struct FakeApp {
     config: Arc<Mutex<LlmChannelConfig>>,
     expected_tools: BTreeSet<String>,
+    mention_mode: MentionMode,
 }
 
 impl FakeApp {
-    /// 构造可启动 L3b 的公开 HTTPS BYOK 配置。
-    fn byok(expected_tools: impl IntoIterator<Item = String>) -> Self {
+    /// 构造带指定 mention 端口行为的公开 HTTPS BYOK 配置。
+    fn byok_with_mention_mode(
+        expected_tools: impl IntoIterator<Item = String>,
+        mention_mode: MentionMode,
+    ) -> Self {
         Self {
             config: Arc::new(Mutex::new(LlmChannelConfig::Byok {
                 base_url: "https://8.8.8.8/v1".to_string(),
@@ -53,6 +69,7 @@ impl FakeApp {
                 api_key: SealedSecret::new(b"test-key".to_vec()),
             })),
             expected_tools: expected_tools.into_iter().collect(),
+            mention_mode,
         }
     }
 
@@ -61,6 +78,7 @@ impl FakeApp {
         Self {
             config: Arc::new(Mutex::new(LlmChannelConfig::Unconfigured)),
             expected_tools: BTreeSet::new(),
+            mention_mode: MentionMode::Unsupported,
         }
     }
 }
@@ -107,6 +125,45 @@ impl HostApp for FakeApp {
         Ok(ApprovedMcpSpec::with_expected_tools(
             self.expected_tools.iter().cloned(),
         ))
+    }
+
+    /// 只有显式启用的测试端口才向运行时声明 mentions 能力。
+    fn mentions(&self) -> Option<&dyn HostAppMentions> {
+        if matches!(&self.mention_mode, MentionMode::Unsupported) {
+            None
+        } else {
+            Some(self)
+        }
+    }
+}
+
+impl HostAppMentions for FakeApp {
+    /// 按测试模式解析当前 scope 的标识，模拟产品端口的安全与失败关闭语义。
+    fn resolve_mentions(&self, scope: &ScopeId, ids: &[MentionId]) -> Result<Vec<ResolvedMention>> {
+        if scope.0.as_str() != "scope-a" {
+            return Err(anyhow::anyhow!("测试端口拒绝跨 scope mention"));
+        }
+
+        match &self.mention_mode {
+            MentionMode::Resolve => Ok(ids
+                .iter()
+                .cloned()
+                .map(|id| ResolvedMention {
+                    text: format!("曲目：{}；艺人：测试艺人", id.id),
+                    id,
+                })
+                .collect()),
+            MentionMode::Reject => Err(anyhow::anyhow!("测试端口拒绝未知 mention")),
+            MentionMode::Unsafe(text) => Ok(ids
+                .iter()
+                .cloned()
+                .map(|id| ResolvedMention {
+                    id,
+                    text: text.clone(),
+                })
+                .collect()),
+            MentionMode::Unsupported => Err(anyhow::anyhow!("未声明的 mention 端口不能解析")),
+        }
     }
 }
 
@@ -163,6 +220,24 @@ impl Harness {
         Self::configured_with_options(
             mode,
             expected_tools,
+            MentionMode::Unsupported,
+            idle_after,
+            Duration::from_millis(0),
+            None,
+        )
+    }
+
+    /// 构造声明 mention 端口的运行时，用于验证 Host 的解析与最终文本门禁。
+    fn configured_with_mentions(
+        mode: &str,
+        expected_tools: impl IntoIterator<Item = String>,
+        mention_mode: MentionMode,
+        idle_after: Duration,
+    ) -> Self {
+        Self::configured_with_options(
+            mode,
+            expected_tools,
+            mention_mode,
             idle_after,
             Duration::from_millis(0),
             None,
@@ -179,6 +254,7 @@ impl Harness {
         Self::configured_with_options(
             mode,
             expected_tools,
+            MentionMode::Unsupported,
             idle_after,
             Duration::from_millis(0),
             Some(catalog_timeout),
@@ -192,13 +268,21 @@ impl Harness {
         idle_after: Duration,
         sink_delay: Duration,
     ) -> Self {
-        Self::configured_with_options(mode, expected_tools, idle_after, sink_delay, None)
+        Self::configured_with_options(
+            mode,
+            expected_tools,
+            MentionMode::Unsupported,
+            idle_after,
+            sink_delay,
+            None,
+        )
     }
 
     /// 集中构造 fake sidecar；只有显式传入时才使用测试专用 catalog deadline。
     fn configured_with_options(
         mode: &str,
         expected_tools: impl IntoIterator<Item = String>,
+        mention_mode: MentionMode,
         idle_after: Duration,
         sink_delay: Duration,
         catalog_timeout: Option<Duration>,
@@ -222,12 +306,16 @@ impl Harness {
         };
         let runtime = match catalog_timeout {
             Some(catalog_timeout) => HostRuntime::new_for_test_with_mcp_catalog_timeout(
-                FakeApp::byok(expected_tools),
+                FakeApp::byok_with_mention_mode(expected_tools, mention_mode),
                 sink,
                 config,
                 catalog_timeout,
             ),
-            None => HostRuntime::new(FakeApp::byok(expected_tools), sink, config),
+            None => HostRuntime::new(
+                FakeApp::byok_with_mention_mode(expected_tools, mention_mode),
+                sink,
+                config,
+            ),
         };
         Self {
             _temporary: temporary,
@@ -650,10 +738,150 @@ fn unconfigured_channel_rejects_all_conversation_commands_without_spawning() {
     );
 }
 
+/// Send 的 mention 必须由产品端口展开为中文文本，不能把不透明 id 直接交给 sidecar。
+#[test]
+fn send_mentions_resolve_to_chinese_text_before_prompt_is_written() {
+    let harness = Harness::configured_with_mentions(
+        "default",
+        [],
+        MentionMode::Resolve,
+        Duration::from_secs(60),
+    );
+    let session_id = harness.new_session("scope-a");
+    let mentions = vec![
+        MentionId {
+            kind: "track".to_string(),
+            id: "白日梦".to_string(),
+        },
+        MentionId {
+            kind: "track".to_string(),
+            id: "夜航".to_string(),
+        },
+    ];
+
+    assert_send(
+        harness
+            .runtime
+            .dispatch(send(
+                &session_id,
+                "mention-expanded",
+                "请分析这些曲目",
+                Some(mentions),
+            ))
+            .expect("可解析 mention 必须写入 prompt"),
+        false,
+        &session_id,
+        "mention-expanded",
+    );
+    harness.wait_for_method("session/prompt");
+
+    let prompt = harness
+        .wire()
+        .into_iter()
+        .find(|item| item["method"] == "session/prompt")
+        .expect("必须写出 session/prompt");
+    let prompt_text = prompt["params"]["prompt"][0]["text"]
+        .as_str()
+        .expect("prompt 文本必须是字符串");
+    assert!(prompt_text.contains("请分析这些曲目"));
+    assert!(prompt_text.contains("曲目：白日梦；艺人：测试艺人"));
+    assert!(prompt_text.contains("曲目：夜航；艺人：测试艺人"));
+}
+
+/// 未声明 mention 端口时，即使 Channel 已配置也必须在创建 actor 前拒绝请求。
+#[test]
+fn send_mentions_without_port_is_invalid_request() {
+    let harness = Harness::configured("default", [], Duration::from_secs(60));
+    let error = harness
+        .runtime
+        .dispatch(send(
+            "unattached-session",
+            "unsupported-mentions",
+            "请处理曲目",
+            Some(vec![MentionId {
+                kind: "track".to_string(),
+                id: "track-1".to_string(),
+            }]),
+        ))
+        .expect_err("未声明 mention 端口必须失败关闭");
+
+    assert_eq!(error.code, "invalid_request");
+    assert!(
+        !harness.started.exists(),
+        "无 mention 端口时不得启动 sidecar"
+    );
+}
+
+/// 产品端口拒绝未知或跨 scope 标识时，Host 只能返回不泄漏底层信息的 invalid_request。
+#[test]
+fn mention_resolution_failure_is_invalid_request() {
+    let harness = Harness::configured_with_mentions(
+        "default",
+        [],
+        MentionMode::Reject,
+        Duration::from_secs(60),
+    );
+    let error = harness
+        .runtime
+        .dispatch(send(
+            "unattached-session",
+            "rejected-mentions",
+            "请处理曲目",
+            Some(vec![MentionId {
+                kind: "track".to_string(),
+                id: "other-scope-track".to_string(),
+            }]),
+        ))
+        .expect_err("未知或跨 scope mention 必须失败关闭");
+
+    assert_eq!(error.code, "invalid_request");
+    assert!(!harness.started.exists(), "解析失败时不得启动 sidecar");
+}
+
+/// Host 对产品展开文本保留最终门禁，不能让路径或 grok-shell 文件引用绕过原始文本校验。
+#[test]
+fn unsafe_mention_expansions_are_invalid_requests() {
+    for (name, unsafe_text) in [
+        ("at_file", "曲目：@secret.txt"),
+        ("file_uri", "曲目：file:///private/secret.wav"),
+        ("absolute_path", "曲目：/private/secret.wav"),
+    ] {
+        let harness = Harness::configured_with_mentions(
+            "default",
+            [],
+            MentionMode::Unsafe(unsafe_text.to_string()),
+            Duration::from_secs(60),
+        );
+        let error = harness
+            .runtime
+            .dispatch(send(
+                "unattached-session",
+                &format!("unsafe-mention-{name}"),
+                "请处理曲目",
+                Some(vec![MentionId {
+                    kind: "track".to_string(),
+                    id: "track-1".to_string(),
+                }]),
+            ))
+            .expect_err("不安全展开文本必须被 Host 拒绝");
+
+        assert_eq!(error.code, "invalid_request", "用例 {name} 应失败关闭");
+        assert!(
+            !harness.started.exists(),
+            "用例 {name} 在文本门禁前不得启动 sidecar"
+        );
+    }
+}
+
 /// TC-IDEMP / TC-CANCEL：稳定 submission 指纹、无 id cancel notification 与取消竞态。
 #[test]
 fn idempotency_mentions_and_cancel_keep_prompt_wire_and_inflight_state_correct() {
-    let harness = Harness::configured("hold_prompt", [], Duration::from_secs(60));
+    let harness = Harness::configured_with_mentions(
+        "hold_prompt",
+        [],
+        MentionMode::Resolve,
+        Duration::from_secs(60),
+    );
     let session_id = harness.new_session("scope-a");
     let mentions = vec![
         MentionId {

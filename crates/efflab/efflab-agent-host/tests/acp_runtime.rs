@@ -585,6 +585,55 @@ fn outbound_request_ledger_is_bounded_before_write() {
     peer.finish();
 }
 
+/// 超时调用方必须能仅按 request id 撤销自己的出站账本项，且未知 id 不得释放其它项。
+#[test]
+fn revoked_outbound_request_releases_only_its_ledger_slot() {
+    let (runtime, peer) = runtime_with_peer(DISCARD_STDIN);
+    let policy = policy();
+    let mut request_ids = Vec::new();
+
+    for _ in 0..64 {
+        request_ids.push(
+            runtime
+                .request_validated(
+                    "x.ai/mcp/list",
+                    json!({ "sessionId": "session-1" }),
+                    &policy,
+                )
+                .expect("达到上限前 request 必须可登记"),
+        );
+    }
+
+    runtime
+        .revoke_outbound_request(RequestId::new(10_000))
+        .expect("撤销未知 request id 必须是幂等空操作");
+    let error = runtime
+        .request_validated(
+            "x.ai/mcp/list",
+            json!({ "sessionId": "session-1" }),
+            &policy,
+        )
+        .expect_err("撤销未知 id 后账本仍必须保持满载");
+    assert!(
+        error.to_string().contains("上限") || error.to_string().contains("limit"),
+        "未知 id 不得释放其它账本项: {error}"
+    );
+
+    runtime
+        .revoke_outbound_request(request_ids[0])
+        .expect("必须能按 request id 撤销超时的出站账本项");
+    runtime
+        .request_validated(
+            "x.ai/mcp/list",
+            json!({ "sessionId": "session-1" }),
+            &policy,
+        )
+        .expect("撤销指定 request id 后必须能登记新的 request");
+
+    runtime.shutdown().expect("显式 shutdown 必须回收 runtime");
+    peer.finish();
+}
+
 /// session/cancel 只释放同一 session 的 pending request，释放后可以再次登记。
 #[test]
 fn cancel_releases_matching_outbound_requests() {

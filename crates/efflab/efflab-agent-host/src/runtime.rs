@@ -48,6 +48,8 @@ pub struct HostRuntime {
     sink: Arc<dyn KitEventSink>,
     /// 运行时固定配置；每个新 actor 从此派生 scope 私有路径与 idle 策略。
     cfg: crate::HostRuntimeConfig,
+    /// MCP catalog deadline；生产入口固定使用 20 秒，测试入口才可注入较短值。
+    mcp_catalog_timeout: Duration,
     /// Channel 服务构造也可能因历史配置不安全而失败；构造 API 不能 panic。
     channel: Result<Arc<LlmChannelService>, LlmChannelError>,
     /// 进程内 Send 幂等边界，跨 actor restart 保持。
@@ -67,6 +69,27 @@ impl HostRuntime {
         sink: impl KitEventSink + 'static,
         cfg: crate::HostRuntimeConfig,
     ) -> Self {
+        Self::new_with_mcp_catalog_timeout(app, sink, cfg, MCP_CATALOG_TIMEOUT)
+    }
+
+    /// 仅供集成测试注入较短 catalog deadline；生产调用必须使用 [`Self::new`] 保持 20 秒合同。
+    #[doc(hidden)]
+    pub fn new_for_test_with_mcp_catalog_timeout(
+        app: impl HostApp + 'static,
+        sink: impl KitEventSink + 'static,
+        cfg: crate::HostRuntimeConfig,
+        mcp_catalog_timeout: Duration,
+    ) -> Self {
+        Self::new_with_mcp_catalog_timeout(app, sink, cfg, mcp_catalog_timeout)
+    }
+
+    /// 统一构造路径，避免测试 deadline 改变生产 `new` 的冻结协议语义。
+    fn new_with_mcp_catalog_timeout(
+        app: impl HostApp + 'static,
+        sink: impl KitEventSink + 'static,
+        cfg: crate::HostRuntimeConfig,
+        mcp_catalog_timeout: Duration,
+    ) -> Self {
         let app = Arc::new(app);
         let channel = LlmChannelService::new(Arc::clone(&app), cfg.clone()).map(Arc::new);
         let app: Arc<dyn HostApp> = app;
@@ -76,6 +99,7 @@ impl HostRuntime {
             app,
             sink,
             cfg,
+            mcp_catalog_timeout,
             channel,
             submissions: Mutex::new(SubmissionMap::default()),
             actors: Mutex::new(BTreeMap::new()),
@@ -448,6 +472,7 @@ impl HostRuntime {
             receiver,
             Arc::clone(&accepting),
             self.cfg.idle_after,
+            self.mcp_catalog_timeout,
             expected_tools,
         );
         let name = format!("efflab-acp-{}", scope_id);
@@ -667,6 +692,8 @@ struct ScopeActor {
     receiver: Receiver<ActorCommand>,
     accepting: Arc<AtomicBool>,
     idle_after: Duration,
+    /// 每个 actor 复制一份 catalog deadline，避免测试 seam 触碰生产全局常量。
+    mcp_catalog_timeout: Duration,
     expected_tools: BTreeSet<String>,
     projector: Projector,
     initialized: bool,
@@ -699,6 +726,7 @@ impl ScopeActor {
         receiver: Receiver<ActorCommand>,
         accepting: Arc<AtomicBool>,
         idle_after: Duration,
+        mcp_catalog_timeout: Duration,
         approved: ApprovedMcpSpec,
     ) -> Self {
         Self {
@@ -711,6 +739,7 @@ impl ScopeActor {
             receiver,
             accepting,
             idle_after,
+            mcp_catalog_timeout,
             expected_tools: approved.expected_tools().clone(),
             initialized: false,
             initialize_id: None,
@@ -1456,7 +1485,7 @@ impl ScopeActor {
                     session_id.to_string(),
                     PendingCatalog {
                         request_id: id,
-                        deadline: Instant::now() + MCP_CATALOG_TIMEOUT,
+                        deadline: Instant::now() + self.mcp_catalog_timeout,
                     },
                 );
             }
@@ -1468,7 +1497,7 @@ impl ScopeActor {
         }
     }
 
-    /// 到达冻结 deadline 后按 catalog error 降级，并从 request 账本移除以丢弃迟到响应。
+    /// 到达冻结 deadline 后按 catalog error 降级，并同时撤销 actor 与 ACP 两侧账本以丢弃迟到响应。
     fn expire_mcp_catalogs(&mut self) {
         let now = Instant::now();
         let expired = self
@@ -1479,6 +1508,11 @@ impl ScopeActor {
             .collect::<Vec<_>>();
         for (session_id, request_id) in expired {
             self.catalog_pending.remove(&session_id);
+            if self.acp.revoke_outbound_request(request_id).is_err() {
+                // 无法取得 ACP 账本锁时不能确信后续请求是否会被正确限额，保守停掉 scope。
+                self.enter_dead(sidecar_unavailable("无法撤销超时 MCP catalog 请求"));
+                return;
+            }
             if matches!(
                 self.pending.get(&request_id),
                 Some(PendingRpc::McpCatalog { session_id: pending_session }) if pending_session == &session_id

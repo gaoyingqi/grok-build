@@ -314,11 +314,23 @@ impl AcpRuntime {
         });
         if let Err(error) = self.write_message(&message) {
             // 写入失败时不保留永远无法收到 response 的在途记录。
-            self.remove_outbound_request(id);
+            let _ = self.revoke_outbound_request(id);
             return Err(error);
         }
 
         Ok(id)
+    }
+
+    /// 按 request id 撤销一个 Host→sidecar 出站账本项。
+    ///
+    /// 该操作对未知或已收到 response 的 id 保持幂等，供上层 deadline 在不终止 transport
+    /// 的情况下丢弃迟到 response；不会影响其它 session 或 request 的账本项。
+    pub fn revoke_outbound_request(&self, id: RequestId) -> Result<()> {
+        self.outbound_requests
+            .lock()
+            .map_err(|_| anyhow!("ACP 出站 request 账本不可用，无法撤销 request id {id}"))?
+            .remove(&id);
+        Ok(())
     }
 
     /// 校验逻辑 method 后发送一个无 id 的 Host→sidecar notification。
@@ -448,13 +460,6 @@ impl AcpRuntime {
             .and_then(|_| stdin.write_all(b"\n"))
             .and_then(|_| stdin.flush())
             .context("写入 ACP stdin 失败")
-    }
-
-    /// 移除写入失败的 Host→sidecar 在途 request；锁中毒时保守地保留记录。
-    fn remove_outbound_request(&self, id: RequestId) {
-        if let Ok(mut requests) = self.outbound_requests.lock() {
-            requests.remove(&id);
-        }
     }
 
     /// 按 sessionId 释放被取消的 Host→sidecar 在途 request，保留其它 session 的账本。

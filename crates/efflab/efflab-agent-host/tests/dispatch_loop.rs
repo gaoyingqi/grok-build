@@ -32,8 +32,10 @@ const DELAYED_PROMPT_RESULT: Duration = Duration::from_millis(700);
 const SLOW_SINK_DELAY: Duration = Duration::from_millis(250);
 /// 断言 actor 已写出通知或决定热恢复后，Kit 回执不得等待慢 sink。
 const IMMEDIATE_REPLY_TIMEOUT: Duration = Duration::from_millis(150);
-/// MCP catalog 合同 deadline 为 20 秒；为调度保留少量余量但必须早于 25 秒 API 超时。
-const MCP_CATALOG_REPLY_TIMEOUT: Duration = Duration::from_secs(22);
+/// 测试专用 catalog deadline；生产构造器仍冻结为 20 秒合同。
+const TEST_MCP_CATALOG_TIMEOUT: Duration = Duration::from_millis(15);
+/// fake sidecar 的迟到 catalog response；必须晚于测试 deadline，但无需真实等待 23 秒。
+const LATE_MCP_CATALOG_RESPONSE: Duration = Duration::from_millis(200);
 
 /// 已配置或未配置 Channel 的最小产品端口；测试凭据只停留在内存中。
 struct FakeApp {
@@ -158,7 +160,29 @@ impl Harness {
         expected_tools: impl IntoIterator<Item = String>,
         idle_after: Duration,
     ) -> Self {
-        Self::configured_with_sink_delay(mode, expected_tools, idle_after, Duration::from_millis(0))
+        Self::configured_with_options(
+            mode,
+            expected_tools,
+            idle_after,
+            Duration::from_millis(0),
+            None,
+        )
+    }
+
+    /// 构造使用短 catalog deadline 的运行时；只供超时回归测试避免真实等待生产 20 秒。
+    fn configured_with_catalog_timeout(
+        mode: &str,
+        expected_tools: impl IntoIterator<Item = String>,
+        idle_after: Duration,
+        catalog_timeout: Duration,
+    ) -> Self {
+        Self::configured_with_options(
+            mode,
+            expected_tools,
+            idle_after,
+            Duration::from_millis(0),
+            Some(catalog_timeout),
+        )
     }
 
     /// 构造带可控同步 sink 的运行时，用于锁定产品回执与事件投影的顺序。
@@ -167,6 +191,17 @@ impl Harness {
         expected_tools: impl IntoIterator<Item = String>,
         idle_after: Duration,
         sink_delay: Duration,
+    ) -> Self {
+        Self::configured_with_options(mode, expected_tools, idle_after, sink_delay, None)
+    }
+
+    /// 集中构造 fake sidecar；只有显式传入时才使用测试专用 catalog deadline。
+    fn configured_with_options(
+        mode: &str,
+        expected_tools: impl IntoIterator<Item = String>,
+        idle_after: Duration,
+        sink_delay: Duration,
+        catalog_timeout: Option<Duration>,
     ) -> Self {
         let temporary = tempfile::tempdir().expect("必须能创建 dispatch loop 临时目录");
         let root = temporary.path();
@@ -178,20 +213,25 @@ impl Harness {
 
         let sink = MemorySink::with_delay(sink_delay);
         let events = Arc::clone(&sink.events);
-        let runtime = Arc::new(HostRuntime::new(
-            FakeApp::byok(expected_tools),
-            sink,
-            HostRuntimeConfig {
-                home_root: root.join("app-data"),
-                sidecar_bin: sidecar.clone(),
-                mcp_exec_root: root.join("mcp"),
-                idle_after,
-                l3b: Default::default(),
-            },
-        ));
+        let config = HostRuntimeConfig {
+            home_root: root.join("app-data"),
+            sidecar_bin: sidecar.clone(),
+            mcp_exec_root: root.join("mcp"),
+            idle_after,
+            l3b: Default::default(),
+        };
+        let runtime = match catalog_timeout {
+            Some(catalog_timeout) => HostRuntime::new_for_test_with_mcp_catalog_timeout(
+                FakeApp::byok(expected_tools),
+                sink,
+                config,
+                catalog_timeout,
+            ),
+            None => HostRuntime::new(FakeApp::byok(expected_tools), sink, config),
+        };
         Self {
             _temporary: temporary,
-            runtime,
+            runtime: Arc::new(runtime),
             started,
             exited,
             captured,
@@ -350,9 +390,12 @@ while IFS= read -r line; do
           /usr/bin/printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32001,"message":"catalog failed"}}\n' "$id"
           ;;
         mcp_late)
-          # 晚于 20 秒 catalog deadline、早于原有 25 秒调用上限，验证 Host 自行降级。
-          /bin/sleep 23
+          # 晚于注入的短测试 deadline，验证 Host 自行降级且会忽略迟到 response。
+          /bin/sleep 0.2
           /usr/bin/printf '{"jsonrpc":"2.0","id":%s,"result":{"result":{"servers":[]}}}\n' "$id"
+          ;;
+        mcp_never)
+          # 永久不回复 catalog，但继续消费后续 prompt，模拟健康 stdio 上的 MCP 无响应。
           ;;
         noop_only)
           /usr/bin/printf '{"jsonrpc":"2.0","id":%s,"result":{"result":{"servers":[{"name":"builtin","session":{"status":"ready","tools":[{"name":"GrokBuild:efflab_noop","enabled":true}]}}]}}}\n' "$id"
@@ -1266,10 +1309,11 @@ fn mcp_catalog_gates_extra_tools_but_keeps_missing_or_empty_catalog_nonblocking(
 /// TC-HP deadline：catalog 无响应时按空 catalog 降级，迟到 response 不得释放第二次 prompt。
 #[test]
 fn mcp_catalog_timeout_degrades_before_late_response_and_preserves_submission_idempotency() {
-    let harness = Harness::configured(
+    let harness = Harness::configured_with_catalog_timeout(
         "mcp_late",
         ["purelab__search_tracks".to_string()],
         Duration::from_secs(60),
+        TEST_MCP_CATALOG_TIMEOUT,
     );
     let session_id = harness.new_session("scope-a");
 
@@ -1289,14 +1333,14 @@ fn mcp_catalog_timeout_degrades_before_late_response_and_preserves_submission_id
         "late-catalog",
     );
     assert!(
-        start.elapsed() < MCP_CATALOG_REPLY_TIMEOUT,
-        "catalog timeout 必须早于迟到 response 和 API 调用上限"
+        start.elapsed() < LATE_MCP_CATALOG_RESPONSE,
+        "catalog timeout 必须早于 fake sidecar 的迟到 response"
     );
     let failure = wait_for_status(&harness, "mcp_failed");
     assert_eq!(failure.turn_id, None);
     assert_eq!(failure.submission_id, None);
 
-    // fake 在 23 秒后才消费已写入的 prompt；此时 catalog response 已不属于 pending 请求。
+    // fake 只等待 200ms 才消费 prompt；此时 catalog response 已不属于 pending 请求。
     harness.wait_for_method("session/prompt");
     assert_eq!(
         harness.method_count("session/prompt"),
@@ -1321,6 +1365,63 @@ fn mcp_catalog_timeout_degrades_before_late_response_and_preserves_submission_id
         harness.method_count("session/prompt"),
         1,
         "迟到 catalog response 或 retry 均不得制造幽灵 prompt"
+    );
+}
+
+/// 永久无 catalog response 时，多次 deadline 也必须释放 ACP 64 项出站账本。
+#[test]
+fn mcp_catalog_timeouts_revoke_outbound_ledger_for_permanently_unresponsive_sidecar() {
+    let harness = Harness::configured_with_catalog_timeout(
+        "mcp_never",
+        ["purelab__search_tracks".to_string()],
+        Duration::from_secs(60),
+        TEST_MCP_CATALOG_TIMEOUT,
+    );
+    // 65 次明确越过 ACP 出站账本的 64 项上限；每次均由短 deadline 降级后继续聊天。
+    for index in 0..65 {
+        let session_id = harness.new_session("scope-a");
+        let submission_id = format!("catalog-timeout-{index}");
+        assert_send(
+            harness
+                .runtime
+                .dispatch(send(
+                    &session_id,
+                    &submission_id,
+                    "永久无响应 catalog 后继续",
+                    None,
+                ))
+                .expect("每次 catalog timeout 都必须释放账本并写入 prompt"),
+            false,
+            &session_id,
+            &submission_id,
+        );
+        wait_until(|| {
+            harness.events().iter().any(|event| {
+                event.session_id == session_id
+                    && event.submission_id.as_deref() == Some(submission_id.as_str())
+                    && matches!(&event.block, KitBlock::Status { code, .. } if code == "turn_completed")
+            })
+        });
+    }
+
+    assert_eq!(
+        harness.method_count("_x.ai/mcp/list"),
+        65,
+        "每个 session 都必须实际发出独立 catalog request"
+    );
+    assert_eq!(
+        harness.method_count("session/prompt"),
+        65,
+        "跨越 64 项账本上限后仍必须允许最后一次 prompt"
+    );
+    assert_eq!(
+        harness
+            .events()
+            .iter()
+            .filter(|event| matches!(&event.block, KitBlock::Status { code, .. } if code == "mcp_failed"))
+            .count(),
+        65,
+        "每次永久无响应都必须按 catalog 失败降级"
     );
 }
 

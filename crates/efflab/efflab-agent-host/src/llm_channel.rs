@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -632,14 +633,40 @@ struct SyncDnsRequest {
     host: String,
     port: u16,
     reply: mpsc::SyncSender<Result<Vec<SocketAddr>, ()>>,
+    /// reservation 必须跟随工作项直到阻塞 resolver 返回，不能由 timeout 调用方提前释放。
+    _reservation: SyncDnsReservation,
+}
+
+/// 唯一 DNS 工作项的占位；Drop 时才允许下一次 handoff。
+struct SyncDnsReservation {
+    in_flight: Arc<AtomicBool>,
+}
+
+impl SyncDnsReservation {
+    /// 原子取得唯一 in-flight 槽，忙 worker 或尚未完成的 timeout 请求一律拒绝。
+    fn acquire(in_flight: Arc<AtomicBool>) -> Result<Self, ()> {
+        in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| ())?;
+        Ok(Self { in_flight })
+    }
+}
+
+impl Drop for SyncDnsReservation {
+    /// worker 的阻塞 resolver 返回后才释放 reservation，避免 timeout 后继续积压请求。
+    fn drop(&mut self) {
+        self.in_flight.store(false, Ordering::Release);
+    }
 }
 
 /// 受限的同步 DNS 解析器：全进程最多一个可能阻塞 `ToSocketAddrs` 的 worker。
 ///
-/// `sync_channel(0)` 不允许忙 worker 后继续排队；超时调用方丢弃 reply receiver，worker
-/// 恢复后只会丢弃迟到结果。这避免每次 DNS 卡死都创建一个不可取消线程。
+/// worker-ready 握手保证构造器返回时线程已启动；容量为一的 handoff 消除 worker 刚进入
+/// `recv` 前的零容量调度窗口。独立的 in-flight reservation 仍确保最多一个请求会等待或
+/// 进入阻塞 resolver；超时调用方只丢弃 reply receiver，不能提前释放该 reservation。
 struct SyncDnsResolver {
     sender: mpsc::SyncSender<SyncDnsRequest>,
+    in_flight: Arc<AtomicBool>,
 }
 
 impl SyncDnsResolver {
@@ -647,29 +674,50 @@ impl SyncDnsResolver {
     fn new(
         resolver: impl Fn(&str, u16) -> Result<Vec<SocketAddr>, ()> + Send + 'static,
     ) -> Result<Self, ()> {
-        let (sender, receiver) = mpsc::sync_channel::<SyncDnsRequest>(0);
+        let (sender, receiver) = mpsc::sync_channel::<SyncDnsRequest>(1);
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         thread::Builder::new()
             .name("efflab-sync-dns".to_string())
             .spawn(move || {
+                // 先通知构造器 worker 已取得 receiver，再开始接收有限 handoff。
+                if ready_sender.send(()).is_err() {
+                    return;
+                }
                 while let Ok(request) = receiver.recv() {
-                    let resolved = resolver(&request.host, request.port);
+                    let SyncDnsRequest {
+                        host,
+                        port,
+                        reply,
+                        _reservation,
+                    } = request;
+                    let resolved = resolver(&host, port);
+                    // resolver 已返回即可交出唯一槽；reply 发送期间允许下一条请求进入有界 handoff。
+                    drop(_reservation);
                     // 调用方超时后 receiver 会被丢弃；迟到解析结果不能复活已拒绝的候选。
-                    let _ = request.reply.send(resolved);
+                    let _ = reply.send(resolved);
                 }
             })
             .map_err(|_| ())?;
-        Ok(Self { sender })
+        // 返回前等待 worker-ready，避免首个合法请求被创建线程的调度窗口错误拒绝。
+        ready_receiver.recv().map_err(|_| ())?;
+        Ok(Self {
+            sender,
+            in_flight: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     /// 向空闲 worker 提交一次解析并等待固定 deadline；忙或超时都 fail-closed。
     fn resolve(&self, host: &str, port: u16, timeout: Duration) -> Result<Vec<SocketAddr>, ()> {
+        let reservation = SyncDnsReservation::acquire(Arc::clone(&self.in_flight))?;
         let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
         self.sender
             .try_send(SyncDnsRequest {
                 host: host.to_string(),
                 port,
                 reply: reply_sender,
+                _reservation: reservation,
             })
+            // `try_send` 失败时 request 被丢弃，reservation 自动释放，后续可安全重试。
             .map_err(|_| ())?;
         reply_receiver.recv_timeout(timeout).map_err(|_| ())?
     }
@@ -1072,5 +1120,39 @@ mod tests {
             "忙 worker 的 fail-closed 必须不等待第二个 DNS deadline"
         );
         release_tx.send(()).expect("测试必须释放 DNS worker");
+    }
+
+    /// 构造器返回即代表 worker-ready 握手完成，第一条合法解析不能受线程调度窗口影响。
+    #[test]
+    fn synchronous_dns_first_handoff_waits_for_worker_ready() {
+        // 每次构造后立即提交第一条请求，覆盖 worker 刚创建时最容易暴露的调度窗口。
+        for attempt in 0..64 {
+            let resolver = SyncDnsResolver::new(|_host, port| {
+                Ok(vec![SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                    port,
+                )])
+            })
+            .expect("测试 DNS worker 必须启动");
+
+            let addresses = resolver
+                .resolve("ready.test", 443, Duration::from_secs(1))
+                .unwrap_or_else(|_| {
+                    panic!("worker-ready 后第 {attempt} 条首个 DNS 请求必须被接受")
+                });
+            assert_eq!(
+                addresses,
+                vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 443)]
+            );
+            let next_addresses = resolver
+                .resolve("ready.test", 444, Duration::from_secs(1))
+                .unwrap_or_else(|_| {
+                    panic!("worker 完成第 {attempt} 条请求后必须立即接受下一条 DNS 请求")
+                });
+            assert_eq!(
+                next_addresses,
+                vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 444)]
+            );
+        }
     }
 }

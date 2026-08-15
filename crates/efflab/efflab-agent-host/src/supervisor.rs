@@ -297,6 +297,22 @@ fn terminate_and_reap_detached_process(mut process: ManagedSidecar) {
     }
 }
 
+/// leader 已被 `try_wait` 或 `wait` 回收后，仍显式终止同组 descendant。
+///
+/// Unix `ProcessGroup` 的 Drop 不发送信号；所以不能因 leader 自然退出而直接丢弃最后一个
+/// `Arc`。失败只记 debug：`ESRCH` 代表 group 已空，其他错误仍保留既有 stop/natural-exit
+/// 状态机的完成语义。
+fn kill_process_group_after_leader_exit(process: &ManagedSidecar) {
+    if let Err(source) = process.process_group.kill() {
+        tracing::debug!(
+            scope = %process.scope_id,
+            generation = process.generation,
+            error = %source,
+            "sidecar leader 已回收，但 process group 清理失败"
+        );
+    }
+}
+
 /// 真实 launch 后向未来 runtime 返回的非敏感进程描述。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidecarProcessInfo {
@@ -852,6 +868,8 @@ fn slot_generation_is_live(
             process
                 .registry
                 .invalidate_generation(&process.scope_id, process.generation);
+            // leader 已被 try_wait 回收；在丢弃最后一个 group Arc 前必须终止仍存活的 descendant。
+            kill_process_group_after_leader_exit(&process);
             runtime.stopping = false;
             runtime.restart_blocked = false;
             let mut metadata = slot
@@ -984,6 +1002,9 @@ fn stop_slot_with_kill(
             restore_stopping_process(slot, process);
             return Err(error);
         }
+    } else {
+        // 关闭 stdin 后 leader 正常 EOF 已由 try_wait 回收；仍要清理同组 descendant。
+        kill_process_group_after_leader_exit(&process);
     }
     // `try_wait` 或 `wait` 已确认退出；现在才允许清除 pid 并解除 restart 隔离。
     finish_stopped_slot(slot)
@@ -1417,14 +1438,15 @@ fn finish_lifecycle(first_error: Option<SupervisorError>) -> Result<(), Supervis
 mod tests {
     use std::io::{self, BufRead, BufReader};
     use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use super::{
         BindingTokenRegistry, ManagedSidecar, ProcessGroup, ProcessScope, ProcessSlotMetadata,
         ProcessSlotState, ScopePaths, ScopeSlot, ScopeSlotRuntime, SpawnedSidecarGuard,
-        SupervisorError, prepare_slot_launch, spawn_enrolled_sidecar, stop_slot_with_kill,
-        terminate_and_reap_detached_process,
+        SupervisorError, prepare_slot_launch, slot_generation_is_live, spawn_enrolled_sidecar,
+        stop_slot_with_kill, terminate_and_reap_detached_process,
     };
 
     /// 构造仅用于生命周期失败路径的内存 scope slot，不接入 Task 7b 的 ACP actor。
@@ -1467,6 +1489,45 @@ mod tests {
             .attach_std(&child)
             .expect("测试 child 必须能加入 process group");
         (child, Arc::new(process_group))
+    }
+
+    /// 从测试 sidecar 的标准输出读取其创建的孙进程 PID。
+    fn reported_descendant_pid(child: &mut Child) -> libc::pid_t {
+        let stdout = child.stdout.take().expect("测试 sidecar 必须有 stdout");
+        let mut descendant_pid = String::new();
+        BufReader::new(stdout)
+            .read_line(&mut descendant_pid)
+            .expect("测试 sidecar 必须报告孙进程 pid");
+        descendant_pid
+            .trim()
+            .parse::<libc::pid_t>()
+            .expect("孙进程 pid 必须是整数")
+    }
+
+    /// 等待被杀孙进程消失；返回 `true` 表示 deadline 后仍可被信号探测。
+    fn descendant_survived_until_deadline(descendant_pid: libc::pid_t) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut descendant_survived = unsafe { libc::kill(descendant_pid, 0) } == 0;
+        while descendant_survived && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            descendant_survived = unsafe { libc::kill(descendant_pid, 0) } == 0;
+        }
+        descendant_survived
+    }
+
+    /// 失败断言前回收仍由测试 slot 持有的 child，避免污染后续进程表。
+    fn cleanup_test_slot_child(slot: &Arc<ScopeSlot>) {
+        let process = slot
+            .runtime
+            .lock()
+            .expect("测试 runtime 锁必须可用")
+            .child
+            .take();
+        if let Some(mut process) = process {
+            let _ = process.process_group.kill();
+            let _ = process.child.kill();
+            let _ = process.child.wait();
+        }
     }
 
     /// 创建不读取 stdin 的测试 sidecar，以便稳定覆盖 kill 失败时的保留所有权分支。
@@ -1624,6 +1685,128 @@ mod tests {
         assert!(
             !descendant_survived,
             "sidecar leader 已回收后，孙进程不得继续存活"
+        );
+    }
+
+    /// leader 自然退出后 watcher 路径必须显式回收同一 group 中的孙进程。
+    #[test]
+    fn natural_exit_reaps_process_group_descendant() {
+        let registry = Arc::new(BindingTokenRegistry::default());
+        let _token = registry
+            .register("scope-natural-exit", 1, 1)
+            .expect("测试 binding 必须可注册");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 60 & printf '%s\\n' \"$!\"")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let (mut child, process_group) = detached_test_child(&mut command);
+        let child_pid = child.id();
+        let descendant_pid = reported_descendant_pid(&mut child);
+        let slot = test_slot(
+            Some(ManagedSidecar {
+                child,
+                process_group: Arc::clone(&process_group),
+                registry,
+                scope_id: "scope-natural-exit".to_string(),
+                generation: 1,
+            }),
+            Some(child_pid),
+            false,
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut observed_exit = false;
+        let mut lifecycle_error = None;
+        while Instant::now() < deadline {
+            match slot_generation_is_live(&slot, 1) {
+                Ok(false) => {
+                    observed_exit = true;
+                    break;
+                }
+                Ok(true) => std::thread::sleep(Duration::from_millis(10)),
+                Err(error) => {
+                    lifecycle_error = Some(error);
+                    break;
+                }
+            }
+        }
+        let descendant_survived = descendant_survived_until_deadline(descendant_pid);
+        if descendant_survived {
+            let _ = process_group.kill();
+        }
+        if !observed_exit {
+            cleanup_test_slot_child(&slot);
+        }
+
+        assert!(
+            lifecycle_error.is_none(),
+            "自然退出 watcher 路径不得报告错误: {lifecycle_error:?}"
+        );
+        assert!(observed_exit, "自然退出必须被 slot watcher 检测并回收");
+        assert!(
+            !descendant_survived,
+            "leader 自然退出后，其 process group 中的孙进程不得继续存活"
+        );
+    }
+
+    /// 关闭 stdin 触发正常 EOF 时，stop 路径也必须回收同一 group 中的孙进程。
+    #[test]
+    fn normal_eof_reaps_process_group_descendant() {
+        let registry = Arc::new(BindingTokenRegistry::default());
+        let _token = registry
+            .register("scope-normal-eof", 1, 1)
+            .expect("测试 binding 必须可注册");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 60 & printf '%s\\n' \"$!\"; read _")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let (mut child, process_group) = detached_test_child(&mut command);
+        let child_pid = child.id();
+        let descendant_pid = reported_descendant_pid(&mut child);
+        let slot = test_slot(
+            Some(ManagedSidecar {
+                child,
+                process_group: Arc::clone(&process_group),
+                registry,
+                scope_id: "scope-normal-eof".to_string(),
+                generation: 1,
+            }),
+            Some(child_pid),
+            false,
+        );
+        let forced_kill = Arc::new(AtomicBool::new(false));
+        let stop_result = stop_slot_with_kill(&slot, Duration::from_secs(1), {
+            let forced_kill = Arc::clone(&forced_kill);
+            move |child| {
+                forced_kill.store(true, Ordering::Release);
+                child.kill()
+            }
+        });
+        let descendant_survived = descendant_survived_until_deadline(descendant_pid);
+        if descendant_survived {
+            let _ = process_group.kill();
+        }
+        if stop_result.is_err() {
+            cleanup_test_slot_child(&slot);
+        }
+
+        assert!(
+            stop_result.is_ok(),
+            "正常 EOF 必须在宽限期内完成，不应落入强制终止: {stop_result:?}"
+        );
+        assert!(
+            !forced_kill.load(Ordering::Acquire),
+            "正常 EOF 不得调用强制终止回调"
+        );
+        assert!(
+            !descendant_survived,
+            "关闭 stdin 后 leader 正常 EOF 退出时，孙进程不得继续存活"
         );
     }
 

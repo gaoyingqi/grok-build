@@ -28,6 +28,10 @@ pub const METHOD_NOT_FOUND: i64 = -32601;
 
 /// 入站消息队列的硬上限；溢出时终止传输并通过 `poll_inbound` 报错。
 const MAX_INBOUND_QUEUE: usize = 64;
+/// 单条 ACP JSON-RPC stdout 行的最大字节数（不含换行符）。
+///
+/// 该边界同时覆盖已到达换行与持续不换行的半帧，避免恶意 sidecar 无限增长 reader 缓冲。
+pub const MAX_ACP_LINE_BYTES: usize = 1_048_576;
 /// Host 或 sidecar 侧单向在途 request 账本的硬上限。
 const MAX_PENDING_REQUESTS: usize = 64;
 
@@ -582,6 +586,15 @@ fn read_stdout_loop<R>(
         pending.extend_from_slice(&chunk[..read]);
 
         while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+            if newline > MAX_ACP_LINE_BYTES {
+                terminate_reader(
+                    &terminal_error,
+                    &inbound_requests,
+                    &outbound_requests,
+                    anyhow!("ACP stdout 行长度超过上限 {MAX_ACP_LINE_BYTES}; transport terminated"),
+                );
+                return;
+            }
             let line_bytes: Vec<u8> = pending.drain(..=newline).collect();
             let line = match String::from_utf8(line_bytes) {
                 Ok(line) => line,
@@ -635,6 +648,17 @@ fn read_stdout_loop<R>(
                 }
             }
         }
+
+        // 没有换行的半帧同样受相同上限约束；reader 退出后 actor 会让 Supervisor 回收 child。
+        if pending.len() > MAX_ACP_LINE_BYTES {
+            terminate_reader(
+                &terminal_error,
+                &inbound_requests,
+                &outbound_requests,
+                anyhow!("ACP stdout 行长度超过上限 {MAX_ACP_LINE_BYTES}; transport terminated"),
+            );
+            return;
+        }
     }
 }
 
@@ -652,13 +676,12 @@ fn read_stdout_loop<R>(
     R: Read + Send + 'static,
 {
     let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
+    let mut line = Vec::new();
     loop {
         if shutdown_requested.load(Ordering::Acquire) || shutdown_receiver.try_recv().is_ok() {
             return;
         }
-        line.clear();
-        match reader.read_line(&mut line) {
+        match read_bounded_line(&mut reader, &mut line) {
             Ok(0) => {
                 if shutdown_requested.load(Ordering::Acquire) {
                     return;
@@ -672,7 +695,18 @@ fn read_stdout_loop<R>(
                 return;
             }
             Ok(_) => {
-                let line = line.trim_end_matches(['\n', '\r']);
+                let line = match std::str::from_utf8(&line) {
+                    Ok(line) => line.trim_end_matches(['\n', '\r']),
+                    Err(error) => {
+                        terminate_reader(
+                            &terminal_error,
+                            &inbound_requests,
+                            &outbound_requests,
+                            anyhow!(error).context("ACP stdout 包含非 UTF-8 内容"),
+                        );
+                        return;
+                    }
+                };
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -719,6 +753,35 @@ fn read_stdout_loop<R>(
                 );
                 return;
             }
+        }
+    }
+}
+
+/// 非 Unix `BufRead` 的有界逐行读取；遇到未终止半帧也不会让 Vec 超过固定上限。
+#[cfg(not(unix))]
+fn read_bounded_line<R: BufRead>(reader: &mut R, line: &mut Vec<u8>) -> std::io::Result<usize> {
+    line.clear();
+    loop {
+        let (consumed, complete) = {
+            let buffer = reader.fill_buf()?;
+            if buffer.is_empty() {
+                return Ok(0);
+            }
+            let newline = buffer.iter().position(|byte| *byte == b'\n');
+            let consumed = newline.map_or(buffer.len(), |offset| offset + 1);
+            let content_len = line.len() + newline.unwrap_or(buffer.len());
+            if content_len > MAX_ACP_LINE_BYTES {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("ACP stdout 行长度超过上限 {MAX_ACP_LINE_BYTES}"),
+                ));
+            }
+            line.extend_from_slice(&buffer[..consumed]);
+            (consumed, newline.is_some())
+        };
+        reader.consume(consumed);
+        if complete {
+            return Ok(line.len());
         }
     }
 }

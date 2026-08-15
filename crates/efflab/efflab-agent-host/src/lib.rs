@@ -15,7 +15,9 @@ mod runtime;
 mod submission;
 mod supervisor;
 
-pub use acp_runtime::{AcpRuntime, Inbound, METHOD_NOT_FOUND, RequestId, RpcError, ValidatedReply};
+pub use acp_runtime::{
+    AcpRuntime, Inbound, MAX_ACP_LINE_BYTES, METHOD_NOT_FOUND, RequestId, RpcError, ValidatedReply,
+};
 pub use app_port::{
     ApprovedMcpSpec, HostApp, HostAppMentions, LlmChannelConfig, LlmSecretSlot, MentionId,
     ResolvedMention, ScopeId, SealedSecret, SecretGuard,
@@ -27,7 +29,7 @@ pub use llm_channel::{
 };
 pub use llm_loopback::{
     BindingContext, BindingToken, BindingTokenRegistry, L3bLoopback, L3bLoopbackError,
-    MAX_L3B_REQUEST_BODY_BYTES,
+    MAX_BINDING_RECORDS, MAX_L3B_REQUEST_BODY_BYTES,
 };
 pub use projector::{ProjectError, Projector, apply_acp_notification};
 pub use protocol::{

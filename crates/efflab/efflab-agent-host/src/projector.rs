@@ -22,14 +22,30 @@ const SESSION_UPDATE_METHOD: &str = "session/update";
 ///
 /// 该状态只保存 UI 合并所需的快照、工具字段和 replay 跳过计数；不保存原始
 /// ACP payload，避免把未知内容变成新的产品协议或意外留存敏感数据。
-#[derive(Debug)]
 pub struct Projector {
     scope_id: String,
     sessions: BTreeMap<String, SessionProjection>,
+    /// 没有稳定 sessionId 的未知/禁用通知只能安全跳过，仍需保留可观测计数。
+    unattributed_skipped: u64,
+}
+
+impl fmt::Debug for Projector {
+    /// 调试形状只暴露固定计数，绝不递归格式化含模型文本的 session 快照。
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let replay_skipped = self.sessions.values().fold(0_u64, |total, session| {
+            total.saturating_add(session.replay_skipped)
+        });
+        formatter
+            .debug_struct("Projector")
+            .field("session_count", &self.sessions.len())
+            .field("unattributed_skipped", &self.unattributed_skipped)
+            .field("replay_skipped", &replay_skipped)
+            .finish()
+    }
 }
 
 /// 单个 session 的增量投影状态。
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct SessionProjection {
     next_sequence: u64,
     replay_active: bool,
@@ -42,14 +58,12 @@ struct SessionProjection {
 }
 
 /// 流式文本块的稳定 block_id 与累计文本。
-#[derive(Debug)]
 struct TextSnapshot {
     block_id: String,
     text: String,
 }
 
 /// ToolCall 与 ToolCallUpdate 合并后仍可展示的最小状态。
-#[derive(Debug)]
 struct ToolSnapshot {
     name: String,
     detail: String,
@@ -65,7 +79,7 @@ enum ToolStatusField {
 }
 
 /// 先于完整 ToolCall 到达的可选更新字段。
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct PendingToolUpdate {
     name: Option<String>,
     detail: Option<String>,
@@ -157,7 +171,13 @@ impl Projector {
         Self {
             scope_id: scope_id.into(),
             sessions: BTreeMap::new(),
+            unattributed_skipped: 0,
         }
+    }
+
+    /// 返回没有稳定 sessionId 的未知/禁用通知累计跳过数。
+    pub fn unattributed_skipped_count(&self) -> u64 {
+        self.unattributed_skipped
     }
 
     /// 显式开始一次冷 replay；序号从零起，旧流式/工具快照不能跨栅栏复用。
@@ -208,8 +228,6 @@ impl Projector {
         method: &str,
         params: &Value,
     ) -> Result<Vec<KitProductEvent>, ProjectError> {
-        let session_id =
-            required_string(params, "sessionId").ok_or(ProjectError::MissingSessionId)?;
         let meta = params.get("_meta").and_then(Value::as_object);
         let origin = if meta
             .and_then(|meta| meta.get("isReplay"))
@@ -220,29 +238,50 @@ impl Projector {
         } else {
             Origin::Live
         };
-        let scope_id = self.scope_id.clone();
-        let session = self.sessions.entry(session_id.to_string()).or_default();
-        session.prepare_origin(origin);
-        let sequence = session.allocate_sequence()?;
-        let event_id = sidecar_event_id(meta, session_id, origin, sequence);
-
-        // 仅标准 session/update 可投影；xAI 扩展和其他 method 一律安全跳过。
-        if method != SESSION_UPDATE_METHOD {
+        // 先按 method/update kind 分类。未知、禁用或不完整的 update 即使缺少 sessionId
+        // 也不能阻断整个 reader batch；只有可投影的已识别 turn update 才要求关联 session。
+        let update = (method == SESSION_UPDATE_METHOD)
+            .then(|| params.get("update").and_then(Value::as_object))
+            .flatten();
+        let update_kind =
+            update.and_then(|update| update.get("sessionUpdate").and_then(Value::as_str));
+        let recognized_update = matches!(
+            update_kind,
+            Some(
+                "agent_message_chunk"
+                    | "agent_thought_chunk"
+                    | "tool_call"
+                    | "tool_call_update"
+                    | "user_message_chunk"
+            )
+        );
+        if !recognized_update {
+            let Some(session_id) = required_string(params, "sessionId") else {
+                self.unattributed_skipped = self.unattributed_skipped.saturating_add(1);
+                tracing::debug!(
+                    unattributed_skipped = self.unattributed_skipped,
+                    "已安全跳过不可归属的 ACP 未知更新"
+                );
+                return Ok(Vec::new());
+            };
+            let scope_id = self.scope_id.clone();
+            let session = self.sessions.entry(session_id.to_string()).or_default();
+            session.prepare_origin(origin);
+            let sequence = session.allocate_sequence()?;
             return finish_events(skip_unknown_update(
                 &scope_id, session_id, origin, sequence, session,
             ));
         }
 
-        let Some(update) = params.get("update").and_then(Value::as_object) else {
-            return finish_events(skip_unknown_update(
-                &scope_id, session_id, origin, sequence, session,
-            ));
-        };
-        let Some(update_kind) = update.get("sessionUpdate").and_then(Value::as_str) else {
-            return finish_events(skip_unknown_update(
-                &scope_id, session_id, origin, sequence, session,
-            ));
-        };
+        let session_id =
+            required_string(params, "sessionId").ok_or(ProjectError::MissingSessionId)?;
+        let update = update.expect("已识别 update 必须有 object");
+        let update_kind = update_kind.expect("已识别 update 必须有 sessionUpdate");
+        let scope_id = self.scope_id.clone();
+        let session = self.sessions.entry(session_id.to_string()).or_default();
+        session.prepare_origin(origin);
+        let sequence = session.allocate_sequence()?;
+        let event_id = sidecar_event_id(meta, session_id, origin, sequence);
 
         let events = match update_kind {
             "agent_message_chunk" => project_assistant(
@@ -260,7 +299,7 @@ impl Projector {
             "user_message_chunk" => project_user_echo(
                 &scope_id, session_id, meta, origin, sequence, event_id, update, session,
             )?,
-            // plan / todo 在 M1 没有 KitBlock，未知未来变体也必须 fail-open。
+            // `recognized_update` 已封闭本分支；保留以防后续修改分类条件时漏掉 fail-open。
             _ => skip_unknown_update(&scope_id, session_id, origin, sequence, session),
         };
 

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use efflab_agent_contract::{HostPolicy, validate_prompt_text};
+use efflab_agent_contract::{HOST_ACP_PROTOCOL_VERSION, HostPolicy, validate_prompt_text};
 use serde_json::{Value, json};
 
 use crate::acp_runtime::{AcpRuntime, Inbound, RequestId, RpcError, ValidatedReply};
@@ -188,14 +188,22 @@ impl HostRuntime {
         }
     }
 
-    /// GetCapability 只读本地 committed view；未配置时不能伪装 sidecar 已可用。
+    /// GetCapability 只读本地 committed view；平台硬化不可用优先于无 Channel 返回。
     fn dispatch_get_capability(&self) -> Result<KitReply, KitError> {
+        // 先读取平台能力：Windows 这类硬化不可用的目标不能被 no-key 语义掩盖。
+        let supervisor_capability = capability();
         let channel = self.channel_service()?.view().map_err(channel_error)?;
         if channel.kind.is_none() {
+            if matches!(
+                supervisor_capability,
+                SupervisorCapability::Unavailable { .. }
+            ) {
+                return Err(sidecar_unavailable("当前平台不支持受硬化的 sidecar"));
+            }
             return Err(LlmChannelError::Unconfigured.as_kit_error());
         }
 
-        let (sidecar, reason) = match capability() {
+        let (sidecar, reason) = match supervisor_capability {
             SupervisorCapability::Available => ("available".to_string(), None),
             SupervisorCapability::Unavailable { reason } => (
                 "unavailable".to_string(),
@@ -874,7 +882,7 @@ impl ScopeActor {
             .request_validated(
                 "initialize",
                 json!({
-                    "protocolVersion": 1,
+                    "protocolVersion": HOST_ACP_PROTOCOL_VERSION,
                     "client": { "name": "efflab-agent-host", "mcpServers": [] },
                     "capabilities": { "terminal": false, "fs": false },
                 }),

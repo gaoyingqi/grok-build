@@ -5,7 +5,9 @@
 
 use std::fmt;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::thread;
+use std::time::Duration;
 
 use url::Url;
 
@@ -622,10 +624,91 @@ fn validate_byok_identity_shape(
     validate_byok_url_shape(base_url, allow_loopback_llm).map(|_| ())
 }
 
+/// 同步设置/启动路径等待 DNS 的最长时间；到期后候选一律 fail-closed。
+const SYNC_DNS_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 单次同步 DNS 工作项；reply 接收端被调用方丢弃即表示该次等待已取消。
+struct SyncDnsRequest {
+    host: String,
+    port: u16,
+    reply: mpsc::SyncSender<Result<Vec<SocketAddr>, ()>>,
+}
+
+/// 受限的同步 DNS 解析器：全进程最多一个可能阻塞 `ToSocketAddrs` 的 worker。
+///
+/// `sync_channel(0)` 不允许忙 worker 后继续排队；超时调用方丢弃 reply receiver，worker
+/// 恢复后只会丢弃迟到结果。这避免每次 DNS 卡死都创建一个不可取消线程。
+struct SyncDnsResolver {
+    sender: mpsc::SyncSender<SyncDnsRequest>,
+}
+
+impl SyncDnsResolver {
+    /// 用指定 resolver 创建唯一 worker；测试可注入阻塞闭包验证 timeout 语义。
+    fn new(
+        resolver: impl Fn(&str, u16) -> Result<Vec<SocketAddr>, ()> + Send + 'static,
+    ) -> Result<Self, ()> {
+        let (sender, receiver) = mpsc::sync_channel::<SyncDnsRequest>(0);
+        thread::Builder::new()
+            .name("efflab-sync-dns".to_string())
+            .spawn(move || {
+                while let Ok(request) = receiver.recv() {
+                    let resolved = resolver(&request.host, request.port);
+                    // 调用方超时后 receiver 会被丢弃；迟到解析结果不能复活已拒绝的候选。
+                    let _ = request.reply.send(resolved);
+                }
+            })
+            .map_err(|_| ())?;
+        Ok(Self { sender })
+    }
+
+    /// 向空闲 worker 提交一次解析并等待固定 deadline；忙或超时都 fail-closed。
+    fn resolve(&self, host: &str, port: u16, timeout: Duration) -> Result<Vec<SocketAddr>, ()> {
+        let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
+        self.sender
+            .try_send(SyncDnsRequest {
+                host: host.to_string(),
+                port,
+                reply: reply_sender,
+            })
+            .map_err(|_| ())?;
+        reply_receiver.recv_timeout(timeout).map_err(|_| ())?
+    }
+}
+
+/// 使用一个全进程 worker 包装阻塞系统 resolver，保证 caller 不会无限等待 DNS。
+fn resolve_dns_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>, ()> {
+    static RESOLVER: OnceLock<Result<SyncDnsResolver, ()>> = OnceLock::new();
+    let resolver = RESOLVER.get_or_init(|| {
+        SyncDnsResolver::new(|host, port| {
+            (host, port)
+                .to_socket_addrs()
+                .map(|addresses| addresses.collect())
+                .map_err(|_| ())
+        })
+    });
+    resolver
+        .as_ref()
+        .map_err(|_| ())?
+        .resolve(host, port, SYNC_DNS_RESOLUTION_TIMEOUT)
+}
+
 /// 对已密封候选执行全量 DNS/IP 审查；失败时该候选不得持久化或作为启动配置使用。
 fn validate_byok_candidate_addresses(
     candidate: &LlmChannelConfig,
     allow_loopback_llm: bool,
+) -> Result<(), LlmChannelError> {
+    validate_byok_candidate_addresses_with_resolver(
+        candidate,
+        allow_loopback_llm,
+        resolve_dns_addresses,
+    )
+}
+
+/// 将同步 resolver 注入候选审查；生产使用受限 worker，测试可确定性覆盖超时失败关闭。
+fn validate_byok_candidate_addresses_with_resolver(
+    candidate: &LlmChannelConfig,
+    allow_loopback_llm: bool,
+    resolver: impl Fn(&str, u16) -> Result<Vec<SocketAddr>, ()>,
 ) -> Result<(), LlmChannelError> {
     let LlmChannelConfig::Byok {
         base_url, model_id, ..
@@ -643,10 +726,9 @@ fn validate_byok_candidate_addresses(
     let addresses: Vec<SocketAddr> = match parsed.host().ok_or(LlmChannelError::InvalidRequest)? {
         url::Host::Ipv4(address) => vec![SocketAddr::new(IpAddr::V4(address), port)],
         url::Host::Ipv6(address) => vec![SocketAddr::new(IpAddr::V6(address), port)],
-        url::Host::Domain(host) => (host, port)
-            .to_socket_addrs()
-            .map_err(|_| LlmChannelError::InvalidRequest)?
-            .collect(),
+        url::Host::Domain(host) => {
+            resolver(host, port).map_err(|_| LlmChannelError::InvalidRequest)?
+        }
     };
     if addresses.is_empty()
         || addresses
@@ -930,3 +1012,65 @@ fn map_supervisor_error_to_lifecycle(error: SupervisorError) -> LlmChannelError 
 /// 保留 `IpAddr` 导入的编译期锚点，确保配置文档中地址语义不被意外替换为字符串。
 #[allow(dead_code)]
 fn _l3b_address_type_marker(_: IpAddr) {}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        LlmChannelConfig, LlmChannelError, SealedSecret, SyncDnsResolver,
+        validate_byok_candidate_addresses_with_resolver,
+    };
+
+    /// 同步 DNS worker 超时时，候选地址审查必须 fail-closed，且忙 worker 不得再积压请求。
+    #[test]
+    fn synchronous_dns_timeout_is_bounded_and_fails_closed() {
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let first = Arc::new(AtomicBool::new(true));
+        let resolver = SyncDnsResolver::new({
+            let first = Arc::clone(&first);
+            move |_host, port| {
+                if first.swap(false, Ordering::AcqRel) {
+                    started_tx.send(()).expect("测试必须观察 DNS worker 已阻塞");
+                    release_rx.recv().expect("测试必须释放 DNS worker");
+                }
+                Ok(vec![SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                    port,
+                )])
+            }
+        })
+        .expect("测试 DNS worker 必须启动");
+        let candidate = LlmChannelConfig::Byok {
+            base_url: "https://timeout.test/v1".to_string(),
+            model_id: "test-model".to_string(),
+            api_key: SealedSecret::new(b"test-key".to_vec()),
+        };
+
+        let result =
+            validate_byok_candidate_addresses_with_resolver(&candidate, false, |host, port| {
+                resolver.resolve(host, port, Duration::from_millis(10))
+            });
+        assert_eq!(result, Err(LlmChannelError::InvalidRequest));
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("超时前 DNS worker 必须已开始唯一的解析请求");
+
+        let busy_start = Instant::now();
+        assert!(
+            resolver
+                .resolve("timeout.test", 443, Duration::from_secs(1))
+                .is_err(),
+            "已阻塞的唯一 worker 不得接受第二个 DNS 请求"
+        );
+        assert!(
+            busy_start.elapsed() < Duration::from_millis(100),
+            "忙 worker 的 fail-closed 必须不等待第二个 DNS deadline"
+        );
+        release_tx.send(()).expect("测试必须释放 DNS worker");
+    }
+}

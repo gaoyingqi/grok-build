@@ -62,6 +62,11 @@ done
 /// stdout 立即 EOF，用于确认传输终止不会被伪装成“暂无消息”。
 const STDOUT_EOF: &str = "exit 0";
 
+/// 攻击方持续输出没有换行的内容时，reader 必须在固定行上限处终止，而不能无限积累。
+const OVERSIZED_UNTERMINATED_STDOUT: &str = r#"
+head -c 1048577 /dev/zero | tr '\000' x
+"#;
+
 /// 同一个 reverse id 的第二个 request 带不同的 permission options，属于协议错误。
 const DUPLICATE_REVERSE_REQUESTS: &str = r#"
 printf '%s\n' '{"jsonrpc":"2.0","id":41,"method":"session/request_permission","params":{"options":[{"optionId":"first-option","name":"First","kind":"allow_once"}]}}'
@@ -151,6 +156,8 @@ struct PipePeer {
 
 /// 用一个最小 shell sidecar 构造拆分的 ACP stdio 端点。
 fn runtime_with_peer(script: &str) -> (AcpRuntime, PipePeer) {
+    #[allow(clippy::disallowed_methods)]
+    // 集成测试 fixture：`PipePeer::finish` 在所有正常路径同步 wait 该短生命周期 shell。
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(script)
@@ -483,6 +490,21 @@ fn stdout_eof_is_reported_as_transport_error() {
     assert!(
         error.contains("ACP stdout EOF"),
         "EOF 错误必须包含传输终止原因: {error}"
+    );
+
+    drop(runtime);
+    peer.finish();
+}
+
+/// 不带换行的过长 stdout 帧必须在达到上限时终止 reader，避免 pending Vec 无界增长。
+#[test]
+fn unterminated_over_limit_stdout_frame_terminates_transport() {
+    let (runtime, peer) = runtime_with_peer(OVERSIZED_UNTERMINATED_STDOUT);
+
+    let error = next_inbound_error(&runtime);
+    assert!(
+        error.contains("行长度") || error.contains("line length"),
+        "过长帧必须报告固定长度上限，而不是等待 EOF: {error}"
     );
 
     drop(runtime);

@@ -2,7 +2,8 @@
 //!
 //! 职责：可信 Host 在写入 sidecar stdin 前，必须对每个 ACP 请求执行
 //! **字段白名单**（非黑名单）校验：
-//! - `initialize` 仅允许协议、客户端、能力、认证与 `_meta` 字段；
+//! - `initialize` 仅允许固定协议版本、客户端、能力与 `_meta` 字段；
+//!   `protocolVersion` 必须精确等于 Host 固定 ACP 版本，
 //!   `capabilities.terminal` / `capabilities.fs` 必须为 false，
 //!   `client.mcpServers` 必须为空数组（MCP 全部来自 `--mcp-config`）。
 //! - `session/new` / `session/load` 仅允许会话、cwd、MCP 与 `_meta` 字段；
@@ -14,7 +15,7 @@
 //! - 未知字段与未知 method 默认拒绝（fail-closed）。
 //!
 //! 字段拼写遵循 ACP wire 协议（camelCase）：`_meta`、`cwd`、`mcpServers`、
-//! `capabilities`、`authentication`、`sessionId`、`modelId`。
+//! `capabilities`、`sessionId`、`modelId`。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -22,14 +23,11 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use thiserror::Error;
 
+/// Host 支持且写入每个 `initialize` 请求的唯一 ACP 协议版本。
+pub const HOST_ACP_PROTOCOL_VERSION: u64 = 1;
+
 /// `initialize` 顶层 params 的唯一允许字段集合。
-const INITIALIZE_ALLOWED_FIELDS: &[&str] = &[
-    "protocolVersion",
-    "client",
-    "capabilities",
-    "authentication",
-    "_meta",
-];
+const INITIALIZE_ALLOWED_FIELDS: &[&str] = &["protocolVersion", "client", "capabilities", "_meta"];
 
 /// `session/new` 与 `session/load` 顶层 params 的唯一允许字段集合。
 const SESSION_ALLOWED_FIELDS: &[&str] = &["sessionId", "cwd", "mcpServers", "_meta"];
@@ -134,6 +132,12 @@ pub enum HostRejection {
     InvalidFieldType { method: String, field: String },
     #[error("method {method}: missing required field {field}")]
     MissingRequiredField { method: String, field: String },
+    #[error("method {method}: unsupported protocolVersion (expected {expected}, got {got})")]
+    UnsupportedProtocolVersion {
+        method: String,
+        expected: u64,
+        got: u64,
+    },
     #[error("method {0}: terminal capability must be false")]
     TerminalCapabilityEnabled(String),
     #[error("method {0}: fs capability must be false")]
@@ -257,6 +261,26 @@ fn validate_initialize(params: &Value, policy: &HostPolicy) -> Result<(), HostRe
         return Err(HostRejection::ClientMcpServersNotAllowed(
             method.to_string(),
         ));
+    }
+
+    // Host 与 sidecar 只协商这一固定 ACP 版本；缺失、非无符号整数或其它版本均不能透传。
+    let protocol_version = params
+        .get("protocolVersion")
+        .ok_or_else(|| HostRejection::MissingRequiredField {
+            method: method.to_string(),
+            field: "protocolVersion".to_string(),
+        })?
+        .as_u64()
+        .ok_or_else(|| HostRejection::InvalidFieldType {
+            method: method.to_string(),
+            field: "protocolVersion".to_string(),
+        })?;
+    if protocol_version != HOST_ACP_PROTOCOL_VERSION {
+        return Err(HostRejection::UnsupportedProtocolVersion {
+            method: method.to_string(),
+            expected: HOST_ACP_PROTOCOL_VERSION,
+            got: protocol_version,
+        });
     }
 
     // _meta 白名单 + modelId 校验。
@@ -684,7 +708,6 @@ mod tests {
                     "protocolVersion": 1,
                     "capabilities": { "terminal": false, "fs": false },
                     "client": { "mcpServers": [] },
-                    "authentication": {},
                     "_meta": { "modelId": "grok-code-fast" }
                 }),
             ),
@@ -743,6 +766,72 @@ mod tests {
                 "白名单用例 {name} 应通过"
             );
         }
+    }
+
+    /// initialize 必须固定使用 Host 支持的 ACP 版本，并拒绝任何认证注入字段。
+    #[test]
+    fn initialize_requires_pinned_protocol_version_and_rejects_authentication() {
+        let directory = TempDir::new().expect("必须能创建契约临时目录");
+        let policy = policy_with(directory.path());
+        let valid_fields = serde_json::json!({
+            "capabilities": { "terminal": false, "fs": false },
+            "client": { "mcpServers": [] },
+        });
+
+        assert_eq!(
+            validate_host_request("initialize", &valid_fields, &policy),
+            Err(HostRejection::MissingRequiredField {
+                method: "initialize".to_string(),
+                field: "protocolVersion".to_string(),
+            })
+        );
+        assert_eq!(
+            validate_host_request(
+                "initialize",
+                &serde_json::json!({
+                    "protocolVersion": "1",
+                    "capabilities": { "terminal": false, "fs": false },
+                    "client": { "mcpServers": [] },
+                }),
+                &policy,
+            ),
+            Err(HostRejection::InvalidFieldType {
+                method: "initialize".to_string(),
+                field: "protocolVersion".to_string(),
+            })
+        );
+        assert_eq!(
+            validate_host_request(
+                "initialize",
+                &serde_json::json!({
+                    "protocolVersion": 2,
+                    "capabilities": { "terminal": false, "fs": false },
+                    "client": { "mcpServers": [] },
+                }),
+                &policy,
+            ),
+            Err(HostRejection::UnsupportedProtocolVersion {
+                method: "initialize".to_string(),
+                expected: HOST_ACP_PROTOCOL_VERSION,
+                got: 2,
+            })
+        );
+        assert_eq!(
+            validate_host_request(
+                "initialize",
+                &serde_json::json!({
+                    "protocolVersion": HOST_ACP_PROTOCOL_VERSION,
+                    "capabilities": { "terminal": false, "fs": false },
+                    "client": { "mcpServers": [] },
+                    "authentication": {},
+                }),
+                &policy,
+            ),
+            Err(HostRejection::UnknownField {
+                method: "initialize".to_string(),
+                field: "authentication".to_string(),
+            })
+        );
     }
 
     #[test]

@@ -308,6 +308,74 @@ fn windows_rejects_drive_relative_app_id_and_scope() {
     assert!(matches!(scope_error, SupervisorError::InvalidPathComponent));
 }
 
+/// Windows 上无 Channel 与硬化不可用同时出现时，优先报告 sidecar 不可用而非缺少 Key。
+/// 该断言只在 Windows CI 运行；非 Windows 目标不编译此平台能力分支。
+#[cfg(windows)]
+struct WindowsUnconfiguredApp;
+
+#[cfg(windows)]
+impl efflab_agent_host::HostApp for WindowsUnconfiguredApp {
+    fn app_id(&self) -> &str {
+        "windows-capability-test"
+    }
+
+    fn persist_llm_channel(
+        &self,
+        _cfg: &efflab_agent_host::LlmChannelConfig,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn load_llm_channel(&self) -> anyhow::Result<efflab_agent_host::LlmChannelConfig> {
+        Ok(efflab_agent_host::LlmChannelConfig::Unconfigured)
+    }
+
+    fn seal_secret(&self, plain: &[u8]) -> anyhow::Result<efflab_agent_host::SealedSecret> {
+        Ok(efflab_agent_host::SealedSecret::new(plain.to_vec()))
+    }
+
+    fn unseal_secret(
+        &self,
+        sealed: &efflab_agent_host::SealedSecret,
+    ) -> anyhow::Result<efflab_agent_host::SecretGuard> {
+        Ok(efflab_agent_host::SecretGuard::new(
+            sealed.as_bytes().to_vec(),
+        ))
+    }
+
+    fn mcp_for_scope(
+        &self,
+        _scope: &efflab_agent_host::ScopeId,
+    ) -> anyhow::Result<efflab_agent_host::ApprovedMcpSpec> {
+        Ok(efflab_agent_host::ApprovedMcpSpec::default())
+    }
+}
+
+#[cfg(windows)]
+struct DiscardWindowsSink;
+
+#[cfg(windows)]
+impl efflab_agent_host::KitEventSink for DiscardWindowsSink {
+    fn emit(&self, _event: efflab_agent_host::KitProductEvent) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_unconfigured_capability_prefers_sidecar_unavailable() {
+    use efflab_agent_host::{HostRuntime, KitCommand};
+
+    let root = std::env::temp_dir().join("efflab-agent-host-windows-capability");
+    let runtime = HostRuntime::new(WindowsUnconfiguredApp, DiscardWindowsSink, config(root));
+    let error = runtime
+        .dispatch(KitCommand::GetCapability)
+        .expect_err("Windows 硬化不可用必须优先于无 Channel 返回");
+
+    assert_eq!(error.code, "sidecar_unavailable");
+    assert!(error.retryable, "平台硬化不可用必须可重试");
+}
+
 /// Windows 必须保留 Supervisor、lifecycle 和 kill API 的编译形状，同时 fail-closed。
 #[cfg(windows)]
 #[test]

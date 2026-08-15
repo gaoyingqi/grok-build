@@ -328,3 +328,85 @@ fn replay_unknown_updates_increment_a_count_without_emitting_a_status() {
     assert_eq!(projector.take_replay_skipped_count("session-1"), 1);
     assert_eq!(projector.replay_skipped_count("session-1"), 0);
 }
+
+/// 无法归属到 session 的未知/禁用通知只能计数并安全忽略，不能把整批 ACP 流变成错误。
+#[test]
+fn unattributed_unknown_notifications_are_safe_noops() {
+    let mut projector = Projector::new("scope-1");
+    let notifications = [
+        ("_x.ai/session/update", json!({})),
+        ("session/update", json!({})),
+        (
+            "session/update",
+            json!({ "update": { "sessionUpdate": "future_update" } }),
+        ),
+    ];
+
+    for (method, params) in notifications {
+        let events = apply_acp_notification(&mut projector, method, &params)
+            .expect("无 sessionId 的未知或禁用更新必须安全忽略");
+        assert!(events.is_empty(), "不可归属输入不得伪造 Kit 事件");
+    }
+    assert_eq!(
+        projector.unattributed_skipped_count(),
+        3,
+        "每条无 sessionId 的未知/禁用通知都必须进入可观测计数"
+    );
+}
+
+/// Projector 的调试输出只允许诊断计数，不能回显 assistant、thinking 或工具快照文本。
+#[test]
+fn projector_debug_redacts_projected_text_snapshots() {
+    let mut assistant_projector = Projector::new("scope-1");
+    let _ = apply_acp_notification(
+        &mut assistant_projector,
+        "session/update",
+        &text_notification(
+            "agent_message_chunk",
+            "assistant-debug-secret",
+            json!({ "promptId": "turn-1" }),
+        ),
+    )
+    .expect("assistant 测试通知必须可投影");
+    assert!(
+        !format!("{assistant_projector:?}").contains("assistant-debug-secret"),
+        "Projector Debug 不得回显 assistant 文本"
+    );
+
+    let mut thinking_projector = Projector::new("scope-1");
+    let _ = apply_acp_notification(
+        &mut thinking_projector,
+        "session/update",
+        &text_notification(
+            "agent_thought_chunk",
+            "thinking-debug-secret",
+            json!({ "promptId": "turn-1" }),
+        ),
+    )
+    .expect("thinking 测试通知必须可投影");
+    assert!(
+        !format!("{thinking_projector:?}").contains("thinking-debug-secret"),
+        "Projector Debug 不得回显 thinking 文本"
+    );
+
+    let mut tool_projector = Projector::new("scope-1");
+    let _ = apply_acp_notification(
+        &mut tool_projector,
+        "session/update",
+        &tool_notification(
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tool-1",
+                "title": "tool-name-debug-secret",
+                "content": [{ "type": "text", "text": "tool-detail-debug-secret" }]
+            }),
+            json!({ "promptId": "turn-1" }),
+        ),
+    )
+    .expect("tool 测试通知必须可投影");
+    let debug = format!("{tool_projector:?}");
+    assert!(
+        !debug.contains("tool-name-debug-secret") && !debug.contains("tool-detail-debug-secret"),
+        "Projector Debug 不得回显工具快照文本"
+    );
+}

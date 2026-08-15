@@ -442,6 +442,10 @@ while IFS= read -r line; do
   fi
   case "$line" in
     *'"method":"initialize"'*)
+      if [ "$mode" = "unknown_without_session" ]; then
+        # 无法归属的未来通知不得杀死 actor；它没有 sessionId，不能形成产品事件。
+        /usr/bin/printf '%s\n' '{"jsonrpc":"2.0","method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"future_update"}}}'
+      fi
       /usr/bin/printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
       ;;
     *'"method":"session/new"'*)
@@ -680,6 +684,19 @@ fn launch_handshake_new_session_and_empty_mcp_catalog_are_wired_through_real_std
         "launch-turn",
     );
     harness.wait_for_method("session/prompt");
+}
+
+/// 无 sessionId 的未知 sidecar 通知只能被 actor 安全跳过，后续 initialize/new session 仍必须完成。
+#[test]
+fn actor_continues_after_unattributed_unknown_notification() {
+    let harness = Harness::configured("unknown_without_session", [], Duration::from_secs(60));
+
+    assert_eq!(harness.new_session("scope-a"), "sidecar-session");
+    harness.wait_for_method("session/new");
+    assert!(
+        harness.events().is_empty(),
+        "无法归属的未知通知不得伪造产品事件或中断初始化"
+    );
 }
 
 /// TC-SEND / TC-TURN：prompt 写入后必须立即回执，同时同 session 只允许一个 in-flight turn。

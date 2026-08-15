@@ -32,6 +32,7 @@ enum Rejection {
     UnknownNestedField,
     InvalidFieldType,
     MissingRequiredField,
+    UnsupportedProtocolVersion,
     TerminalCapabilityEnabled,
     FsCapabilityEnabled,
     ModelIdNotAllowed,
@@ -125,6 +126,9 @@ fn rejection_matches(actual: &HostRejection, expected: &Rejection) -> bool {
         Rejection::InvalidFieldType => matches!(actual, HostRejection::InvalidFieldType { .. }),
         Rejection::MissingRequiredField => {
             matches!(actual, HostRejection::MissingRequiredField { .. })
+        }
+        Rejection::UnsupportedProtocolVersion => {
+            matches!(actual, HostRejection::UnsupportedProtocolVersion { .. })
         }
         Rejection::TerminalCapabilityEnabled => {
             matches!(actual, HostRejection::TerminalCapabilityEnabled(..))

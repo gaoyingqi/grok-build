@@ -5,7 +5,7 @@
 //! 下游断开会 drop 上游流而不是继续缓冲。
 
 use std::fmt;
-use std::future::IntoFuture;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -29,10 +29,14 @@ use crate::llm_channel::{LlmChannelError, LlmChannelManager, is_loopback_ip};
 
 /// 入站 Chat Completions 请求的硬上限；超过时在任何上游访问前返回 413。
 pub const MAX_L3B_REQUEST_BODY_BYTES: usize = 1_048_576;
+/// 每次异步上游 DNS 解析的独立 deadline；超时不允许进入 HTTP client 构造。
+const ASYNC_DNS_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 仅可监听的精确 IPv4/IPv6 loopback 地址。
 const IPV4_LOOPBACK: Ipv4Addr = Ipv4Addr::LOCALHOST;
 const IPV6_LOOPBACK: Ipv6Addr = Ipv6Addr::LOCALHOST;
+/// 进程级 L3b binding registry 的固定 slot 数；满载时必须拒绝新 sidecar 身份。
+pub const MAX_BINDING_RECORDS: usize = 64;
 
 /// 注册 binding token 后绑定的不可伪造身份上下文。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,19 +92,34 @@ struct BindingRecord {
     active: bool,
 }
 
+impl BindingRecord {
+    /// 空 slot 保留固定宽度 token/context，占位记录也会参与授权时的完整扫描。
+    fn vacant() -> Self {
+        Self {
+            token: BindingToken([0; 32]),
+            context: BindingContext {
+                scope_id: String::new(),
+                generation: 0,
+                channel_revision: 0,
+            },
+            active: false,
+        }
+    }
+}
+
 /// 进程级 binding token 注册表。
 ///
-/// 即使逻辑上是 token → context 映射，验证时仍线性扫描全部记录并使用常量时间比较，
-/// 避免把 bearer 命中与否泄露为普通哈希查找时间差。
+/// tombstone 固定保留在预分配 slot 中，新注册优先复用 inactive 记录；授权始终遍历
+/// 全部固定容量并执行常量时间 token 比较，避免历史轮换造成内存或比较时间随次数增长。
 pub struct BindingTokenRegistry {
-    records: Mutex<Vec<BindingRecord>>,
+    records: Mutex<[BindingRecord; MAX_BINDING_RECORDS]>,
 }
 
 impl Default for BindingTokenRegistry {
     /// 新进程无任何可信 sidecar，所有请求默认拒绝。
     fn default() -> Self {
         Self {
-            records: Mutex::new(Vec::new()),
+            records: Mutex::new(std::array::from_fn(|_| BindingRecord::vacant())),
         }
     }
 }
@@ -124,14 +143,21 @@ impl BindingTokenRegistry {
             generation,
             channel_revision,
         };
-        self.records
+        let mut records = self
+            .records
             .lock()
-            .map_err(|_| L3bLoopbackError::RegistryUnavailable)?
-            .push(BindingRecord {
-                token: token.clone(),
-                context: context.clone(),
-                active: true,
-            });
+            .map_err(|_| L3bLoopbackError::RegistryUnavailable)?;
+        let slot = records
+            .iter_mut()
+            .find(|record| !record.active)
+            .ok_or(L3bLoopbackError::RegistryCapacityExhausted)?;
+        // inactive tombstone 被原位覆盖；registry 容量与 authorize 扫描宽度始终固定。
+        *slot = BindingRecord {
+            token: token.clone(),
+            context: context.clone(),
+            active: true,
+        };
+        drop(records);
         tracing::debug!(
             token_fingerprint = %fingerprint,
             scope = %context.scope_id,
@@ -239,6 +265,8 @@ pub enum L3bLoopbackError {
     InvalidBindingContext,
     /// registry 锁不可用。
     RegistryUnavailable,
+    /// 所有固定 slot 仍由活动 sidecar 占用，不能无界追加 token 历史。
+    RegistryCapacityExhausted,
 }
 
 impl fmt::Display for L3bLoopbackError {
@@ -253,6 +281,7 @@ impl fmt::Display for L3bLoopbackError {
             Self::RandomnessUnavailable => "无法生成 L3b binding token",
             Self::InvalidBindingContext => "L3b binding 上下文无效",
             Self::RegistryUnavailable => "L3b binding 注册表不可用",
+            Self::RegistryCapacityExhausted => "L3b binding 注册表容量已满",
         };
         formatter.write_str(text)
     }
@@ -522,6 +551,30 @@ struct VerifiedUpstream {
     address: SocketAddr,
 }
 
+/// 为异步 DNS future 施加独立 deadline；超时或 resolver 错误均不允许继续出站。
+async fn resolve_dns_with_deadline<F>(
+    deadline: Duration,
+    resolution: F,
+) -> Result<Vec<SocketAddr>, ()>
+where
+    F: Future<Output = std::io::Result<Vec<SocketAddr>>>,
+{
+    tokio::time::timeout(deadline, resolution)
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
+}
+
+/// 使用系统 async resolver 解析所有 A/AAAA，并在 HTTP client 构造前完成 timeout 边界。
+async fn resolve_upstream_dns(host: &str, port: u16) -> Result<Vec<SocketAddr>, ()> {
+    resolve_dns_with_deadline(ASYNC_DNS_RESOLUTION_TIMEOUT, async {
+        tokio::net::lookup_host((host, port))
+            .await
+            .map(|addresses| addresses.collect())
+    })
+    .await
+}
+
 /// 每次新出站请求都重新解析/验证所有 A 与 AAAA，并把连接钉在本次验证出的地址。
 async fn verify_upstream(base_url: &str, allow_loopback_llm: bool) -> Result<VerifiedUpstream, ()> {
     let mut chat_completions_url = Url::parse(base_url).map_err(|_| ())?;
@@ -561,10 +614,7 @@ async fn verify_upstream(base_url: &str, allow_loopback_llm: bool) -> Result<Ver
     let addresses: Vec<SocketAddr> = match chat_completions_url.host().ok_or(())? {
         url::Host::Ipv4(address) => vec![SocketAddr::new(IpAddr::V4(address), port)],
         url::Host::Ipv6(address) => vec![SocketAddr::new(IpAddr::V6(address), port)],
-        url::Host::Domain(host) => tokio::net::lookup_host((host, port))
-            .await
-            .map_err(|_| ())?
-            .collect(),
+        url::Host::Domain(host) => resolve_upstream_dns(host, port).await?,
     };
     if addresses.is_empty()
         || addresses
@@ -666,9 +716,79 @@ fn status_response(status: StatusCode) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+    use std::time::Duration;
 
-    use super::{is_allowed_upstream_ip, verify_upstream};
+    use super::{
+        BindingTokenRegistry, MAX_BINDING_RECORDS, is_allowed_upstream_ip,
+        resolve_dns_with_deadline, verify_upstream,
+    };
+
+    /// binding registry 的 tombstone 必须在固定容量内回收，不能随 Channel/sidecar 轮换增长。
+    #[test]
+    fn binding_registry_recycles_tombstones_with_fixed_capacity() {
+        let registry = BindingTokenRegistry::default();
+
+        for generation in 1..=MAX_BINDING_RECORDS as u64 {
+            let token = registry
+                .register(format!("active-scope-{generation}"), generation, 1)
+                .expect("固定容量以内的 active binding 必须可注册");
+            let context = registry
+                .authorize(&token.as_bearer())
+                .expect("刚注册的 active binding 必须可认证");
+            assert_eq!(context.generation, generation);
+        }
+        assert!(
+            registry
+                .register("overflow-scope", MAX_BINDING_RECORDS as u64 + 1, 1)
+                .is_err(),
+            "所有 slot active 时新 binding 必须 fail-closed"
+        );
+
+        assert_eq!(
+            registry.invalidate_all(),
+            MAX_BINDING_RECORDS,
+            "所有 active token 必须可一次性失效"
+        );
+        for generation in 1..=(MAX_BINDING_RECORDS as u64 * 3) {
+            let token = registry
+                .register("rotating-scope", generation, 2)
+                .expect("失效 tombstone 必须被复用而非追加新记录");
+            let bearer = token.as_bearer();
+            let context = registry
+                .authorize(&bearer)
+                .expect("轮换后的当前 binding 必须可认证");
+            assert_eq!(context.generation, generation);
+            assert_eq!(
+                registry.invalidate_generation("rotating-scope", generation),
+                1
+            );
+            assert!(
+                registry.authorize(&bearer).is_none(),
+                "失效 token 不得因 slot 复用而重新被授权"
+            );
+        }
+
+        assert_eq!(
+            registry
+                .records
+                .lock()
+                .expect("测试 registry 锁必须可用")
+                .len(),
+            MAX_BINDING_RECORDS,
+            "轮换次数不得增加 registry 的固定 slot 数"
+        );
+    }
+
+    /// 每次上游 DNS 解析都必须拥有独立 deadline；超时不能进入 reqwest 连接路径。
+    #[tokio::test]
+    async fn upstream_dns_timeout_fails_closed() {
+        let resolution = std::future::pending::<std::io::Result<Vec<SocketAddr>>>();
+        assert_eq!(
+            resolve_dns_with_deadline(Duration::from_millis(1), resolution).await,
+            Err(())
+        );
+    }
 
     /// IPv4-compatible 与 IPv4-mapped IPv6 必须递归接受 IPv4 SSRF 策略审查。
     #[test]

@@ -18,6 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use efflab_agent_contract::{SidecarModelSpec, render_authoritative_config};
+use xai_tty_utils::{ProcessGroup, ProcessScope, detach_std_command};
 
 use crate::HostRuntimeConfig;
 use crate::llm_channel::LlmChannelManager;
@@ -213,6 +214,8 @@ pub struct ProcessSlotMetadata {
 /// 已启动 child 与其 binding token 的私有所有权；不向外暴露 token 或 stdio。
 struct ManagedSidecar {
     child: Child,
+    /// 强引用维持受验证的 process group/job；`ProcessScope` 仅保存 Weak 用于崩溃兜底回收。
+    process_group: Arc<ProcessGroup>,
     /// registry 保留 token 本体；child 所有权只保留失效所需的 registry 与 generation。
     registry: Arc<BindingTokenRegistry>,
     /// 用于在不抢占 metadata 锁的情况下立即撤销本代 token。
@@ -278,12 +281,15 @@ fn terminate_and_reap_detached_process(mut process: ManagedSidecar) {
         .registry
         .invalidate_generation(&process.scope_id, process.generation);
     let _ = process.child.stdin.take();
+    // 先杀完整 process group/job，再回收 leader；避免 sidecar 的孙进程继承 stdout 或存活。
+    let group_kill_result = process.process_group.kill();
     let kill_result = process.child.kill();
     let wait_result = process.child.wait();
-    if kill_result.is_err() || wait_result.is_err() {
+    if group_kill_result.is_err() || kill_result.is_err() || wait_result.is_err() {
         tracing::debug!(
             scope = %process.scope_id,
             generation = process.generation,
+            process_group_kill_succeeded = group_kill_result.is_ok(),
             kill_succeeded = kill_result.is_ok(),
             wait_succeeded = wait_result.is_ok(),
             "未挂接 sidecar 的强制回收出现系统错误"
@@ -343,6 +349,8 @@ pub struct Supervisor {
     config: HostRuntimeConfig,
     app_id: String,
     slots: Mutex<BTreeMap<String, Arc<ScopeSlot>>>,
+    /// 每个已启动 sidecar tree 都在此登记；Supervisor 释放时可统一回收未完成的子树。
+    process_scope: ProcessScope,
 }
 
 impl Supervisor {
@@ -358,6 +366,7 @@ impl Supervisor {
             config,
             app_id,
             slots: Mutex::new(BTreeMap::new()),
+            process_scope: ProcessScope::new(),
         })
     }
 
@@ -567,15 +576,13 @@ impl Supervisor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         environment.apply(&mut command);
-        let child = command.spawn().map_err(|source| SupervisorError::Io {
-            operation: "spawn",
-            source,
-        })?;
+        let (child, process_group) = spawn_enrolled_sidecar(&mut command, &self.process_scope)?;
         let pid = child.id();
         // 在 slot 挂接前始终由 guard 独占 child；complete_slot_launch 任何失败均会触发
         // 同步 token 撤销、kill 与 wait，不能把已启动进程遗留为无监督 child。
         let mut child_guard = SpawnedSidecarGuard::new(ManagedSidecar {
             child,
+            process_group,
             registry,
             scope_id: scope_id.to_string(),
             generation,
@@ -646,9 +653,63 @@ impl Supervisor {
     }
 }
 
+/// 用标准库 child 建立受控 process tree，并立即纳入 [`ProcessScope`] 的关闭边界。
+///
+/// `AcpRuntime` 需要同步 `std::process` 管道，不能直接使用 `ProcessScope::spawn` 的
+/// Tokio child。因此唯一的 raw `Command::spawn` 被局限在这里：spawn 前创建独立
+/// process group/job，spawn 后立刻把 group 注册到 scope。没有采用 Linux pdeathsig，
+/// 因为它绑定的是任意产品 dispatch 线程而非整个 Host 进程；正常关闭由 scope/group
+/// 完成，父进程异常退出则会关闭 stdio，sidecar 必须按 ACP EOF 退出。
+fn spawn_enrolled_sidecar(
+    command: &mut Command,
+    process_scope: &ProcessScope,
+) -> Result<(Child, Arc<ProcessGroup>), SupervisorError> {
+    // Unix `setsid` / Windows CREATE_NO_WINDOW 令 ProcessGroup 只覆盖这棵 sidecar tree。
+    detach_std_command(command);
+    #[allow(clippy::disallowed_methods)]
+    // 这是 std child 到 ProcessScope 的受控桥接；下一步必定 attach_std + register，
+    // 所以 child 不会以未登记状态离开本函数。
+    let mut child = command.spawn().map_err(|source| SupervisorError::Io {
+        operation: "spawn",
+        source,
+    })?;
+
+    let process_group = match ProcessGroup::new().and_then(|mut group| {
+        group.attach_std(&child)?;
+        Ok(Arc::new(group))
+    }) {
+        Ok(group) => group,
+        Err(source) => {
+            // group enrollment 失败后不可让刚启动的 child 脱离监督。
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(SupervisorError::Io {
+                operation: "绑定 sidecar 进程组",
+                source,
+            });
+        }
+    };
+
+    if !process_scope.register(&process_group) {
+        // closed scope 已对 group 发出 kill；仍要 wait leader，避免留下 zombie。
+        let _ = process_group.kill();
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(SupervisorError::Io {
+            operation: "注册 sidecar 进程作用域",
+            source: io::Error::other("process scope already closed"),
+        });
+    }
+
+    Ok((child, process_group))
+}
+
 impl Drop for Supervisor {
     /// Host 释放时回收仍由本进程持有的 child，避免遗留获得过 binding token 的 sidecar。
     fn drop(&mut self) {
+        // 析构路径不应在每个 scope 的 EOF 宽限期中拖延；先由 scope 杀掉完整子树，
+        // 后续 stop 只负责撤销 token、回收 leader 与整理 metadata。
+        self.process_scope.kill_all();
         let slots = self
             .slots
             .lock()
@@ -904,6 +965,15 @@ fn stop_slot_with_kill(
             // kill 失败时绝不能丢 child；保留所有权和 restart_blocked，等待后续显式恢复。
             restore_stopping_process(slot, process);
             return Err(error);
+        }
+        // leader 已收到 kill 但尚未 wait/reap，pgid 仍不可复用；此时再杀完整 tree。
+        if let Err(source) = process.process_group.kill() {
+            tracing::debug!(
+                scope = %process.scope_id,
+                generation = process.generation,
+                error = %source,
+                "sidecar leader 已终止，但 process group 清理失败"
+            );
         }
         if let Err(source) = process.child.wait() {
             let error = SupervisorError::Io {
@@ -1345,14 +1415,16 @@ fn finish_lifecycle(first_error: Option<SupervisorError>) -> Result<(), Supervis
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::io;
-    use std::process::{Command, Stdio};
+    use std::io::{self, BufRead, BufReader};
+    use std::process::{Child, Command, Stdio};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use super::{
-        BindingTokenRegistry, ManagedSidecar, ProcessSlotMetadata, ProcessSlotState, ScopePaths,
-        ScopeSlot, ScopeSlotRuntime, SpawnedSidecarGuard, SupervisorError, prepare_slot_launch,
-        stop_slot_with_kill,
+        BindingTokenRegistry, ManagedSidecar, ProcessGroup, ProcessScope, ProcessSlotMetadata,
+        ProcessSlotState, ScopePaths, ScopeSlot, ScopeSlotRuntime, SpawnedSidecarGuard,
+        SupervisorError, prepare_slot_launch, spawn_enrolled_sidecar, stop_slot_with_kill,
+        terminate_and_reap_detached_process,
     };
 
     /// 构造仅用于生命周期失败路径的内存 scope slot，不接入 Task 7b 的 ACP actor。
@@ -1384,24 +1456,38 @@ mod tests {
         })
     }
 
+    /// 把测试 child 放入独立 group，令生命周期断言能观测 leader 与孙进程一并回收。
+    fn detached_test_child(command: &mut Command) -> (Child, Arc<ProcessGroup>) {
+        xai_tty_utils::detach_std_command(command);
+        #[allow(clippy::disallowed_methods)]
+        // 测试 fixture：立即 attach 到 ProcessGroup，测试结束由受测生命周期函数回收。
+        let child = command.spawn().expect("测试 sidecar 必须可启动");
+        let mut process_group = ProcessGroup::new().expect("测试 process group 必须创建成功");
+        process_group
+            .attach_std(&child)
+            .expect("测试 child 必须能加入 process group");
+        (child, Arc::new(process_group))
+    }
+
     /// 创建不读取 stdin 的测试 sidecar，以便稳定覆盖 kill 失败时的保留所有权分支。
     fn long_running_process() -> (ManagedSidecar, String, u32) {
         let registry = Arc::new(BindingTokenRegistry::default());
         let token = registry
             .register("scope-test", 1, 1)
             .expect("测试 binding 必须可注册");
-        let child = Command::new("sh")
+        let mut command = Command::new("sh");
+        command
             .arg("-c")
             .arg("while :; do sleep 1; done")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("测试 sidecar 必须可启动");
+            .stderr(Stdio::null());
+        let (child, process_group) = detached_test_child(&mut command);
         let pid = child.id();
         (
             ManagedSidecar {
                 child,
+                process_group,
                 registry,
                 scope_id: "scope-test".to_string(),
                 generation: 1,
@@ -1419,10 +1505,7 @@ mod tests {
         let slot = test_slot(Some(process), Some(pid), false);
 
         let error = stop_slot_with_kill(&slot, std::time::Duration::ZERO, |_child| {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                "injected kill failure",
-            ))
+            Err(io::Error::other("injected kill failure"))
         })
         .expect_err("注入 kill 失败必须向上报告");
         assert!(matches!(
@@ -1461,6 +1544,7 @@ mod tests {
             .child
             .take()
             .expect("失败路径必须保留 child");
+        let _ = process.process_group.kill();
         let _ = process.child.kill();
         let _ = process.child.wait();
     }
@@ -1491,5 +1575,79 @@ mod tests {
             Some(libc::ESRCH),
             "挂接失败 child 的 pid 必须不可再被信号探测"
         );
+    }
+
+    /// sidecar 退出清理必须杀掉同一 detached process group 中的孙进程，不能只回收 leader。
+    #[test]
+    fn detached_cleanup_reaps_process_group_descendants() {
+        let registry = Arc::new(BindingTokenRegistry::default());
+        let _token = registry
+            .register("scope-tree", 1, 1)
+            .expect("测试 binding 必须可注册");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 60 & printf '%s\\n' \"$!\"; wait")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let (mut child, process_group) = detached_test_child(&mut command);
+        let stdout = child.stdout.take().expect("测试 sidecar 必须有 stdout");
+        let mut descendant_pid = String::new();
+        BufReader::new(stdout)
+            .read_line(&mut descendant_pid)
+            .expect("测试 sidecar 必须报告孙进程 pid");
+        let descendant_pid = descendant_pid
+            .trim()
+            .parse::<libc::pid_t>()
+            .expect("孙进程 pid 必须是整数");
+        let process = ManagedSidecar {
+            child,
+            process_group,
+            registry,
+            scope_id: "scope-tree".to_string(),
+            generation: 1,
+        };
+
+        terminate_and_reap_detached_process(process);
+        // `killpg` 已发信号后，孙进程可能短暂保持 zombie，交由 init 回收才会呈现 ESRCH。
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut descendant_survived = unsafe { libc::kill(descendant_pid, 0) } == 0;
+        while descendant_survived && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            descendant_survived = unsafe { libc::kill(descendant_pid, 0) } == 0;
+        }
+        if descendant_survived {
+            // 失败路径也必须回收故意制造的孙进程，不能污染后续测试进程表。
+            unsafe { libc::kill(descendant_pid, libc::SIGKILL) };
+        }
+        assert!(
+            !descendant_survived,
+            "sidecar leader 已回收后，孙进程不得继续存活"
+        );
+    }
+
+    /// std child 必须在 spawn 后立即登记到 ProcessScope，scope 关闭时可回收完整 tree。
+    #[test]
+    fn std_sidecar_spawn_enrolls_process_scope() {
+        let process_scope = ProcessScope::new();
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("while :; do sleep 1; done")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let (mut child, _process_group) = spawn_enrolled_sidecar(&mut command, &process_scope)
+            .expect("std sidecar 必须成功登记到 process scope");
+        assert_eq!(
+            process_scope.live_count(),
+            1,
+            "spawn 返回前必须已有一个可由 scope 回收的 process group"
+        );
+
+        process_scope.kill_all();
+        child.wait().expect("scope 关闭后必须回收 sidecar leader");
     }
 }

@@ -11,6 +11,50 @@
     "expect": "allow"
   },
   {
+    "name": "initialize rejects missing protocolVersion",
+    "method": "initialize",
+    "params": {
+      "capabilities": { "terminal": false, "fs": false },
+      "client": { "mcpServers": [] }
+    },
+    "expect": "reject",
+    "rejection": "MissingRequiredField"
+  },
+  {
+    "name": "initialize rejects non-integer protocolVersion",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": "1",
+      "capabilities": { "terminal": false, "fs": false },
+      "client": { "mcpServers": [] }
+    },
+    "expect": "reject",
+    "rejection": "InvalidFieldType"
+  },
+  {
+    "name": "initialize rejects unsupported protocolVersion",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 2,
+      "capabilities": { "terminal": false, "fs": false },
+      "client": { "mcpServers": [] }
+    },
+    "expect": "reject",
+    "rejection": "UnsupportedProtocolVersion"
+  },
+  {
+    "name": "initialize rejects authentication injection",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "capabilities": { "terminal": false, "fs": false },
+      "client": { "mcpServers": [] },
+      "authentication": {}
+    },
+    "expect": "reject",
+    "rejection": "UnknownField"
+  },
+  {
     "name": "initialize terminal capability",
     "method": "initialize",
     "params": {
@@ -91,6 +135,7 @@
     "name": "initialize unknown meta key",
     "method": "initialize",
     "params": {
+      "protocolVersion": 1,
       "capabilities": { "terminal": false, "fs": false },
       "client": { "mcpServers": [] },
       "_meta": { "sneaky": 1 }

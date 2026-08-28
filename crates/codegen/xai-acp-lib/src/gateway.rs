@@ -188,6 +188,9 @@ impl<C: acp::Agent + 'static> AcpGatewayReceiver<acp::ClientSide, C> {
                 AcpAgentMessage::LoadSession(args) => {
                     handle!(args, self.tracing, conn, load_session, spawn, on_meta);
                 }
+                AcpAgentMessage::ListSessions(args) => {
+                    handle!(args, self.tracing, conn, list_sessions, spawn, on_meta);
+                }
                 AcpAgentMessage::SetSessionMode(args) => {
                     handle!(args, self.tracing, conn, set_session_mode, spawn, on_meta);
                 }
@@ -497,6 +500,13 @@ impl acp::Agent for AcpGatewaySender<acp::ClientSide> {
         self.forward(args).await
     }
 
+    async fn list_sessions(
+        &self,
+        args: acp::ListSessionsRequest,
+    ) -> AcpResult<acp::ListSessionsResponse> {
+        self.forward(args).await
+    }
+
     async fn set_session_mode(
         &self,
         args: acp::SetSessionModeRequest,
@@ -558,6 +568,66 @@ mod tests {
                 acp::TextContent::new(marker),
             ))),
         )
+    }
+
+    struct ListSessionsAgent;
+
+    #[async_trait::async_trait(?Send)]
+    impl acp::Agent for ListSessionsAgent {
+        async fn initialize(
+            &self,
+            _args: acp::InitializeRequest,
+        ) -> acp::Result<acp::InitializeResponse> {
+            unimplemented!()
+        }
+
+        async fn authenticate(
+            &self,
+            _args: acp::AuthenticateRequest,
+        ) -> acp::Result<acp::AuthenticateResponse> {
+            unimplemented!()
+        }
+
+        async fn new_session(
+            &self,
+            _args: acp::NewSessionRequest,
+        ) -> acp::Result<acp::NewSessionResponse> {
+            unimplemented!()
+        }
+
+        async fn prompt(&self, _args: acp::PromptRequest) -> acp::Result<acp::PromptResponse> {
+            unimplemented!()
+        }
+
+        async fn cancel(&self, _args: acp::CancelNotification) -> acp::Result<()> {
+            unimplemented!()
+        }
+
+        // 用最小 Agent 返回值确认 ClientSide gateway 转发了标准方法。
+        async fn list_sessions(
+            &self,
+            _args: acp::ListSessionsRequest,
+        ) -> acp::Result<acp::ListSessionsResponse> {
+            Ok(acp::ListSessionsResponse::new(Vec::new()))
+        }
+    }
+
+    /// 回归测试：ClientSide gateway 转发标准 session/list 请求。
+    #[tokio::test]
+    async fn client_side_gateway_forwards_list_sessions() {
+        use acp::Agent as _;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (sender, receiver) = acp_gateway::<acp::ClientSide, _>(ListSessionsAgent);
+                tokio::task::spawn_local(receiver.run());
+
+                let response = sender.list_sessions(acp::ListSessionsRequest::new()).await;
+                let response = response.expect("list_sessions response");
+                assert!(response.sessions.is_empty());
+            })
+            .await;
     }
 
     /// Regression: draining completion receivers preserves notification ordering.

@@ -3010,6 +3010,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "efflab-pr0-http-probe"
+version = "0.1.0"
+dependencies = [
+ "reqwest 0.13.4",
+ "rmcp",
+]
+
+[[package]]
 name = "ego-tree"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

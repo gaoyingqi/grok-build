@@ -1,0 +1,16 @@
+[package]
+name = "efflab-pr0-http-probe"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+rmcp = { version = "2.1", default-features = false, features = [
+  "client",
+  "transport-async-rw",
+  "transport-streamable-http-client-reqwest",
+] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
+
+[lints]
+workspace = true

@@ -24,6 +24,7 @@ MEMBERS=(
   "crates/efflab/efflab-agent-contract"
   "crates/efflab/efflab-agent-host"
   "crates/efflab/efflab-agent-sidecar"
+  "crates/efflab/efflab-pr0-http-probe"
 )
 FORK_BASE_REV_FILE="$ROOT/FORK_BASE_REV"
 

@@ -85,6 +85,7 @@ members = [
     "crates/efflab/efflab-agent-contract",
     "crates/efflab/efflab-agent-host",
     "crates/efflab/efflab-agent-sidecar",
+    "crates/efflab/efflab-pr0-http-probe",
     "prod/mc/cli-chat-proxy-types",
     "third_party/dagre_rust",
     "third_party/graphlib_rust",

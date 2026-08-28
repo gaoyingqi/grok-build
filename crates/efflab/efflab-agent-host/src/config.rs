@@ -4,14 +4,14 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// 进程级 L3b 回环监听与上游 SSRF 策略配置。
+/// 进程级 L3b 回环监听与用户上游连接配置。
 #[derive(Debug, Clone)]
 pub struct L3bRuntimeConfig {
     /// 只允许 IPv4 `127.0.0.1` 或 IPv6 `::1`；禁止公开或任意地址监听。
     pub bind_addr: IpAddr,
     /// `0` 表示让操作系统分配进程级 ephemeral port。
     pub port: u16,
-    /// 是否显式允许用户上游指向回环地址；默认关闭，其它私网仍一律拒绝。
+    /// 兼容性开关；不限制用户填写的上游 URL。
     pub allow_loopback_llm: bool,
 }
 
@@ -37,6 +37,6 @@ pub struct HostRuntimeConfig {
     pub mcp_exec_root: PathBuf,
     /// 空闲回收阈值；Task 7b 才会接入完整 idle 状态机。
     pub idle_after: Duration,
-    /// L3b 回环监听与 SSRF 策略；默认拒绝上游回环地址。
+    /// L3b 回环监听与用户上游连接配置。
     pub l3b: L3bRuntimeConfig,
 }

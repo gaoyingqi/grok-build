@@ -14,7 +14,7 @@ use url::Url;
 
 use crate::app_port::{HostApp, LlmChannelConfig, LlmSecretSlot, SealedSecret, SecretGuard};
 use crate::config::{HostRuntimeConfig, L3bRuntimeConfig};
-use crate::llm_loopback::{L3bLoopback, embedded_ipv4_address, is_allowed_upstream_ip};
+use crate::llm_loopback::{L3bLoopback, embedded_ipv4_address};
 use crate::protocol::{KitError, LlmChannelKind, LlmChannelView};
 use crate::supervisor::{
     ScopePaths, SidecarProcessInfo, SidecarStdio, Supervisor, SupervisorError,
@@ -91,7 +91,7 @@ pub(crate) struct LaunchedScope {
 pub enum LlmChannelError {
     /// 还没有可用 BYOK Channel。
     Unconfigured,
-    /// 请求缺字段、字段冲突或 URL 基础语法不安全。
+    /// 请求缺字段、字段冲突或 URL 基础语法错误。
     InvalidRequest,
     /// M1 仍没有 Relay 出站实现。
     RelayNotImplemented,
@@ -119,7 +119,7 @@ impl LlmChannelError {
                 KitError::non_retryable("llm_channel_unconfigured", "尚未配置可用的大模型通道")
             }
             Self::InvalidRequest => {
-                KitError::non_retryable("invalid_request", "LLM Channel 请求不完整或不符合安全策略")
+                KitError::non_retryable("invalid_request", "LLM Channel 请求不完整")
             }
             Self::RelayNotImplemented => {
                 KitError::non_retryable("unsupported", "Relay Channel 尚未实现")
@@ -179,7 +179,7 @@ pub(crate) struct ResolvedUpstream {
 struct ChannelState {
     config: LlmChannelConfig,
     revision: u64,
-    /// 遗留 DNS 配置在本次启动完成全量地址审查前不得拉起 L3b/sidecar。
+    /// 当前配置是否已经通过启动所需的 URL 语法校验。
     launch_ready: bool,
 }
 
@@ -191,7 +191,7 @@ pub struct LlmChannelManager {
     operation_lock: Mutex<()>,
     /// 当前 committed view；绝不存放解封后的明文。
     state: Mutex<ChannelState>,
-    /// 仅控制设置时是否允许 HTTP loopback 上游；默认 false。
+    /// 遗留运行参数；用户填写的 BYOK URL 保存/加载不读取此开关。
     allow_loopback_llm: bool,
 }
 
@@ -246,10 +246,7 @@ impl LlmChannelManager {
         Ok(state.launch_ready && matches!(state.config, LlmChannelConfig::Byok { .. }))
     }
 
-    /// 在 L3b 绑定端口或 sidecar spawn 前完成已加载配置的全量地址审查。
-    ///
-    /// 域名配置加载时只保留非敏感 view，不能直接认为可运行；本入口串行化 DNS 审查并在
-    /// 成功后才把它标记为可启动。Set 成功的新候选已审查过，重复调用仍会复核地址。
+    /// 在 L3b 绑定端口或 sidecar spawn 前复核已加载配置的 URL 语法。
     pub(crate) fn ensure_startable(&self) -> Result<(), LlmChannelError> {
         let _operation = self
             .operation_lock
@@ -396,7 +393,7 @@ impl LlmChannelManager {
             .map_err(|_| LlmChannelError::StateUnavailable)?;
         state.revision = state.revision.saturating_add(1).max(1);
         state.config = next;
-        // 新候选在 seal 后已完成全量地址审查；提交成功后可立即作为当前进程的启动配置。
+        // 新候选已完成 URL 形状校验；提交成功后可立即作为当前进程的启动配置。
         state.launch_ready = true;
         let change = ChannelChange {
             changed: true,
@@ -435,7 +432,7 @@ impl LlmChannelManager {
         }
         let base_url = base_url.ok_or(LlmChannelError::InvalidRequest)?;
         let model_id = model_id.ok_or(LlmChannelError::InvalidRequest)?;
-        // URL/model 形状检查不触发 DNS；通过后立即把明文限制在此局部作用域交给产品密封端口。
+        // URL/model 形状检查不触发网络访问；通过后立即把明文限制在此局部作用域交给产品密封端口。
         validate_byok_identity_shape(&base_url, &model_id, self.allow_loopback_llm)?;
         let api_key = {
             let plain_api_key = api_key.ok_or(LlmChannelError::InvalidRequest)?;
@@ -448,7 +445,7 @@ impl LlmChannelManager {
             model_id,
             api_key,
         };
-        // 只用已密封候选继续可能阻塞的 DNS/IP 审查；失败时不会触及持久化配置。
+        // 只用已密封候选复核 URL 形状；失败时不会触及持久化配置。
         validate_byok_candidate_addresses(&candidate, self.allow_loopback_llm)?;
         Ok(candidate)
     }
@@ -555,10 +552,9 @@ fn non_empty_preserved(value: Option<String>) -> Option<String> {
     value.and_then(|value| (!value.trim().is_empty()).then_some(value))
 }
 
-/// 对持久化配置做不解封的 fail-closed 加载审查，返回它是否已可启动。
+/// 对持久化配置做不解封的加载审查，返回它是否已可启动。
 ///
-/// URL 形状错误和可立即判定的危险 IP literal 直接拒绝；DNS hostname 保留给设置页读取，
-/// 但先标为不可启动，直到 L3b/sidecar 启动前的全量地址审查成功。
+/// 用户填写的 BYOK URL 不是保存/加载阶段的 SSRF 目标；这里只保留 URL 与模型语法校验。
 fn validate_loaded_config(
     config: &LlmChannelConfig,
     allow_loopback_llm: bool,
@@ -569,46 +565,24 @@ fn validate_loaded_config(
             base_url, model_id, ..
         } => {
             validate_byok_identity_shape(base_url, model_id, allow_loopback_llm)?;
-            let parsed = validate_byok_url_shape(base_url, allow_loopback_llm)?;
-            match parsed.host().ok_or(LlmChannelError::InvalidRequest)? {
-                // IP literal 无须等待 DNS；加载阶段就按与请求相同的 SSRF 分类直接 fail-closed。
-                url::Host::Ipv4(address) => {
-                    is_allowed_upstream_ip(IpAddr::V4(address), allow_loopback_llm)
-                        .then_some(true)
-                        .ok_or(LlmChannelError::InvalidRequest)
-                }
-                url::Host::Ipv6(address) => {
-                    is_allowed_upstream_ip(IpAddr::V6(address), allow_loopback_llm)
-                        .then_some(true)
-                        .ok_or(LlmChannelError::InvalidRequest)
-                }
-                // 域名的 A/AAAA 结果不能仅凭 URL 形状信任；不启动，直到 ensure_startable 复核。
-                url::Host::Domain(_) => Ok(false),
-            }
+            Ok(true)
         }
         LlmChannelConfig::Relay { enabled: true, .. } => Err(LlmChannelError::RelayNotImplemented),
         LlmChannelConfig::Relay { enabled: false, .. } => Ok(false),
     }
 }
 
-/// 先校验不会写入 view 或日志的 BYOK URL 形状；只允许 HTTPS，开发开关下才可用精确
-/// IP loopback 的 HTTP。地址解析与全量 IP 审查由已密封候选和每次出站路径执行。
+/// 只校验不会解封 Key 的 BYOK URL 形状；用户代理可使用任意带 host 的 HTTP 或 HTTPS URL。
 fn validate_byok_url_shape(
     base_url: &str,
-    allow_loopback_llm: bool,
+    _allow_loopback_llm: bool,
 ) -> Result<Url, LlmChannelError> {
     let parsed = Url::parse(base_url).map_err(|_| LlmChannelError::InvalidRequest)?;
-    if parsed.host_str().is_none()
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
+    if parsed.host_str().is_none() {
         return Err(LlmChannelError::InvalidRequest);
     }
     match parsed.scheme() {
-        "https" => Ok(parsed),
-        "http" if allow_loopback_llm && parsed.host().is_some_and(is_loopback_host) => Ok(parsed),
+        "http" | "https" => Ok(parsed),
         _ => Err(LlmChannelError::InvalidRequest),
     }
 }
@@ -740,7 +714,7 @@ fn resolve_dns_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>, ()> {
         .resolve(host, port, SYNC_DNS_RESOLUTION_TIMEOUT)
 }
 
-/// 对已密封候选执行全量 DNS/IP 审查；失败时该候选不得持久化或作为启动配置使用。
+/// 只对已密封候选复核 URL/model 形状；保存路径不执行 DNS 或 IP 分类审查。
 fn validate_byok_candidate_addresses(
     candidate: &LlmChannelConfig,
     allow_loopback_llm: bool,
@@ -752,11 +726,11 @@ fn validate_byok_candidate_addresses(
     )
 }
 
-/// 将同步 resolver 注入候选审查；生产使用受限 worker，测试可确定性覆盖超时失败关闭。
+/// 保留 resolver 参数供现有测试接口使用，但用户代理保存不依赖 DNS 或 IP 审查。
 fn validate_byok_candidate_addresses_with_resolver(
     candidate: &LlmChannelConfig,
     allow_loopback_llm: bool,
-    resolver: impl Fn(&str, u16) -> Result<Vec<SocketAddr>, ()>,
+    _resolver: impl Fn(&str, u16) -> Result<Vec<SocketAddr>, ()>,
 ) -> Result<(), LlmChannelError> {
     let LlmChannelConfig::Byok {
         base_url, model_id, ..
@@ -764,31 +738,7 @@ fn validate_byok_candidate_addresses_with_resolver(
     else {
         return Err(LlmChannelError::InvalidRequest);
     };
-    validate_byok_identity_shape(base_url, model_id, allow_loopback_llm)?;
-    let parsed = validate_byok_url_shape(base_url, allow_loopback_llm)?;
-    let port = parsed
-        .port_or_known_default()
-        .ok_or(LlmChannelError::InvalidRequest)?;
-    // URL 的 IPv6 literal host_str 不含方括号，不能可靠交给 ToSocketAddrs 当 hostname；
-    // literal 直接构造 SocketAddr，只有域名才需要 DNS。
-    let addresses: Vec<SocketAddr> = match parsed.host().ok_or(LlmChannelError::InvalidRequest)? {
-        url::Host::Ipv4(address) => vec![SocketAddr::new(IpAddr::V4(address), port)],
-        url::Host::Ipv6(address) => vec![SocketAddr::new(IpAddr::V6(address), port)],
-        url::Host::Domain(host) => {
-            resolver(host, port).map_err(|_| LlmChannelError::InvalidRequest)?
-        }
-    };
-    if addresses.is_empty()
-        || addresses
-            .iter()
-            .any(|address| !is_allowed_upstream_ip(address.ip(), allow_loopback_llm))
-    {
-        return Err(LlmChannelError::InvalidRequest);
-    }
-    if parsed.scheme() == "http" && !addresses.iter().all(|address| is_loopback_ip(address.ip())) {
-        return Err(LlmChannelError::InvalidRequest);
-    }
-    Ok(())
+    validate_byok_identity_shape(base_url, model_id, allow_loopback_llm)
 }
 
 /// 判断原生或 IPv4-embedded 地址是否等价于回环，用于严格的开发 HTTP 例外。
@@ -799,15 +749,6 @@ pub(crate) fn is_loopback_ip(ip: IpAddr) -> bool {
             address.is_loopback()
                 || embedded_ipv4_address(address).is_some_and(|embedded| embedded.is_loopback())
         }
-    }
-}
-
-/// HTTP 明文只可用于显式开发测试的 IP 回环地址，不允许 hostname 绕过后续 DNS 复核。
-fn is_loopback_host(host: url::Host<&str>) -> bool {
-    match host {
-        url::Host::Ipv4(address) => is_loopback_ip(IpAddr::V4(address)),
-        url::Host::Ipv6(address) => is_loopback_ip(IpAddr::V6(address)),
-        url::Host::Domain(_) => false,
     }
 }
 
@@ -1028,7 +969,7 @@ impl LlmChannelService {
 
     /// 配置有效时延迟创建唯一进程级监听；监听地址严格由 L3bRuntimeConfig 约束。
     fn ensure_loopback(&self) -> Result<Arc<L3bLoopback>, LlmChannelError> {
-        // 对重启后加载的 DNS 配置先完成全量地址审查，禁止仅凭 URL 形状产生可运行 listener。
+        // 对重启后加载的配置复核 URL 形状，再创建进程级 L3b listener。
         self.manager.ensure_startable()?;
         if !self.manager.has_active_byok()? {
             return Err(LlmChannelError::Unconfigured);
@@ -1068,12 +1009,9 @@ mod tests {
     use std::sync::{Arc, mpsc};
     use std::time::{Duration, Instant};
 
-    use super::{
-        LlmChannelConfig, LlmChannelError, SealedSecret, SyncDnsResolver,
-        validate_byok_candidate_addresses_with_resolver,
-    };
+    use super::SyncDnsResolver;
 
-    /// 同步 DNS worker 超时时，候选地址审查必须 fail-closed，且忙 worker 不得再积压请求。
+    /// 同步 DNS worker 超时时必须 fail-closed，且忙 worker 不得再积压请求。
     #[test]
     fn synchronous_dns_timeout_is_bounded_and_fails_closed() {
         let (started_tx, started_rx) = mpsc::sync_channel(1);
@@ -1093,17 +1031,9 @@ mod tests {
             }
         })
         .expect("测试 DNS worker 必须启动");
-        let candidate = LlmChannelConfig::Byok {
-            base_url: "https://timeout.test/v1".to_string(),
-            model_id: "test-model".to_string(),
-            api_key: SealedSecret::new(b"test-key".to_vec()),
-        };
 
-        let result =
-            validate_byok_candidate_addresses_with_resolver(&candidate, false, |host, port| {
-                resolver.resolve(host, port, Duration::from_millis(10))
-            });
-        assert_eq!(result, Err(LlmChannelError::InvalidRequest));
+        let result = resolver.resolve("timeout.test", 443, Duration::from_millis(10));
+        assert_eq!(result, Err(()));
         started_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("超时前 DNS worker 必须已开始唯一的解析请求");

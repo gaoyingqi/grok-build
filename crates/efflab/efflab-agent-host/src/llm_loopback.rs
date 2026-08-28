@@ -1,7 +1,7 @@
 //! L3b 本机回环 Chat Completions 出口。
 //!
 //! sidecar 只可用短生命周期 binding token 访问此服务；Host 在认证 token、复核 Channel
-//! revision 后才会解封用户 Key，并以已验证地址连接用户上游。响应体直接流式转发，
+//! revision 后才会解封用户 Key，并以已解析地址连接用户上游。响应体直接流式转发，
 //! 下游断开会 drop 上游流而不是继续缓冲。
 
 use std::fmt;
@@ -25,7 +25,7 @@ use tokio::sync::oneshot;
 use url::Url;
 
 use crate::config::L3bRuntimeConfig;
-use crate::llm_channel::{LlmChannelError, LlmChannelManager, is_loopback_ip};
+use crate::llm_channel::{LlmChannelError, LlmChannelManager};
 
 /// 入站 Chat Completions 请求的硬上限；超过时在任何上游访问前返回 413。
 pub const MAX_L3B_REQUEST_BODY_BYTES: usize = 1_048_576;
@@ -303,8 +303,7 @@ impl L3bLoopback {
         manager: Arc<LlmChannelManager>,
         config: L3bRuntimeConfig,
     ) -> Result<Self, L3bLoopbackError> {
-        // 遗留的 DNS hostname 必须先完成本次启动的全量地址审查，不能只因 URL 形状正确
-        // 就产生可运行 sidecar。
+        // Channel 必须先完成 URL 语法校验，不能只因配置存在就产生可运行 sidecar。
         manager
             .ensure_startable()
             .map_err(|_| L3bLoopbackError::ChannelUnconfigured)?;
@@ -459,7 +458,7 @@ struct LoopbackState {
     allow_loopback_llm: bool,
 }
 
-/// 唯一允许的 sidecar 入站路径：认证 token、限长读取、解封、已验证地址出站、直接流式返回。
+/// 唯一允许的 sidecar 入站路径：认证 token、限长读取、解封、按解析地址出站、直接流式返回。
 async fn chat_completions(State(state): State<Arc<LoopbackState>>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
     let Some(presented_token) = bearer_token(parts.headers.get(AUTHORIZATION)) else {
@@ -544,7 +543,7 @@ fn upstream_authorization_header(secret: &[u8]) -> Result<HeaderValue, ()> {
     HeaderValue::from_bytes(&bytes).map_err(|_| ())
 }
 
-/// 已通过 DNS 全量审查、并强制 connect 到指定地址的上游请求参数。
+/// 已完成 URL 形状校验与 DNS 解析、并强制 connect 到指定地址的上游请求参数。
 struct VerifiedUpstream {
     chat_completions_url: Url,
     hostname: String,
@@ -575,21 +574,21 @@ async fn resolve_upstream_dns(host: &str, port: u16) -> Result<Vec<SocketAddr>, 
     .await
 }
 
-/// 每次新出站请求都重新解析/验证所有 A 与 AAAA，并把连接钉在本次验证出的地址。
-async fn verify_upstream(base_url: &str, allow_loopback_llm: bool) -> Result<VerifiedUpstream, ()> {
+/// 每次新出站请求都重新解析所有 A 与 AAAA，并把连接钉在本次解析出的地址。
+async fn verify_upstream(
+    base_url: &str,
+    _allow_loopback_llm: bool,
+) -> Result<VerifiedUpstream, ()> {
     let mut chat_completions_url = Url::parse(base_url).map_err(|_| ())?;
     if chat_completions_url.host_str().is_none()
-        || !chat_completions_url.username().is_empty()
-        || chat_completions_url.password().is_some()
-        || chat_completions_url.query().is_some()
-        || chat_completions_url.fragment().is_some()
+        || !matches!(chat_completions_url.scheme(), "http" | "https")
     {
         return Err(());
     }
-    // 仅在显式允许的明文 HTTP 开发例外中，将 IPv4-compatible/mapped IPv6 降级为
-    // 嵌入 IPv4 literal，以兼容没有可路由 IPv6 路径的平台。原生 `::1` 必须保留；
-    // HTTPS 的 authority 也绝不能改写，否则会改变 TLS SNI 与证书 SAN 身份语义。
-    if chat_completions_url.scheme() == "http" && allow_loopback_llm {
+    // 明文 HTTP 将 IPv4-compatible/mapped IPv6 降级为嵌入 IPv4 literal，以兼容没有可路由
+    // IPv6 路径的平台。原生 `::1` 必须保留；HTTPS 的 authority 也绝不能改写，否则会
+    // 改变 TLS SNI 与证书 SAN 身份语义。
+    if chat_completions_url.scheme() == "http" {
         if let Some(url::Host::Ipv6(address)) = chat_completions_url.host() {
             if !address.is_loopback() {
                 if let Some(embedded) = embedded_ipv4_address(address) {
@@ -610,27 +609,14 @@ async fn verify_upstream(base_url: &str, allow_loopback_llm: bool) -> Result<Ver
     };
     let port = chat_completions_url.port_or_known_default().ok_or(())?;
     // IP literal 已由 URL 解析为地址，直接构造 SocketAddr，避免把带方括号的 IPv6 host
-    // 误交给 DNS；只有域名才需要在每次请求前重新解析并全量审查。
+    // 误交给 DNS；只有域名才需要在每次请求前重新解析以用于连接。
     let addresses: Vec<SocketAddr> = match chat_completions_url.host().ok_or(())? {
         url::Host::Ipv4(address) => vec![SocketAddr::new(IpAddr::V4(address), port)],
         url::Host::Ipv6(address) => vec![SocketAddr::new(IpAddr::V6(address), port)],
         url::Host::Domain(host) => resolve_upstream_dns(host, port).await?,
     };
-    if addresses.is_empty()
-        || addresses
-            .iter()
-            .any(|address| !is_allowed_upstream_ip(address.ip(), allow_loopback_llm))
-    {
+    if addresses.is_empty() {
         return Err(());
-    }
-
-    match chat_completions_url.scheme() {
-        "https" => {}
-        // 明文 HTTP 仅支持显式开发开关下的纯 loopback 集合；private/metadata 永不例外。
-        "http"
-            if allow_loopback_llm
-                && addresses.iter().all(|address| is_loopback_ip(address.ip())) => {}
-        _ => return Err(()),
     }
 
     let base_path = chat_completions_url.path().trim_end_matches('/');
@@ -640,12 +626,11 @@ async fn verify_upstream(base_url: &str, allow_loopback_llm: bool) -> Result<Ver
         format!("{base_path}/chat/completions")
     };
     chat_completions_url.set_path(&path);
-    chat_completions_url.set_query(None);
     chat_completions_url.set_fragment(None);
     Ok(VerifiedUpstream {
         chat_completions_url,
         hostname,
-        // 前面已审查所有结果；使用一个被核验的地址而不是让 HTTP client 自由重解析。
+        // 使用一个已解析的地址而不是让 HTTP client 自由重解析。
         address: addresses[0],
     })
 }
@@ -821,6 +806,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn verify_upstream_accepts_http_lan_without_development_flag() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("测试 Tokio runtime 必须可构造");
+        let verified = runtime
+            .block_on(verify_upstream(
+                "http://192.168.1.10:8080/v1?token=abc",
+                false,
+            ))
+            .expect("用户局域网 HTTP 代理必须可出站");
+        assert_eq!(verified.chat_completions_url.scheme(), "http");
+        assert!(
+            verified
+                .chat_completions_url
+                .as_str()
+                .contains("/chat/completions")
+        );
+        assert_eq!(verified.chat_completions_url.query(), Some("token=abc"));
+    }
+
     /// HTTPS 的 IPv6 literal authority 必须保留，避免改变 TLS SNI/证书身份语义。
     #[test]
     fn https_ipv4_compatible_ipv6_keeps_original_authority() {
@@ -829,8 +836,8 @@ mod tests {
             .build()
             .expect("测试 Tokio runtime 必须可构造");
         let verified = runtime
-            .block_on(verify_upstream("https://[::127.0.0.1]:9443/v1", true))
-            .expect("显式允许的 IPv4-compatible IPv6 HTTPS URL 必须通过地址审查");
+            .block_on(verify_upstream("https://[::127.0.0.1]:9443/v1", false))
+            .expect("默认配置下 IPv4-compatible IPv6 HTTPS URL 也必须通过 URL 校验");
 
         let expected_ipv6 = "::127.0.0.1"
             .parse::<Ipv6Addr>()

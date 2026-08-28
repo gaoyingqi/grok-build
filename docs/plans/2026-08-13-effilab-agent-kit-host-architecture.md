@@ -598,7 +598,7 @@ M1               = 出站打设置页的 BYOK URL + 用户 Key
 M2               = 同一出口改打 Relay，注幂等头，映射 401/402/403
 ```
 
-用户侧 `base_url`（设置页）校验：默认仅 `https:`；拒 userinfo。语法校验后解析全部 A/AAAA；只要任一地址属于 loopback、private、link-local、metadata、unspecified 等禁区就整单拒绝。连接必须使用已验证地址，同时保留原 hostname 做 TLS SNI / 证书校验；每次新连接或 TTL 到期重新验证，禁止校验后再次自由解析。`allow_loopback_llm` 默认 false，只能由显式产品策略开启。
+用户侧 `base_url`（设置页）校验：用户填写的 BYOK `base_url` 视为可信目标，只做「`Url::parse` 可解析、含 host、scheme 为 `http` 或 `https`」的语法校验；允许明文 HTTP、localhost / 回环、LAN / 私网 / metadata 地址以及 query / userinfo / fragment（按用户原文保存与回显）。出站按用户原文直连，每次请求解析 DNS 供连接使用，不再做 DNS/IP 安全分级审查；`allow_loopback_llm` 保留为兼容字段，不再决定 BYOK URL 保存与出站。L3b 自身监听仍只绑定 `127.0.0.1` / `::1`；API Key 仍即时密封、日志脱敏、view 不回显明文。
 
 L3b 注册表固定为 `binding_token → scope slot → sidecar process generation → channel revision`；请求不得覆盖这些绑定。token 使用密码学随机数（至少 256 bit）、常量时间比较，日志只记不可逆短指纹。未知 token、旧 generation、抢锁后旧 token、sidecar 退出后的 token、通道变更前的旧 token都必须在 unseal 与任何上游请求前失败。
 

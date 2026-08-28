@@ -4,12 +4,24 @@
 //! 均可复用的、无 grok-shell 依赖的确定性文本渲染，以及读取 Host 已写入文件的
 //! fail-closed 校验。校验函数绝不修复、合并或覆盖配置。
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 
-use crate::{ApprovedMcpConfig, McpServerSpec, SidecarModelSpec};
+use crate::stdio_mcp::deny_stdio_mcp;
+use crate::{
+    ApprovedMcpConfig, LoopbackModelSpec, McpServerSpec, RuntimeConfigV1, SidecarModelSpec,
+};
+
+const RUNTIME_SCHEMA_VERSION: u32 = 1;
+const RUNTIME_SESSION_STORE_VERSION: u32 = 1;
+const RUNTIME_BACKEND: &str = "chat_completions";
+const RUNTIME_TOKEN_ENV: &str = "EFFLAB_L3B_BIND";
+const MAX_RUNTIME_PATH_BYTES: usize = 4096;
+const MAX_RUNTIME_MODEL_ID_CHARS: usize = 128;
 
 /// 物化 AgentDefinition 与权威配置中使用的固定 agent 名称。
 const DEFAULT_AGENT_NAME: &str = "efflab-default";
@@ -27,6 +39,333 @@ const CHAT_COMPLETIONS_BACKEND: &str = "chat_completions";
 const L3B_BIND_ENV_KEY: &str = "EFFLAB_L3B_BIND";
 /// 长期保留会话，避免 sidecar 启动时清理产品管理的会话目录。
 const SESSION_CLEANUP_TTL_DAYS: u32 = 36500;
+
+/// 渲染 S1 最小 runtime 配置，并以不含自身的规范化 JSON 重新计算 revision。
+pub fn render_runtime_config_v1(config: &RuntimeConfigV1) -> Result<String> {
+    // 与 Task 3 使用同一 helper，避免 renderer 产生任何可执行 stdio 配置。
+    deny_stdio_mcp(&config.approved_mcp)?;
+    validate_runtime_config_v1(config)?;
+
+    let mut materialized = config.clone();
+    materialized.runtime_revision = calculate_runtime_revision(&materialized)?;
+    let mut rendered = String::new();
+    rendered.push_str("schema_version = ");
+    rendered.push_str(&materialized.schema_version.to_string());
+    rendered.push_str("\nruntime_revision = ");
+    rendered.push_str(&runtime_toml_string(&materialized.runtime_revision));
+    rendered.push_str("\nsession_store_version = ");
+    rendered.push_str(&materialized.session_store_version.to_string());
+    rendered.push_str("\nsession_cwd = ");
+    rendered.push_str(&runtime_toml_string(&materialized.session_cwd));
+    rendered.push_str("\nexpected_tools = ");
+    rendered.push_str(&runtime_toml_string_array(&materialized.expected_tools));
+    rendered.push_str("\n\n[model]\nmodel_id = ");
+    rendered.push_str(&runtime_toml_string(&materialized.model.model_id));
+    rendered.push_str("\nbase_url = ");
+    rendered.push_str(&runtime_toml_string(&materialized.model.base_url));
+    rendered.push_str("\nbackend = ");
+    rendered.push_str(&runtime_toml_string(&materialized.model.backend));
+    rendered.push_str("\ntoken_env = ");
+    rendered.push_str(&runtime_toml_string(&materialized.model.token_env));
+
+    if materialized.approved_mcp.servers.is_empty() {
+        rendered.push_str("\n\n[approved_mcp]\nservers = {}\n");
+    } else {
+        for (name, server) in &materialized.approved_mcp.servers {
+            let McpServerSpec::Http { url } = server else {
+                bail!("stdio_mcp_unavailable");
+            };
+            rendered.push_str("\n\n[approved_mcp.servers.");
+            rendered.push_str(&runtime_toml_key_literal(name));
+            rendered.push_str("]\nurl = ");
+            rendered.push_str(&runtime_toml_string(url));
+            rendered.push('\n');
+        }
+    }
+
+    toml::from_str::<RuntimeConfigV1>(&rendered)
+        .context("内部错误：生成的 RuntimeConfigV1 TOML 不是合法 schema")?;
+    Ok(rendered)
+}
+
+/// 从 Host 写出的 v1 TOML 读取配置，并在任何后续使用前完成闭集与 revision 校验。
+pub fn load_runtime_config_v1(path: &Path) -> Result<RuntimeConfigV1> {
+    let source = fs::read_to_string(path)
+        .with_context(|| format!("读取 RuntimeConfigV1 TOML 失败: {}", path.display()))?;
+    let config: RuntimeConfigV1 = toml::from_str(&source)
+        .with_context(|| format!("解析 RuntimeConfigV1 TOML 失败: {}", path.display()))?;
+
+    // stdio 必须在 revision 等其他策略校验之前统一走 Task 3 helper，保持稳定错误码。
+    deny_stdio_mcp(&config.approved_mcp)?;
+    validate_runtime_config_v1(&config)?;
+    let expected_revision = calculate_runtime_revision(&config)?;
+    if config.runtime_revision != expected_revision {
+        bail!("runtime_revision 校验失败：配置摘要与不含自身的规范化 JSON 不一致");
+    }
+    Ok(config)
+}
+
+/// 只接受字面量 IPv4/IPv6 loopback HTTP，并要求 URL 带显式端口和非空路径。
+pub fn is_literal_loopback_http_url(url: &str) -> bool {
+    literal_loopback_http_path(url).is_some()
+}
+
+/// 提取已通过字面量 loopback HTTP 校验的 URL path。
+fn literal_loopback_http_path(url: &str) -> Option<&str> {
+    if url.is_empty() || url.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return None;
+    }
+
+    let remainder = url
+        .strip_prefix("http://127.0.0.1:")
+        .or_else(|| url.strip_prefix("http://[::1]:"))?;
+    let path_start = remainder.find('/')?;
+    let port = &remainder[..path_start];
+    let path = &remainder[path_start..];
+    let Ok(port_number) = port.parse::<u16>() else {
+        return None;
+    };
+    if port.is_empty()
+        || !port.bytes().all(|byte| byte.is_ascii_digit())
+        || port_number == 0
+        || path.contains('?')
+        || path.contains('#')
+    {
+        return None;
+    }
+
+    Some(path)
+}
+
+/// 校验 RuntimeConfigV1 的固定版本、路径、模型和 MCP 传输约束。
+fn validate_runtime_config_v1(config: &RuntimeConfigV1) -> Result<()> {
+    if config.schema_version != RUNTIME_SCHEMA_VERSION {
+        bail!("schema_version 必须为 {RUNTIME_SCHEMA_VERSION}");
+    }
+    if config.session_store_version != RUNTIME_SESSION_STORE_VERSION {
+        bail!("session_store_version 必须为 {RUNTIME_SESSION_STORE_VERSION}");
+    }
+    if config.session_cwd.is_empty() {
+        bail!("session_cwd 不能为空");
+    }
+    if config.session_cwd.len() > MAX_RUNTIME_PATH_BYTES {
+        bail!("session_cwd 长度不能超过 {MAX_RUNTIME_PATH_BYTES} 字节");
+    }
+    if !Path::new(&config.session_cwd).is_absolute() {
+        bail!("session_cwd 必须是绝对 UTF-8 路径");
+    }
+
+    let model_id = &config.model.model_id;
+    if model_id.is_empty() {
+        bail!("model.model_id 不能为空");
+    }
+    if model_id.chars().count() > MAX_RUNTIME_MODEL_ID_CHARS
+        || !model_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
+        bail!("model.model_id 必须匹配 ^[A-Za-z0-9._:-]+$ 且不超过 128 个字符");
+    }
+    if config.model.backend != RUNTIME_BACKEND {
+        bail!("model.backend 必须为 {RUNTIME_BACKEND}");
+    }
+    if config.model.token_env != RUNTIME_TOKEN_ENV {
+        bail!("model.token_env 必须为 {RUNTIME_TOKEN_ENV}");
+    }
+    if literal_loopback_http_path(&config.model.base_url) != Some("/v1") {
+        bail!("model.base_url 必须是字面量 loopback HTTP 且 path 精确为 /v1");
+    }
+
+    for (name, server) in &config.approved_mcp.servers {
+        if name.is_empty() {
+            bail!("approved_mcp.servers 不允许空 server 名称");
+        }
+        match server {
+            McpServerSpec::Http { url } => {
+                if !is_literal_loopback_http_url(url) {
+                    bail!(
+                        "approved_mcp.servers.{name}.url 必须是字面量 loopback HTTP 且 path 非空"
+                    );
+                }
+            }
+            McpServerSpec::Stdio { .. } => {
+                // load_runtime_config_v1 已在此函数前调用 deny_stdio_mcp。
+                bail!("stdio_mcp_unavailable");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 生成 revision 使用的字段顺序固定、且不包含 runtime_revision 的 JSON 投影。
+#[derive(Serialize)]
+struct RuntimeRevisionPayload<'a> {
+    schema_version: u32,
+    session_store_version: u32,
+    session_cwd: &'a str,
+    model: &'a LoopbackModelSpec,
+    approved_mcp: RuntimeRevisionMcp<'a>,
+    expected_tools: &'a BTreeSet<String>,
+}
+
+/// revision 专用 MCP 视图只包含 HTTP URL，避免 command/args 进入摘要。
+#[derive(Serialize)]
+struct RuntimeRevisionMcp<'a> {
+    servers: BTreeMap<&'a str, RuntimeRevisionServer<'a>>,
+}
+
+#[derive(Serialize)]
+struct RuntimeRevisionServer<'a> {
+    url: &'a str,
+}
+
+/// 以纯 Rust SHA-256 计算 runtime revision，避免为 contract crate 扩大依赖闭包。
+fn calculate_runtime_revision(config: &RuntimeConfigV1) -> Result<String> {
+    let servers = config
+        .approved_mcp
+        .servers
+        .iter()
+        .map(|(name, server)| {
+            let McpServerSpec::Http { url } = server else {
+                return Err(anyhow::anyhow!("stdio_mcp_unavailable"));
+            };
+            Ok((name.as_str(), RuntimeRevisionServer { url: url.as_str() }))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let payload = RuntimeRevisionPayload {
+        schema_version: config.schema_version,
+        session_store_version: config.session_store_version,
+        session_cwd: &config.session_cwd,
+        model: &config.model,
+        approved_mcp: RuntimeRevisionMcp { servers },
+        expected_tools: &config.expected_tools,
+    };
+    let canonical_json =
+        serde_json::to_vec(&payload).context("规范化 RuntimeConfigV1 JSON 失败")?;
+    let digest = Sha256::digest(&canonical_json);
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("sha256:{hex}"))
+}
+
+/// 最小 SHA-256 实现；只用于短小配置摘要，不处理秘密或外部网络数据。
+struct Sha256;
+
+impl Sha256 {
+    /// 按 SHA-256 标准完成 padding、压缩和大端摘要输出。
+    fn digest(input: &[u8]) -> [u8; 32] {
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
+        ];
+        let mut state = [
+            0x6a09e667u32,
+            0xbb67ae85,
+            0x3c6ef372,
+            0xa54ff53a,
+            0x510e527f,
+            0x9b05688c,
+            0x1f83d9ab,
+            0x5be0cd19,
+        ];
+        let bit_len = (input.len() as u64).wrapping_mul(8);
+        let padded_len = (input.len() + 9).div_ceil(64) * 64;
+        let mut padded = vec![0u8; padded_len];
+        padded[..input.len()].copy_from_slice(input);
+        padded[input.len()] = 0x80;
+        padded[padded_len - 8..].copy_from_slice(&bit_len.to_be_bytes());
+
+        for chunk in padded.chunks_exact(64) {
+            let mut words = [0u32; 64];
+            for (index, bytes) in chunk.chunks_exact(4).take(16).enumerate() {
+                words[index] = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            }
+            for index in 16..64 {
+                let s0 = words[index - 15].rotate_right(7)
+                    ^ words[index - 15].rotate_right(18)
+                    ^ (words[index - 15] >> 3);
+                let s1 = words[index - 2].rotate_right(17)
+                    ^ words[index - 2].rotate_right(19)
+                    ^ (words[index - 2] >> 10);
+                words[index] = words[index - 16]
+                    .wrapping_add(s0)
+                    .wrapping_add(words[index - 7])
+                    .wrapping_add(s1);
+            }
+
+            let mut working = state;
+            for index in 0..64 {
+                let s1 = working[4].rotate_right(6)
+                    ^ working[4].rotate_right(11)
+                    ^ working[4].rotate_right(25);
+                let choose = (working[4] & working[5]) ^ ((!working[4]) & working[6]);
+                let temp1 = working[7]
+                    .wrapping_add(s1)
+                    .wrapping_add(choose)
+                    .wrapping_add(K[index])
+                    .wrapping_add(words[index]);
+                let s0 = working[0].rotate_right(2)
+                    ^ working[0].rotate_right(13)
+                    ^ working[0].rotate_right(22);
+                let majority = (working[0] & working[1])
+                    ^ (working[0] & working[2])
+                    ^ (working[1] & working[2]);
+                let temp2 = s0.wrapping_add(majority);
+                working[7] = working[6];
+                working[6] = working[5];
+                working[5] = working[4];
+                working[4] = working[3].wrapping_add(temp1);
+                working[3] = working[2];
+                working[2] = working[1];
+                working[1] = working[0];
+                working[0] = temp1.wrapping_add(temp2);
+            }
+            for index in 0..8 {
+                state[index] = state[index].wrapping_add(working[index]);
+            }
+        }
+
+        let mut digest = [0u8; 32];
+        for (index, word) in state.iter().enumerate() {
+            digest[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        digest
+    }
+}
+
+/// 渲染 runtime schema 的 TOML 字符串，不应用旧权威配置的环境变量转义规则。
+fn runtime_toml_string(value: &str) -> String {
+    toml::Value::String(value.to_owned()).to_string()
+}
+
+/// 按 BTreeSet 顺序渲染 runtime schema 的字符串数组。
+fn runtime_toml_string_array(values: &BTreeSet<String>) -> String {
+    let values = values.iter().cloned().map(toml::Value::String).collect();
+    toml::Value::Array(values).to_string()
+}
+
+/// 优先保留安全的裸 TOML key，否则退回引号 key 以支持任意 UTF-8 名称。
+fn runtime_toml_key_literal(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        value.to_owned()
+    } else {
+        runtime_toml_string(value)
+    }
+}
 
 /// 完整渲染 sidecar 唯一权威的 `config.toml` 文本。
 ///

@@ -14,6 +14,9 @@ pub use host_contract::{
     validate_host_request, validate_prompt_text,
 };
 pub use mcp_config::{ApprovedMcpConfig, McpServerSpec};
-pub use model::SidecarModelSpec;
-pub use render::{render_authoritative_config, validate_authoritative_config};
+pub use model::{LoopbackModelSpec, RuntimeConfigV1, SidecarModelSpec};
+pub use render::{
+    is_literal_loopback_http_url, load_runtime_config_v1, render_authoritative_config,
+    render_runtime_config_v1, validate_authoritative_config,
+};
 pub use stdio_mcp::deny_stdio_mcp;

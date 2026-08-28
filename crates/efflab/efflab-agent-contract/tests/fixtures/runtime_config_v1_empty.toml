@@ -1,0 +1,14 @@
+schema_version = 1
+runtime_revision = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+session_store_version = 1
+session_cwd = "<canonical-session-cwd>"
+expected_tools = []
+
+[model]
+model_id = "byok-user-model"
+base_url = "http://127.0.0.1:4312/v1"
+backend = "chat_completions"
+token_env = "EFFLAB_L3B_BIND"
+
+[approved_mcp]
+servers = {}

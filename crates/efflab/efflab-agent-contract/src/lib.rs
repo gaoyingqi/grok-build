@@ -7,6 +7,7 @@ pub mod host_contract;
 pub mod mcp_config;
 pub mod model;
 pub mod render;
+pub mod stdio_mcp;
 
 pub use host_contract::{
     HOST_ACP_PROTOCOL_VERSION, HostPolicy, HostRejection, PromptTextRejection,
@@ -15,3 +16,4 @@ pub use host_contract::{
 pub use mcp_config::{ApprovedMcpConfig, McpServerSpec};
 pub use model::SidecarModelSpec;
 pub use render::{render_authoritative_config, validate_authoritative_config};
+pub use stdio_mcp::deny_stdio_mcp;

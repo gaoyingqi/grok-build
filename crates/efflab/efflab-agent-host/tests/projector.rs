@@ -27,6 +27,14 @@ fn tool_notification(update: Value, meta: Value) -> Value {
     })
 }
 
+/// 构造不支持的 ACP update，验证其不会进入 Kit 产品事件流。
+fn unknown_notification(prompt_id: &str) -> Value {
+    tool_notification(
+        json!({ "sessionUpdate": "future_update" }),
+        json!({ "promptId": prompt_id }),
+    )
+}
+
 /// 所有从 projector 返回的事件都必须在生产边界校验前已满足标识不变量。
 fn assert_valid(events: &[efflab_agent_host::KitProductEvent]) {
     for event in events {
@@ -73,6 +81,7 @@ fn assistant_chunks_accumulate_into_a_single_streaming_snapshot() {
         KitBlock::Assistant { markdown, streaming } if markdown == "hello" && *streaming
     ));
     assert_eq!(first_events[0].block_id, second_events[0].block_id);
+    assert!(first_events[0].block_id.contains("sidecar-event-1"));
 }
 
 /// 思考块、用户回显和工具调用均必须使用真实 ACP 字段并映射为冻结 KitBlock。
@@ -273,9 +282,357 @@ fn uses_sidecar_event_id_before_deterministic_fallback() {
     assert_eq!(fallback_events[0].event_id, "session-1:live:1");
 }
 
-/// 未知、plan、todo 以及 xAI session update 均不得让本批失败；live 必须发合成 Status。
+/// 未知 update 不能清掉当前 prompt 的快照，也不能消耗会话序号。
 #[test]
-fn unknown_updates_are_counted_without_failing_live_projection() {
+fn unknown_live_update_preserves_snapshot_and_does_not_consume_sequence() {
+    let mut projector = Projector::new("scope-1");
+    let first = text_notification(
+        "agent_message_chunk",
+        "hello",
+        json!({ "promptId": "turn-a", "eventId": "a" }),
+    );
+    let second = text_notification(
+        "agent_message_chunk",
+        " world",
+        json!({ "promptId": "turn-a", "eventId": "b" }),
+    );
+
+    let first_events = apply_acp_notification(&mut projector, "session/update", &first)
+        .expect("第一条 assistant chunk 必须可投影");
+    let unknown_events = apply_acp_notification(
+        &mut projector,
+        "session/update",
+        &unknown_notification("turn-a"),
+    )
+    .expect("未知 update 必须安全忽略");
+    let second_events = apply_acp_notification(&mut projector, "session/update", &second)
+        .expect("第二条 assistant chunk 必须可投影");
+
+    assert_eq!(first_events[0].sequence, 0);
+    assert!(unknown_events.is_empty(), "未知 update 不得生成诊断事件");
+    assert_eq!(second_events[0].sequence, 1);
+    assert!(matches!(
+        &second_events[0].block,
+        KitBlock::Assistant { markdown, .. } if markdown == "hello world"
+    ));
+}
+
+/// 首个 replay 未知通知必须保持 live 快照和 origin fence 不变。
+#[test]
+fn first_replay_unknown_preserves_existing_live_snapshot() {
+    let mut projector = Projector::new("scope-1");
+    let first = apply_acp_notification(
+        &mut projector,
+        "session/update",
+        &text_notification(
+            "agent_message_chunk",
+            "hello",
+            json!({ "promptId": "turn-a", "eventId": "live-a" }),
+        ),
+    )
+    .expect("live 首个 chunk 必须可投影");
+    let replay_unknown = tool_notification(
+        json!({ "sessionUpdate": "future_update" }),
+        json!({ "isReplay": true, "promptId": "turn-a" }),
+    );
+    let unknown_events = apply_acp_notification(&mut projector, "session/update", &replay_unknown)
+        .expect("首个 replay 未知通知必须安全忽略");
+    let continuation = apply_acp_notification(
+        &mut projector,
+        "session/update",
+        &text_notification(
+            "agent_message_chunk",
+            " world",
+            json!({ "promptId": "turn-a", "eventId": "live-b" }),
+        ),
+    )
+    .expect("未知通知后的 live chunk 必须可投影");
+
+    assert_eq!(first[0].sequence, 0);
+    assert!(unknown_events.is_empty(), "未知通知必须返回空事件");
+    assert_eq!(projector.replay_skipped_count("session-1"), 1);
+    assert_eq!(continuation[0].sequence, 1, "未知通知不得消耗 sequence");
+    assert_eq!(continuation[0].origin, Origin::Live);
+    assert_eq!(continuation[0].block_id, first[0].block_id);
+    assert!(matches!(
+        &continuation[0].block,
+        KitBlock::Assistant { markdown, .. } if markdown == "hello world"
+    ));
+}
+
+/// 未显式 begin_replay 时，自动 replay fence 必须保留 fence 前累计的 counter。
+#[test]
+fn replay_unknown_before_automatic_fence_preserves_counter() {
+    let mut projector = Projector::new("scope-1");
+    let live = apply_acp_notification(
+        &mut projector,
+        "session/update",
+        &text_notification(
+            "agent_message_chunk",
+            "live",
+            json!({ "promptId": "turn-a", "eventId": "live-a" }),
+        ),
+    )
+    .expect("live 首个 chunk 必须可投影");
+    let replay_unknown = tool_notification(
+        json!({ "sessionUpdate": "future_update" }),
+        json!({ "isReplay": true, "promptId": "turn-a" }),
+    );
+    let unknown_events = apply_acp_notification(&mut projector, "session/update", &replay_unknown)
+        .expect("replay 未知通知必须安全忽略");
+    let replay_known = text_notification(
+        "agent_message_chunk",
+        "history",
+        json!({ "isReplay": true, "promptId": "turn-r", "eventId": "replay-a" }),
+    );
+    let known_events = apply_acp_notification(&mut projector, "session/update", &replay_known)
+        .expect("首个已知 replay update 必须自动建立 fence");
+
+    assert_eq!(live[0].sequence, 0);
+    assert!(unknown_events.is_empty(), "未知通知必须返回空事件");
+    assert_eq!(
+        known_events[0].sequence, 0,
+        "自动 fence 后 replay 应从零开始"
+    );
+    assert_eq!(known_events[0].origin, Origin::Replay);
+    assert!(matches!(
+        &known_events[0].block,
+        KitBlock::Assistant { markdown, streaming } if markdown == "history" && !streaming
+    ));
+    assert_eq!(projector.replay_skipped_count("session-1"), 1);
+    assert_eq!(projector.take_replay_skipped_count("session-1"), 1);
+    assert_eq!(projector.replay_skipped_count("session-1"), 0);
+
+    let next_replay_unknown = tool_notification(
+        json!({ "sessionUpdate": "future_update" }),
+        json!({ "isReplay": true, "promptId": "turn-next" }),
+    );
+    let next_unknown_events =
+        apply_acp_notification(&mut projector, "session/update", &next_replay_unknown)
+            .expect("下一批 replay 未知通知必须安全忽略");
+    assert!(next_unknown_events.is_empty());
+    assert_eq!(projector.replay_skipped_count("session-1"), 1);
+    projector.begin_replay("session-1");
+    assert_eq!(
+        projector.replay_skipped_count("session-1"),
+        0,
+        "显式新 replay 批次必须清理旧计数"
+    );
+}
+
+/// replay 栅栏内首个 live 未知通知必须保持 replay 快照和栅栏不变。
+#[test]
+fn first_live_unknown_preserves_existing_replay_snapshot() {
+    let mut projector = Projector::new("scope-1");
+    projector.begin_replay("session-1");
+    let first = apply_acp_notification(
+        &mut projector,
+        "session/update",
+        &text_notification(
+            "agent_message_chunk",
+            "history",
+            json!({ "isReplay": true, "promptId": "turn-r", "eventId": "replay-a" }),
+        ),
+    )
+    .expect("replay 首个 chunk 必须可投影");
+    let live_unknown = tool_notification(
+        json!({ "sessionUpdate": "future_update" }),
+        json!({ "isReplay": false, "promptId": "turn-r" }),
+    );
+    let unknown_events = apply_acp_notification(&mut projector, "session/update", &live_unknown)
+        .expect("replay 栅栏内首个 live 未知通知必须安全忽略");
+    let continuation = apply_acp_notification(
+        &mut projector,
+        "session/update",
+        &text_notification(
+            "agent_message_chunk",
+            " + more",
+            json!({ "isReplay": true, "promptId": "turn-r", "eventId": "replay-b" }),
+        ),
+    )
+    .expect("未知通知后的 replay chunk 必须可投影");
+
+    assert_eq!(first[0].sequence, 0);
+    assert!(unknown_events.is_empty(), "未知通知必须返回空事件");
+    assert_eq!(projector.replay_skipped_count("session-1"), 0);
+    assert_eq!(continuation[0].sequence, 1, "未知通知不得消耗 sequence");
+    assert_eq!(continuation[0].origin, Origin::Replay);
+    assert_eq!(continuation[0].block_id, first[0].block_id);
+    assert!(matches!(
+        &continuation[0].block,
+        KitBlock::Assistant { markdown, streaming } if markdown == "history + more" && !streaming
+    ));
+}
+
+/// 不同 prompt 的文本快照必须使用不同 block，且新 prompt 不得继承旧文本。
+#[test]
+fn assistant_chunks_from_two_prompts_use_different_blocks() {
+    let mut projector = Projector::new("scope-1");
+    let first = apply_acp_notification(
+        &mut projector,
+        "session/update",
+        &text_notification(
+            "agent_message_chunk",
+            "A",
+            json!({ "promptId": "prompt-a", "eventId": "a" }),
+        ),
+    )
+    .expect("prompt A 必须可投影");
+    let second = apply_acp_notification(
+        &mut projector,
+        "session/update",
+        &text_notification(
+            "agent_message_chunk",
+            "B",
+            json!({ "promptId": "prompt-b", "eventId": "b" }),
+        ),
+    )
+    .expect("prompt B 必须可投影");
+
+    assert_ne!(first[0].block_id, second[0].block_id);
+    assert!(matches!(
+        &second[0].block,
+        KitBlock::Assistant { markdown, .. } if markdown == "B"
+    ));
+}
+
+/// begin_prompt 对同一 prompt 幂等，对不同 prompt 建立新的文本边界。
+#[test]
+fn begin_prompt_is_idempotent_for_same_prompt() {
+    let mut projector = Projector::new("scope-1");
+    projector.begin_prompt("session-1", "prompt-a");
+    let first = apply_acp_notification(
+        &mut projector,
+        "session/update",
+        &text_notification(
+            "agent_message_chunk",
+            "A",
+            json!({ "promptId": "prompt-a", "eventId": "a" }),
+        ),
+    )
+    .expect("prompt A 首个 chunk 必须可投影");
+
+    projector.begin_prompt("session-1", "prompt-a");
+    let second = apply_acp_notification(
+        &mut projector,
+        "session/update",
+        &text_notification(
+            "agent_message_chunk",
+            "B",
+            json!({ "promptId": "prompt-a", "eventId": "b" }),
+        ),
+    )
+    .expect("prompt A 后续 chunk 必须可投影");
+
+    assert_eq!(first[0].block_id, second[0].block_id);
+    assert!(matches!(
+        &second[0].block,
+        KitBlock::Assistant { markdown, .. } if markdown == "AB"
+    ));
+}
+
+/// 工具状态 token 不支持时，必须与未知 update 一样保持快照和 sequence 不变。
+#[test]
+fn unsupported_tool_status_is_an_internal_noop() {
+    let mut projector = Projector::new("scope-1");
+    let first = text_notification(
+        "agent_message_chunk",
+        "hello",
+        json!({ "promptId": "turn-a", "eventId": "a" }),
+    );
+    let unsupported = tool_notification(
+        json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tool-1",
+            "status": "future_status"
+        }),
+        json!({ "promptId": "turn-a" }),
+    );
+    let second = text_notification(
+        "agent_message_chunk",
+        " world",
+        json!({ "promptId": "turn-a", "eventId": "b" }),
+    );
+
+    let _ = apply_acp_notification(&mut projector, "session/update", &first)
+        .expect("第一条 assistant chunk 必须可投影");
+    let unsupported_events = apply_acp_notification(&mut projector, "session/update", &unsupported)
+        .expect("不支持的工具状态必须安全忽略");
+    let events = apply_acp_notification(&mut projector, "session/update", &second)
+        .expect("不支持 update 后的 assistant chunk 必须可投影");
+
+    assert!(
+        unsupported_events.is_empty(),
+        "不支持 update 不得生成诊断事件"
+    );
+    assert_eq!(events[0].sequence, 1);
+    assert!(matches!(
+        &events[0].block,
+        KitBlock::Assistant { markdown, .. } if markdown == "hello world"
+    ));
+}
+
+/// tool_call_update 的未知字符串和非字符串 status 都必须是内部 no-op。
+#[test]
+fn unsupported_tool_call_update_status_shapes_are_noops() {
+    let mut projector = Projector::new("scope-1");
+    let first = apply_acp_notification(
+        &mut projector,
+        "session/update",
+        &text_notification(
+            "agent_message_chunk",
+            "hello",
+            json!({ "promptId": "turn-a", "eventId": "a" }),
+        ),
+    )
+    .expect("初始 assistant chunk 必须可投影");
+    let unsupported_string = tool_notification(
+        json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tool-1",
+            "status": "future_status",
+            "content": [{ "type": "text", "text": "payload-secret" }]
+        }),
+        json!({ "promptId": "turn-a" }),
+    );
+    let unsupported_non_string = tool_notification(
+        json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tool-1",
+            "status": { "secret": "status-payload-secret" }
+        }),
+        json!({ "promptId": "turn-a" }),
+    );
+    let string_events =
+        apply_acp_notification(&mut projector, "session/update", &unsupported_string)
+            .expect("未知字符串 status 必须安全忽略");
+    let non_string_events =
+        apply_acp_notification(&mut projector, "session/update", &unsupported_non_string)
+            .expect("非字符串 status 必须安全忽略");
+    let continuation = apply_acp_notification(
+        &mut projector,
+        "session/update",
+        &text_notification(
+            "agent_message_chunk",
+            " world",
+            json!({ "promptId": "turn-a", "eventId": "b" }),
+        ),
+    )
+    .expect("未知 status 后的 assistant chunk 必须可投影");
+
+    assert_eq!(first[0].sequence, 0);
+    assert!(string_events.is_empty());
+    assert!(non_string_events.is_empty());
+    assert_eq!(continuation[0].sequence, 1);
+    assert!(matches!(
+        &continuation[0].block,
+        KitBlock::Assistant { markdown, .. } if markdown == "hello world"
+    ));
+}
+
+/// 未知、plan、todo 以及 xAI session update 均不得让本批失败或生成诊断事件。
+#[test]
+fn unknown_updates_are_counted_without_emitting_diagnostics() {
     let mut projector = Projector::new("scope-1");
     let updates = [
         json!({ "sessionUpdate": "future_update" }),
@@ -284,33 +641,33 @@ fn unknown_updates_are_counted_without_failing_live_projection() {
     ];
 
     for update in updates {
-        let notification = tool_notification(update, json!({}));
+        let notification = tool_notification(update, json!({ "promptId": "turn-1" }));
         let events = apply_acp_notification(&mut projector, "session/update", &notification)
             .expect("未知或禁用 update 不得让 live 批次报错");
         assert_valid(&events);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].turn_id, None);
-        assert_eq!(events[0].submission_id, None);
-        assert_eq!(events[0].block_id, events[0].event_id);
-        assert!(matches!(
-            &events[0].block,
-            KitBlock::Status { code, .. } if code == "skipped_update"
-        ));
+        assert!(events.is_empty(), "未知 update 不得生成诊断事件");
     }
 
     let xai_notification = tool_notification(
         json!({ "sessionUpdate": "rewind_marker", "target_prompt_index": 1 }),
-        json!({}),
+        json!({ "promptId": "turn-1" }),
     );
     let events = apply_acp_notification(&mut projector, "_x.ai/session/update", &xai_notification)
-        .expect("xAI session update 必须降级为 skipped_update，而不是错误");
+        .expect("xAI session update 必须安全忽略，而不是错误");
     assert_valid(&events);
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].event_id, "session-1:host:skipped_update:3");
-    assert_eq!(events[0].block_id, events[0].event_id);
+    assert!(events.is_empty(), "xAI session update 不得生成诊断事件");
+
+    let known = text_notification(
+        "agent_message_chunk",
+        "after unknown",
+        json!({ "promptId": "turn-1", "eventId": "known" }),
+    );
+    let known_events = apply_acp_notification(&mut projector, "session/update", &known)
+        .expect("未知 update 后的已知 update 必须可投影");
+    assert_eq!(known_events[0].sequence, 0, "未知 update 不得消耗 sequence");
 }
 
-/// replay 中的未知 update 只累计，由后续 Task 7b 决定何时发出 replay_skipped。
+/// replay 中的未知 update 只累计内部计数，不返回任何诊断事件。
 #[test]
 fn replay_unknown_updates_increment_a_count_without_emitting_a_status() {
     let mut projector = Projector::new("scope-1");
@@ -322,9 +679,24 @@ fn replay_unknown_updates_increment_a_count_without_emitting_a_status() {
 
     let events = apply_acp_notification(&mut projector, "session/update", &replay_unknown)
         .expect("replay 未知 update 不得报错");
+    let replay_known = text_notification(
+        "agent_message_chunk",
+        "history",
+        json!({ "isReplay": true, "promptId": "turn-0", "eventId": "history-1" }),
+    );
+    let known_events = apply_acp_notification(&mut projector, "session/update", &replay_known)
+        .expect("未知 replay update 后的已知 update 必须可投影");
 
     assert!(events.is_empty(), "Task 6 不得提前发 replay_skipped");
     assert_eq!(projector.replay_skipped_count("session-1"), 1);
+    assert_eq!(
+        known_events[0].sequence, 0,
+        "replay 未知 update 不得消耗 sequence"
+    );
+    assert!(matches!(
+        &known_events[0].block,
+        KitBlock::Assistant { markdown, streaming } if markdown == "history" && !streaming
+    ));
     assert_eq!(projector.take_replay_skipped_count("session-1"), 1);
     assert_eq!(projector.replay_skipped_count("session-1"), 0);
 }

@@ -20,8 +20,8 @@ const SESSION_UPDATE_METHOD: &str = "session/update";
 
 /// 以 scope 为边界维护会话投影状态。
 ///
-/// 该状态只保存 UI 合并所需的快照、工具字段和 replay 跳过计数；不保存原始
-/// ACP payload，避免把未知内容变成新的产品协议或意外留存敏感数据。
+/// 该状态只保存 UI 合并所需的快照、工具字段和内部计数；不保存原始 ACP
+/// payload，避免把未知内容变成新的产品协议或意外留存敏感数据。
 pub struct Projector {
     scope_id: String,
     sessions: BTreeMap<String, SessionProjection>,
@@ -32,14 +32,18 @@ pub struct Projector {
 impl fmt::Debug for Projector {
     /// 调试形状只暴露固定计数，绝不递归格式化含模型文本的 session 快照。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let replay_skipped = self.sessions.values().fold(0_u64, |total, session| {
-            total.saturating_add(session.replay_skipped)
+        let replay_unsupported_updates = self.sessions.values().fold(0_u64, |total, session| {
+            total.saturating_add(session.unsupported_replay_updates)
+        });
+        let live_unsupported_updates = self.sessions.values().fold(0_u64, |total, session| {
+            total.saturating_add(session.unsupported_live_updates)
         });
         formatter
             .debug_struct("Projector")
             .field("session_count", &self.sessions.len())
             .field("unattributed_skipped", &self.unattributed_skipped)
-            .field("replay_skipped", &replay_skipped)
+            .field("unsupported_live_updates", &live_unsupported_updates)
+            .field("unsupported_replay_updates", &replay_unsupported_updates)
             .finish()
     }
 }
@@ -49,7 +53,10 @@ impl fmt::Debug for Projector {
 struct SessionProjection {
     next_sequence: u64,
     replay_active: bool,
-    replay_skipped: u64,
+    /// live/replay 计数分别属于该 session actor，不进入 Kit 事件流。
+    unsupported_live_updates: u64,
+    unsupported_replay_updates: u64,
+    active_prompt_id: Option<String>,
     assistant: Option<TextSnapshot>,
     thinking: Option<TextSnapshot>,
     tools: BTreeMap<String, ToolSnapshot>,
@@ -57,9 +64,10 @@ struct SessionProjection {
     orphan_tool_updates: BTreeMap<String, PendingToolUpdate>,
 }
 
-/// 流式文本块的稳定 block_id 与累计文本。
+/// 流式文本块的稳定 block_id、所属 prompt 与累计文本。
 struct TextSnapshot {
     block_id: String,
+    prompt_id: String,
     text: String,
 }
 
@@ -125,8 +133,7 @@ impl PendingToolUpdate {
 
 /// 投影过程中仅用于已识别 update 的结构错误。
 ///
-/// 未知、计划、todo 和 xAI session update 不使用本错误；它们必须走
-/// `skipped_update` 或 replay 计数分支。
+/// 未知、计划、todo 和 xAI session update 不使用本错误；它们必须走内部计数分支。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectError {
     /// 通知没有可用的 sessionId，无法生成任何 Kit 事件。
@@ -192,23 +199,32 @@ impl Projector {
             .begin_replay();
     }
 
-    /// 读取当前 replay 批次已跳过的 update 数量，不结束 replay 栅栏。
+    /// 标记一个 prompt 的开始；重复调用同一 prompt 保留正在累计的文本快照。
+    pub fn begin_prompt(&mut self, session_id: &str, prompt_id: &str) {
+        self.sessions
+            .entry(session_id.to_string())
+            .or_default()
+            .begin_prompt(prompt_id);
+    }
+
+    /// 读取当前 replay 批次的内部未知 update 计数，不结束 replay 栅栏。
     pub fn replay_skipped_count(&self, session_id: &str) -> u64 {
         self.sessions
             .get(session_id)
-            .map_or(0, |session| session.replay_skipped)
+            .map_or(0, |session| session.unsupported_replay_updates)
     }
 
-    /// 取得并清空 replay 跳过数，同时结束当前 replay 栅栏。
+    /// 取得并清空 replay 内部未知 update 计数，同时结束当前 replay 栅栏。
     ///
-    /// 本方法故意不构造 `replay_skipped` 或 `replay_complete` 事件；其发射时机
-    /// 依赖 `session/load` response 排空，属于 Task 7b 的职责。
+    /// 本方法自身不构造任何产品事件；它保留旧 Host 接线所需的计数读取边界。
     pub fn take_replay_skipped_count(&mut self, session_id: &str) -> u64 {
         let Some(session) = self.sessions.get_mut(session_id) else {
             return 0;
         };
         session.replay_active = false;
-        std::mem::take(&mut session.replay_skipped)
+        session.active_prompt_id = None;
+        session.clear_text_snapshots();
+        std::mem::take(&mut session.unsupported_replay_updates)
     }
 
     /// 为 Host 合成的 session/process 状态分配同一会话的下一个稳定序号。
@@ -245,38 +261,32 @@ impl Projector {
             .flatten();
         let update_kind =
             update.and_then(|update| update.get("sessionUpdate").and_then(Value::as_str));
-        let recognized_update = matches!(
-            update_kind,
-            Some(
-                "agent_message_chunk"
-                    | "agent_thought_chunk"
-                    | "tool_call"
-                    | "tool_call_update"
-                    | "user_message_chunk"
-            )
-        );
-        if !recognized_update {
+        // 未知类型和已知类型中的不支持字段都在 sequence 分配前内部化。
+        if !is_supported_update(update_kind, update) {
             let Some(session_id) = required_string(params, "sessionId") else {
                 self.unattributed_skipped = self.unattributed_skipped.saturating_add(1);
-                tracing::debug!(
-                    unattributed_skipped = self.unattributed_skipped,
-                    "已安全跳过不可归属的 ACP 未知更新"
-                );
+                if should_log_skip(self.unattributed_skipped) {
+                    tracing::debug!(
+                        unattributed_skipped = self.unattributed_skipped,
+                        origin = origin_name(origin),
+                        "已安全跳过不可归属的 ACP 未知更新"
+                    );
+                }
                 return Ok(Vec::new());
             };
-            let scope_id = self.scope_id.clone();
             let session = self.sessions.entry(session_id.to_string()).or_default();
-            session.prepare_origin(origin);
-            let sequence = session.allocate_sequence()?;
-            return finish_events(skip_unknown_update(
-                &scope_id, session_id, origin, sequence, session,
-            ));
+            // 未知通知是纯 no-op；先计数并返回，不能让 origin fence 清理快照或改动边界。
+            return finish_events(skip_unknown_update(origin, session));
         }
 
         let session_id =
             required_string(params, "sessionId").ok_or(ProjectError::MissingSessionId)?;
-        let update = update.expect("已识别 update 必须有 object");
-        let update_kind = update_kind.expect("已识别 update 必须有 sessionUpdate");
+        let Some(update) = update else {
+            return Ok(Vec::new());
+        };
+        let Some(update_kind) = update_kind else {
+            return Ok(Vec::new());
+        };
         let scope_id = self.scope_id.clone();
         let session = self.sessions.entry(session_id.to_string()).or_default();
         session.prepare_origin(origin);
@@ -299,8 +309,8 @@ impl Projector {
             "user_message_chunk" => project_user_echo(
                 &scope_id, session_id, meta, origin, sequence, event_id, update, session,
             )?,
-            // `recognized_update` 已封闭本分支；保留以防后续修改分类条件时漏掉 fail-open。
-            _ => skip_unknown_update(&scope_id, session_id, origin, sequence, session),
+            // 分类条件已在 sequence 分配前封闭；此分支仅作防御性安全降级。
+            _ => skip_unknown_update(origin, session),
         };
 
         finish_events(events)
@@ -317,27 +327,54 @@ pub fn apply_acp_notification(
 }
 
 impl SessionProjection {
-    /// 进入 replay 前清理会跨历史边界混淆的缓存，并把 sequence 重置为零。
+    /// 进入新的显式 replay 批次，清理跨历史边界的状态和旧 replay 计数。
     fn begin_replay(&mut self) {
         self.next_sequence = 0;
         self.replay_active = true;
-        self.replay_skipped = 0;
+        self.unsupported_replay_updates = 0;
+        self.active_prompt_id = None;
         self.assistant = None;
         self.thinking = None;
         self.tools.clear();
         self.orphan_tool_updates.clear();
     }
 
+    /// 为兼容遗漏显式边界的旧接线自动建立 replay fence，并保留 fence 前的计数。
+    fn begin_replay_after_unknown(&mut self) {
+        let replay_unknowns = self.unsupported_replay_updates;
+        self.begin_replay();
+        self.unsupported_replay_updates = replay_unknowns;
+    }
+
     /// 根据通知来源建立 replay 栅栏；live 首包与 replay 首包不能共用流式快照。
     fn prepare_origin(&mut self, origin: Origin) {
         match origin {
-            Origin::Replay if !self.replay_active => self.begin_replay(),
+            Origin::Replay if !self.replay_active => self.begin_replay_after_unknown(),
             Origin::Live if self.replay_active => {
                 self.replay_active = false;
+                self.active_prompt_id = None;
                 self.clear_text_snapshots();
             }
             _ => {}
         }
+    }
+
+    /// 切换 prompt 时丢弃旧文本快照；同 prompt 重入保持累计内容。
+    fn begin_prompt(&mut self, prompt_id: &str) {
+        if self.active_prompt_id.as_deref() != Some(prompt_id) {
+            self.active_prompt_id = Some(prompt_id.to_string());
+            self.clear_text_snapshots();
+        }
+    }
+
+    /// 按来源增加 actor-local 未知 update 计数，不触碰文本、工具或 sequence。
+    fn record_unknown_update(&mut self, origin: Origin) -> u64 {
+        let counter = match origin {
+            Origin::Live => &mut self.unsupported_live_updates,
+            Origin::Replay => &mut self.unsupported_replay_updates,
+        };
+        *counter = counter.saturating_add(1);
+        *counter
     }
 
     /// 分配单调 sequence；溢出时拒绝回绕。
@@ -371,12 +408,21 @@ fn project_assistant(
 ) -> Result<Vec<KitProductEvent>, ProjectError> {
     let prompt_id = required_prompt_id(meta, "agent_message_chunk")?;
     let text = required_text(update, "agent_message_chunk")?;
+    session.begin_prompt(prompt_id);
     // 新的 assistant 文本会结束上一段 thinking，连续 assistant chunk 继续同一快照。
     session.thinking = None;
     let snapshot = session.assistant.get_or_insert_with(|| TextSnapshot {
         block_id: event_id.clone(),
+        prompt_id: prompt_id.to_string(),
         text: String::new(),
     });
+    if snapshot.prompt_id != prompt_id {
+        *snapshot = TextSnapshot {
+            block_id: event_id.clone(),
+            prompt_id: prompt_id.to_string(),
+            text: String::new(),
+        };
+    }
     snapshot.text.push_str(text);
 
     Ok(vec![turn_event(
@@ -408,12 +454,21 @@ fn project_thinking(
 ) -> Result<Vec<KitProductEvent>, ProjectError> {
     let prompt_id = required_prompt_id(meta, "agent_thought_chunk")?;
     let text = required_text(update, "agent_thought_chunk")?;
+    session.begin_prompt(prompt_id);
     // 思考开始后，后续 assistant chunk 必须成为新的展示块。
     session.assistant = None;
     let snapshot = session.thinking.get_or_insert_with(|| TextSnapshot {
         block_id: event_id.clone(),
+        prompt_id: prompt_id.to_string(),
         text: String::new(),
     });
+    if snapshot.prompt_id != prompt_id {
+        *snapshot = TextSnapshot {
+            block_id: event_id.clone(),
+            prompt_id: prompt_id.to_string(),
+            text: String::new(),
+        };
+    }
     snapshot.text.push_str(text);
 
     Ok(vec![turn_event(
@@ -448,12 +503,9 @@ fn project_tool_call(
     let status = match tool_status(update.get("status")) {
         ToolStatusField::Known(status) => status,
         ToolStatusField::Absent => ToolStatus::Pending,
-        ToolStatusField::Unsupported => {
-            return Ok(skip_unknown_update(
-                scope_id, session_id, origin, sequence, session,
-            ));
-        }
+        ToolStatusField::Unsupported => return Ok(skip_unknown_update(origin, session)),
     };
+    session.begin_prompt(prompt_id);
     session.clear_text_snapshots();
     let mut tool = ToolSnapshot {
         name: optional_string(update, "title")
@@ -498,10 +550,9 @@ fn project_tool_call_update(
         required_string_from_map(update, "toolCallId").ok_or(ProjectError::MissingToolCallId)?;
     let parsed_status = tool_status(update.get("status"));
     if matches!(parsed_status, ToolStatusField::Unsupported) {
-        return Ok(skip_unknown_update(
-            scope_id, session_id, origin, sequence, session,
-        ));
+        return Ok(skip_unknown_update(origin, session));
     }
+    session.begin_prompt(prompt_id);
     session.clear_text_snapshots();
     let title = optional_string(update, "title");
     let detail = tool_detail(update);
@@ -553,6 +604,7 @@ fn project_user_echo(
 ) -> Result<Vec<KitProductEvent>, ProjectError> {
     let prompt_id = required_prompt_id(meta, "user_message_chunk")?;
     let text = required_text(update, "user_message_chunk")?;
+    session.begin_prompt(prompt_id);
     session.clear_text_snapshots();
 
     Ok(vec![turn_event(
@@ -569,38 +621,51 @@ fn project_user_echo(
     )])
 }
 
-/// 未知更新的 fail-open 分支：replay 只计数，live 发 session 级 Status。
-fn skip_unknown_update(
-    scope_id: &str,
-    session_id: &str,
-    origin: Origin,
-    sequence: u64,
-    session: &mut SessionProjection,
-) -> Vec<KitProductEvent> {
-    session.clear_text_snapshots();
-    if origin == Origin::Replay {
-        session.replay_skipped = session.replay_skipped.saturating_add(1);
-        return Vec::new();
+/// 未知更新的 fail-open 分支：只保留 actor-local 计数，不生成产品事件。
+fn skip_unknown_update(origin: Origin, session: &mut SessionProjection) -> Vec<KitProductEvent> {
+    let count = session.record_unknown_update(origin);
+    if should_log_skip(count) {
+        tracing::debug!(
+            origin = origin_name(origin),
+            unsupported_update_total = count,
+            "已内部化不支持的 ACP 更新"
+        );
+    }
+    Vec::new()
+}
+
+/// 以首条和指数间隔记录未知更新，避免异常 sidecar 刷屏。
+fn should_log_skip(count: u64) -> bool {
+    count == 1 || (count.is_power_of_two() && count < u64::MAX)
+}
+
+/// 只把已支持的 ACP update 放入序号分配后的投影路径。
+fn is_supported_update(update_kind: Option<&str>, update: Option<&Map<String, Value>>) -> bool {
+    let recognized = matches!(
+        update_kind,
+        Some(
+            "agent_message_chunk"
+                | "agent_thought_chunk"
+                | "tool_call"
+                | "tool_call_update"
+                | "user_message_chunk"
+        )
+    );
+    if !recognized {
+        return false;
     }
 
-    let code = "skipped_update";
-    let event_id = format!("{session_id}:host:{code}:{sequence}");
-    vec![KitProductEvent {
-        schema_version: KIT_SCHEMA_VERSION,
-        scope_id: scope_id.to_string(),
-        session_id: session_id.to_string(),
-        turn_id: None,
-        submission_id: None,
-        event_id: event_id.clone(),
-        sequence,
-        origin,
-        block_id: event_id,
-        // 不包含原始 update 名或 payload，避免未知内容进入产品显示与日志。
-        block: KitBlock::Status {
-            code: code.to_string(),
-            message: "已跳过不支持的 sidecar 更新".to_string(),
-        },
-    }]
+    // 工具状态 token 不在冻结的 Kit 五值内时，整条 update 也必须内部化。
+    if matches!(update_kind, Some("tool_call" | "tool_call_update"))
+        && matches!(
+            tool_status(update.and_then(|update| update.get("status"))),
+            ToolStatusField::Unsupported
+        )
+    {
+        return false;
+    }
+
+    true
 }
 
 /// 构造 turn 级事件；turn_id 与 submission_id 必须同时等于 ACP promptId。
@@ -641,15 +706,20 @@ fn tool_block(tool_call_id: &str, tool: &ToolSnapshot) -> KitBlock {
 
 /// 仅接受冻结 Kit 支持的工具状态；未知 token 整体按未知 update 跳过。
 fn tool_status(value: Option<&Value>) -> ToolStatusField {
-    match value.and_then(Value::as_str) {
-        None => ToolStatusField::Absent,
-        Some("pending") => ToolStatusField::Known(ToolStatus::Pending),
+    let Some(value) = value else {
+        return ToolStatusField::Absent;
+    };
+    let Some(status) = value.as_str() else {
+        return ToolStatusField::Unsupported;
+    };
+    match status {
+        "pending" => ToolStatusField::Known(ToolStatus::Pending),
         // ACP 的真实 token 是 in_progress；Kit 对产品固定为 running。
-        Some("in_progress") => ToolStatusField::Known(ToolStatus::Running),
-        Some("completed") => ToolStatusField::Known(ToolStatus::Completed),
-        Some("failed") => ToolStatusField::Known(ToolStatus::Failed),
-        Some("cancelled") => ToolStatusField::Known(ToolStatus::Cancelled),
-        Some(_) => ToolStatusField::Unsupported,
+        "in_progress" => ToolStatusField::Known(ToolStatus::Running),
+        "completed" => ToolStatusField::Known(ToolStatus::Completed),
+        "failed" => ToolStatusField::Known(ToolStatus::Failed),
+        "cancelled" => ToolStatusField::Known(ToolStatus::Cancelled),
+        _ => ToolStatusField::Unsupported,
     }
 }
 
@@ -757,4 +827,236 @@ fn finish_events(events: Vec<KitProductEvent>) -> Result<Vec<KitProductEvent>, P
             .map_err(ProjectError::InvalidProductEvent)?;
     }
     Ok(events)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::fmt;
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::{Value, json};
+    use tracing::{Event, Metadata, Subscriber, field, span};
+
+    use super::{Projector, should_log_skip};
+
+    /// 限频只允许首条和 2 的幂次日志，明确覆盖 1/2/3/4 边界。
+    #[test]
+    fn should_log_skip_covers_first_power_and_non_power_boundaries() {
+        assert!(should_log_skip(1));
+        assert!(should_log_skip(2));
+        assert!(!should_log_skip(3));
+        assert!(should_log_skip(4));
+    }
+
+    /// 构造携带测试秘密的未知通知，验证日志不会格式化原始 ACP payload。
+    fn unknown_notification(session_id: &str, is_replay: bool) -> Value {
+        json!({
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "future_tool_call_update_secret",
+                "status": { "secret": "status-payload-secret" },
+                "content": [{ "type": "text", "text": "payload-secret" }],
+                "privateField": "field-secret"
+            },
+            "_meta": {
+                "promptId": "prompt-secret",
+                "isReplay": is_replay,
+                "eventId": "event-secret"
+            }
+        })
+    }
+
+    /// 只捕获结构化 tracing 字段，避免测试依赖未声明的 tracing-subscriber。
+    #[derive(Clone, Default)]
+    struct LogCapture {
+        records: Arc<Mutex<Vec<LogRecord>>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct LogRecord {
+        fields: BTreeMap<String, String>,
+    }
+
+    impl LogCapture {
+        /// 复制捕获结果，使 subscriber guard 可以在断言前释放。
+        fn records(&self) -> Vec<LogRecord> {
+            self.records.lock().expect("日志捕获锁不应中毒").clone()
+        }
+    }
+
+    struct FieldCapture {
+        fields: BTreeMap<String, String>,
+    }
+
+    impl field::Visit for FieldCapture {
+        /// 固定保存 Debug 字段，message 等格式化字段不会展开嵌套 payload。
+        fn record_debug(&mut self, field: &field::Field, value: &dyn fmt::Debug) {
+            self.fields
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        /// 保留字符串字段原值，便于断言 origin 白名单。
+        fn record_str(&mut self, field: &field::Field, value: &str) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        /// 保留计数字段的十进制表示，便于断言限频边界。
+        fn record_u64(&mut self, field: &field::Field, value: u64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    impl Subscriber for LogCapture {
+        /// 仅接收 debug 级别事件，覆盖 projector 的限频日志调用。
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::DEBUG
+        }
+
+        /// 测试不创建 span，返回固定有效 ID 满足 Subscriber 接口。
+        fn new_span(&self, _span: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+
+        /// projector 不记录 span 字段，测试 subscriber 也不保留它们。
+        fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+
+        /// projector 不建立 span 因果关系。
+        fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+
+        /// 记录结构化事件字段，不格式化任何外部 ACP 参数。
+        fn event(&self, event: &Event<'_>) {
+            let mut visitor = FieldCapture {
+                fields: BTreeMap::new(),
+            };
+            event.record(&mut visitor);
+            self.records
+                .lock()
+                .expect("日志捕获锁不应中毒")
+                .push(LogRecord {
+                    fields: visitor.fields,
+                });
+        }
+
+        /// projector 测试不进入 span。
+        fn enter(&self, _span: &span::Id) {}
+
+        /// projector 测试不退出 span。
+        fn exit(&self, _span: &span::Id) {}
+    }
+
+    /// 多 session、双 origin 的计数必须隔离，限频日志必须脱敏且只含固定字段。
+    #[test]
+    fn unsupported_counters_are_session_origin_local_and_logs_are_redacted() {
+        let capture = LogCapture::default();
+        let mut projector = Projector::new("scope-1");
+        let records = {
+            let _guard = tracing::subscriber::set_default(capture.clone());
+            for _ in 0..4 {
+                assert!(
+                    projector
+                        .apply_acp_notification(
+                            "session/update",
+                            &unknown_notification("session-a", false),
+                        )
+                        .expect("live 未知通知必须安全忽略")
+                        .is_empty()
+                );
+            }
+            assert!(
+                projector
+                    .apply_acp_notification(
+                        "session/update",
+                        &unknown_notification("session-b", false),
+                    )
+                    .expect("另一个 live session 的未知通知必须安全忽略")
+                    .is_empty()
+            );
+
+            projector.begin_replay("session-a");
+            for _ in 0..4 {
+                assert!(
+                    projector
+                        .apply_acp_notification(
+                            "session/update",
+                            &unknown_notification("session-a", true),
+                        )
+                        .expect("replay 未知通知必须安全忽略")
+                        .is_empty()
+                );
+            }
+            projector.begin_replay("session-b");
+            assert!(
+                projector
+                    .apply_acp_notification(
+                        "session/update",
+                        &unknown_notification("session-b", true),
+                    )
+                    .expect("另一个 replay session 的未知通知必须安全忽略")
+                    .is_empty()
+            );
+            capture.records()
+        };
+
+        let session_a = projector
+            .sessions
+            .get("session-a")
+            .expect("session-a 应存在");
+        let session_b = projector
+            .sessions
+            .get("session-b")
+            .expect("session-b 应存在");
+        assert_eq!(session_a.unsupported_live_updates, 4);
+        assert_eq!(session_a.unsupported_replay_updates, 4);
+        assert_eq!(session_b.unsupported_live_updates, 1);
+        assert_eq!(session_b.unsupported_replay_updates, 1);
+
+        let origins_and_counts: Vec<(&str, u64)> = records
+            .iter()
+            .map(|record| {
+                let origin = record
+                    .fields
+                    .get("origin")
+                    .map(String::as_str)
+                    .expect("日志必须包含固定 origin 字段");
+                let count = record
+                    .fields
+                    .get("unsupported_update_total")
+                    .expect("日志必须包含固定 count 字段")
+                    .parse()
+                    .expect("日志 count 必须是十进制整数");
+                (origin, count)
+            })
+            .collect();
+        assert_eq!(
+            origins_and_counts,
+            vec![
+                ("live", 1),
+                ("live", 2),
+                ("live", 4),
+                ("live", 1),
+                ("replay", 1),
+                ("replay", 2),
+                ("replay", 4),
+                ("replay", 1),
+            ]
+        );
+        for record in records {
+            assert_eq!(
+                record.fields.keys().map(String::as_str).collect::<Vec<_>>(),
+                vec!["message", "origin", "unsupported_update_total"]
+            );
+            assert_eq!(
+                record.fields.get("message").map(String::as_str),
+                Some("已内部化不支持的 ACP 更新")
+            );
+            let serialized = format!("{:?}", record.fields);
+            assert!(!serialized.contains("secret"));
+            assert!(!serialized.contains("future_tool_call_update"));
+            assert!(!serialized.contains("payload"));
+            assert!(!serialized.contains("privateField"));
+        }
+    }
 }

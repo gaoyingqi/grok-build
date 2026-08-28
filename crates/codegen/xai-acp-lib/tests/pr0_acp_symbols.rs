@@ -1,27 +1,65 @@
-use std::{io::Write, path::PathBuf};
+use std::{future::Future, io::Write, path::PathBuf};
 
 use agent_client_protocol as acp;
 use async_trait::async_trait;
-use futures::io::Cursor;
+use futures::{future::LocalBoxFuture, io::Cursor};
 use serde_json::value::RawValue;
 use tokio::sync::oneshot;
 use xai_acp_lib::{AcpAgentMessage, AcpArgs, AcpMethod, LineBufferedRead};
 
-/// 仅用于编译期验证 AgentSideConnection::new 的真实参数约束。
-#[allow(dead_code)]
-fn assert_agent_side_connection_new_signature() {
-    let _ = acp::AgentSideConnection::new(
+type ConnectionSpawn = fn(LocalBoxFuture<'static, ()>);
+
+fn discard_spawn(_: LocalBoxFuture<'static, ()>) {}
+
+/// 用具体参数 wrapper 调用真实构造函数，并返回 wrapper 的函数类型证据。
+fn agent_side_connection_new_probe(
+    agent: DummyAgent,
+    outgoing: Cursor<Vec<u8>>,
+    incoming: Cursor<Vec<u8>>,
+    spawn: ConnectionSpawn,
+) -> (
+    acp::AgentSideConnection,
+    impl Future<Output = acp::Result<()>>,
+) {
+    acp::AgentSideConnection::new(agent, outgoing, incoming, spawn)
+}
+
+/// 返回已编译 wrapper 的函数项类型名，不凭字符串手写构造函数签名。
+fn agent_side_connection_new_type() -> String {
+    let constructor: fn(DummyAgent, Cursor<Vec<u8>>, Cursor<Vec<u8>>, ConnectionSpawn) -> _ =
+        agent_side_connection_new_probe;
+    let _ = constructor(
         DummyAgent,
         Cursor::new(Vec::<u8>::new()),
         Cursor::new(Vec::<u8>::new()),
-        |_future| {},
+        discard_spawn,
     );
+    std::any::type_name_of_val(&constructor).to_owned()
 }
 
-/// 仅用于编译期验证 LineBufferedRead::spawn_local 的真实输入约束。
-#[allow(dead_code)]
-fn assert_line_buffered_read_spawn_local_signature() {
-    let _ = LineBufferedRead::spawn_local(Cursor::new(Vec::<u8>::new()));
+/// 用具体参数 wrapper 验证真实 spawn_local 输入约束。
+fn line_buffered_read_spawn_local_probe(source: Cursor<Vec<u8>>) -> LineBufferedRead {
+    LineBufferedRead::spawn_local(source)
+}
+
+/// 返回已编译 wrapper 的函数项类型名，不在同步测试中启动 Tokio 任务。
+fn line_buffered_read_spawn_local_type() -> String {
+    let spawn_local: fn(Cursor<Vec<u8>>) -> LineBufferedRead = line_buffered_read_spawn_local_probe;
+    std::any::type_name_of_val(&spawn_local).to_owned()
+}
+
+/// 通过泛型 helper 逐一编译检查 ACP Agent trait 方法。
+fn compile_check_agent_methods<A: acp::Agent>(agent: &A) {
+    let _ = agent.initialize(acp::InitializeRequest::new(acp::ProtocolVersion::V1));
+    let _ = agent.new_session(acp::NewSessionRequest::new("/tmp"));
+    let _ = agent.load_session(acp::LoadSessionRequest::new("probe", "/tmp"));
+    let _ = agent.prompt(acp::PromptRequest::new(
+        acp::SessionId::new("probe"),
+        Vec::new(),
+    ));
+    let _ = agent.cancel(acp::CancelNotification::new("probe"));
+    let _ = agent.ext_method(ext_request());
+    let _ = agent.list_sessions(acp::ListSessionsRequest::new());
 }
 
 /// 通过最小 Agent 实现让 Rust 校验 ACP 的标准 Agent 方法面。
@@ -101,18 +139,31 @@ fn prints_acp_symbols_required_by_minimal_sidecar() {
     let mut evidence = vec!["requires_unstable=true".to_owned()];
     for (label, method) in methods {
         assert!(!method.is_empty(), "Agent 缺少方法 {label}");
-        evidence.push(format!("Agent.{label}={method}"));
+        evidence.push(format!("Agent.{label}.name_constant={method}"));
+    }
+    compile_check_agent_methods(&DummyAgent);
+    for label in [
+        "initialize",
+        "new_session",
+        "load_session",
+        "prompt",
+        "cancel",
+        "ext_method",
+        "list_sessions",
+    ] {
+        evidence.push(format!("Agent.{label}.trait_method=compile_checked"));
     }
 
     let (response_tx, _response_rx) = oneshot::channel();
     let message = AcpAgentMessage::ListSessions(AcpArgs {
-        request: acp::ListSessionsRequest::new(),
+        request: acp::ListSessionsRequest::new().cursor("next"),
         response_tx,
     });
     assert_eq!(message.method_name(), acp::AGENT_METHOD_NAMES.session_list);
     assert_ne!(message.method_name(), "_x.ai/session/list");
     let serialized = serde_json::to_value(&message).expect("serialize session/list message");
     assert_eq!(serialized["method_name"], "session/list");
+    assert_eq!(serialized["request"]["cursor"], "next");
     evidence.push("AcpAgentMessage.ListSessions=true".to_owned());
     evidence.push("AcpAgentMessage.ListSessions.method=session/list".to_owned());
     evidence.push("AcpAgentMessage.ListSessions.serialize=true".to_owned());
@@ -123,19 +174,20 @@ fn prints_acp_symbols_required_by_minimal_sidecar() {
         "request": { "cursor": "next" },
     }))
     .expect("deserialize session/list message");
+    assert!(matches!(&decoded, AcpAgentMessage::ListSessions(_)));
     assert_eq!(decoded.method_name(), acp::AGENT_METHOD_NAMES.session_list);
     let boxed = decoded.boxed();
     assert_eq!(boxed.method_name(), acp::AGENT_METHOD_NAMES.session_list);
     evidence.push("AcpAgentMessage.ListSessions.deserialize=true".to_owned());
     evidence.push("AcpAgentMessage.ListSessions.boxed=true".to_owned());
 
+    let constructor_type = agent_side_connection_new_type();
     evidence.push(format!(
-        "AgentSideConnection::new=compile_checked;type={}",
-        std::any::type_name::<acp::AgentSideConnection>()
+        "AgentSideConnection::new=compile_checked;function_type={constructor_type}"
     ));
+    let spawn_local_type = line_buffered_read_spawn_local_type();
     evidence.push(format!(
-        "LineBufferedRead::spawn_local=compile_checked;type={}",
-        std::any::type_name::<fn(Cursor<Vec<u8>>) -> LineBufferedRead>()
+        "LineBufferedRead::spawn_local=compile_checked;function_type={spawn_local_type}"
     ));
 
     let ext_req = serde_json::to_value(ext_request()).expect("serialize ext request");

@@ -1,3 +1,7 @@
 /target
 **/*.rs.bk
 .DS_Store
+
+# Local agent process directories
+.superpowers/
+.codegraph/

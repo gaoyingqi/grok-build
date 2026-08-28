@@ -18,6 +18,7 @@ use efflab_agent_host::{
 fn config(home_root: PathBuf) -> HostRuntimeConfig {
     HostRuntimeConfig {
         sidecar_bin: home_root.join("sidecar"),
+        sidecar_log_path: home_root.join("sidecar.log"),
         mcp_exec_root: home_root.join("mcp"),
         home_root,
         idle_after: Duration::from_secs(60),

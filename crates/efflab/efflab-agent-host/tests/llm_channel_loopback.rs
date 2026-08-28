@@ -921,6 +921,7 @@ fn channel_change_keeps_committed_view_when_live_scope_restart_fails() {
         HostRuntimeConfig {
             home_root: temporary.path().join("app-data"),
             sidecar_bin: script_path.clone(),
+            sidecar_log_path: temporary.path().join("sidecar.log"),
             mcp_exec_root: temporary.path().join("mcp"),
             idle_after: Duration::from_secs(60),
             l3b: L3bRuntimeConfig::default(),
@@ -961,6 +962,7 @@ fn unconfigured_channel_neither_listens_nor_spawns() {
         HostRuntimeConfig {
             home_root: home_root.clone(),
             sidecar_bin: temporary.path().join("missing-sidecar"),
+            sidecar_log_path: temporary.path().join("sidecar.log"),
             mcp_exec_root: temporary.path().join("mcp"),
             idle_after: Duration::from_secs(60),
             l3b: L3bRuntimeConfig::default(),
@@ -1016,6 +1018,7 @@ fn real_launch_writes_loopback_config_and_keeps_user_key_out_of_sidecar_environm
     let runtime_config = HostRuntimeConfig {
         home_root: temporary.path().join("app-data"),
         sidecar_bin: script_path,
+        sidecar_log_path: temporary.path().join("sidecar.log"),
         mcp_exec_root: temporary.path().join("mcp"),
         idle_after: Duration::from_secs(60),
         l3b: L3bRuntimeConfig::default(),
@@ -1063,4 +1066,54 @@ fn real_launch_writes_loopback_config_and_keeps_user_key_out_of_sidecar_environm
     )));
     assert!(captured_config.contains("model = \"launch-model\""));
     assert!(captured_config.contains("env_key = \"EFFLAB_L3B_BIND\""));
+}
+
+/// sidecar stderr 必须落到产品注入的独立日志文件，Host 不得假定任何产品目录。
+#[test]
+fn real_launch_writes_sidecar_stderr_to_injected_log_file() {
+    let temporary = tempfile::tempdir().expect("必须能创建 sidecar 日志测试目录");
+    let marker_path = temporary.path().join("sidecar-ready");
+    let log_path = temporary
+        .path()
+        .join("product-logs")
+        .join("agent-sidecar.log");
+    let script_path = temporary.path().join("stderr-sidecar.sh");
+    let script = format!(
+        "#!/bin/sh\necho sidecar-stderr-marker >&2\n: > {ready:?}\nwhile IFS= read -r _; do :; done\n",
+        ready = marker_path,
+    );
+    fs::write(&script_path, script).expect("必须能写入 stderr sidecar");
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
+        .expect("stderr sidecar 必须可执行");
+
+    let service = LlmChannelService::new(
+        Arc::new(FakeApp::byok(
+            "https://8.8.8.8/v1".to_string(),
+            "log-model",
+            "log-test-key",
+        )),
+        HostRuntimeConfig {
+            home_root: temporary.path().join("app-data"),
+            sidecar_bin: script_path,
+            sidecar_log_path: log_path.clone(),
+            mcp_exec_root: temporary.path().join("mcp"),
+            idle_after: Duration::from_secs(60),
+            l3b: L3bRuntimeConfig::default(),
+        },
+    )
+    .expect("已配置 BYOK 的 service 必须可构造");
+    service
+        .launch_scope("library-a")
+        .expect("真实 launch 必须能把 sidecar stderr 写到产品注入的日志文件");
+    wait_for_file(&marker_path);
+
+    let text = fs::read_to_string(&log_path).expect("必须能读取产品注入的 sidecar 日志");
+    assert!(
+        text.contains("sidecar-stderr-marker"),
+        "独立日志应包含 sidecar stderr，实际: {text}"
+    );
+    assert!(
+        text.contains("scope=library-a"),
+        "独立日志应包含 Host 写入的 spawn 头，实际: {text}"
+    );
 }

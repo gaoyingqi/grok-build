@@ -119,11 +119,16 @@ fn main() -> ExitCode {
     }
 }
 
-/// 初始化 tracing：日志固定输出到 stderr。
+/// 初始化 tracing：日志固定输出到 stderr，由 Host 重定向到独立文件。
+///
+/// 真实 sidecar 环境不含 `RUST_LOG`；缺省 `info`，避免独立日志文件空转。
 fn init_tracing() -> anyhow::Result<()> {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let subscriber = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(filter)
+        .with_ansi(false)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
     Ok(())

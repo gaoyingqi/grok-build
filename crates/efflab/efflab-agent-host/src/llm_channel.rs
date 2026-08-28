@@ -963,7 +963,10 @@ impl LlmChannelService {
         loopback.registry().invalidate_all();
         self.supervisor
             .restart_live_scopes(&loopback, &self.manager)
-            .map_err(|_| LlmChannelError::RestartFailed)?;
+            .map_err(|error| {
+                tracing::error!(error = %error, "sidecar 批量重启失败");
+                LlmChannelError::RestartFailed
+            })?;
         Ok(change)
     }
 
@@ -992,6 +995,7 @@ impl LlmChannelService {
 
 /// 不保留 Supervisor I/O 错误链，避免上层透传子进程环境或路径诊断。
 fn map_supervisor_error_to_lifecycle(error: SupervisorError) -> LlmChannelError {
+    tracing::error!(error = %error, "sidecar supervisor 失败");
     match error {
         SupervisorError::StateUnavailable => LlmChannelError::StateUnavailable,
         _ => LlmChannelError::LifecycleFailed,

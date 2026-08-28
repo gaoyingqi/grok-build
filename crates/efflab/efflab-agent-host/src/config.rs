@@ -33,6 +33,11 @@ pub struct HostRuntimeConfig {
     pub home_root: PathBuf,
     /// sidecar 可执行文件路径；Task 7 使用此路径执行受控子进程。
     pub sidecar_bin: PathBuf,
+    /// sidecar stderr 独立日志文件的绝对路径。
+    ///
+    /// 由嵌入产品注入，Host 不内置任何产品日志目录或文件名。
+    /// 以追加方式打开并重定向 child stderr；stdout 仍只承载 ACP JSON-RPC。
+    pub sidecar_log_path: PathBuf,
     /// 受控 MCP 可执行文件根目录；Task 7b 才会用于实际 MCP 配置。
     pub mcp_exec_root: PathBuf,
     /// 空闲回收阈值；Task 7b 才会接入完整 idle 状态机。

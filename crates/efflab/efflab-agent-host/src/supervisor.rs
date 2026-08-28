@@ -376,6 +376,7 @@ impl Supervisor {
         app_id: impl AsRef<str>,
     ) -> Result<Self, SupervisorError> {
         validate_absolute_path(&config.home_root)?;
+        validate_absolute_path(&config.sidecar_log_path)?;
         let app_id = sanitize(app_id.as_ref())?;
 
         Ok(Self {
@@ -517,12 +518,14 @@ impl Supervisor {
         let scopes = self.live_scope_ids()?;
         let mut failed = false;
         for scope in &scopes {
-            if self.stop_scope(scope).is_err() {
+            if let Err(error) = self.stop_scope(scope) {
+                tracing::error!(scope = %scope, error = %error, "sidecar 停止失败");
                 failed = true;
             }
         }
         for scope in &scopes {
-            if self.launch_sidecar(scope, loopback, channel).is_err() {
+            if let Err(error) = self.launch_sidecar(scope, loopback, channel) {
+                tracing::error!(scope = %scope, error = %error, "sidecar 重启启动失败");
                 failed = true;
             }
         }
@@ -581,6 +584,23 @@ impl Supervisor {
 
         // 仅此处把 binding token 注入 child；用户 Key 从不在 env、CLI 或 TOML 中出现。
         let environment = ChildEnvironment::for_sidecar_with_binding(&paths.home, &token)?;
+        let mut log_file = open_sidecar_log_file(&self.config.sidecar_log_path)?;
+        let spawned_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        writeln!(
+            log_file,
+            "--- sidecar spawn scope={scope_id} generation={generation} unix={spawned_at} ---"
+        )
+        .map_err(|source| SupervisorError::Io {
+            operation: "写入 sidecar 日志头",
+            source,
+        })?;
+        let stderr = Stdio::from(log_file.try_clone().map_err(|source| SupervisorError::Io {
+            operation: "复制 sidecar 日志句柄",
+            source,
+        })?);
         let mut command = Command::new(&self.config.sidecar_bin);
         command
             .arg("--stdio")
@@ -590,10 +610,21 @@ impl Supervisor {
             .arg(&paths.workspace)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(stderr);
         environment.apply(&mut command);
-        let (child, process_group) = spawn_enrolled_sidecar(&mut command, &self.process_scope)?;
+        let (child, process_group) =
+            match spawn_enrolled_sidecar(&mut command, &self.process_scope) {
+                Ok(spawned) => spawned,
+                Err(error) => {
+                    let _ = writeln!(log_file, "--- sidecar spawn failed: {error} ---");
+                    let _ = log_file.flush();
+                    return Err(error);
+                }
+            };
         let pid = child.id();
+        let _ = writeln!(log_file, "--- sidecar pid={pid} ---");
+        let _ = log_file.flush();
+        drop(log_file);
         // 在 slot 挂接前始终由 guard 独占 child；complete_slot_launch 任何失败均会触发
         // 同步 token 撤销、kill 与 wait，不能把已启动进程遗留为无监督 child。
         let mut child_guard = SpawnedSidecarGuard::new(ManagedSidecar {
@@ -1136,6 +1167,59 @@ fn write_authoritative_config(path: &Path, content: &[u8]) -> Result<(), Supervi
         let _ = fs::remove_file(&temporary);
     }
     write_result
+}
+
+/// 以追加方式打开 sidecar 独立日志文件；父目录不存在时创建。
+///
+/// 该文件只接收 sidecar stderr（tracing / 启动 eprintln），不得占用 ACP stdout。
+fn open_sidecar_log_file(path: &Path) -> Result<File, SupervisorError> {
+    validate_absolute_path(path)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or(SupervisorError::InvalidPathComponent)?;
+    fs::create_dir_all(parent).map_err(|source| SupervisorError::Io {
+        operation: "创建 sidecar 日志目录",
+        source,
+    })?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(SupervisorError::Io {
+                operation: "打开 sidecar 日志文件",
+                source: io::Error::other("sidecar 日志路径必须是普通文件"),
+            });
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(SupervisorError::Io {
+                operation: "读取 sidecar 日志元数据",
+                source,
+            });
+        }
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path).map_err(|source| SupervisorError::Io {
+        operation: "打开 sidecar 日志文件",
+        source,
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| {
+            SupervisorError::Io {
+                operation: "收紧 sidecar 日志权限",
+                source,
+            }
+        })?;
+    }
+    Ok(file)
 }
 
 /// 返回当前编译目标的 sidecar 监督能力，供尚未持有 `Supervisor` 的调用方查询。
@@ -1832,5 +1916,103 @@ mod tests {
 
         process_scope.kill_all();
         child.wait().expect("scope 关闭后必须回收 sidecar leader");
+    }
+}
+
+#[cfg(test)]
+mod sidecar_log_tests {
+    use super::{open_sidecar_log_file, SupervisorError};
+    use std::io::Write;
+    use std::path::Path;
+
+    /// 相对路径或含 `..` 的日志路径必须在打开前 fail-closed。
+    #[test]
+    fn sidecar_log_path_must_be_absolute_without_parent_dir() {
+        let relative = open_sidecar_log_file(Path::new("sidecar.log"))
+            .expect_err("相对 sidecar 日志路径必须拒绝");
+        assert!(matches!(
+            relative,
+            SupervisorError::HomeRootMustBeAbsolute
+        ));
+
+        let mut traversal = std::env::temp_dir();
+        traversal.push("efflab-sidecar");
+        traversal.push("..");
+        traversal.push("sidecar.log");
+        let traversal = open_sidecar_log_file(&traversal)
+            .expect_err("含 .. 的 sidecar 日志路径必须拒绝");
+        assert!(matches!(
+            traversal,
+            SupervisorError::HomeRootContainsParentDirectory
+        ));
+    }
+
+    /// 独立日志文件必须可创建父目录，并在再次打开时追加而不是截断。
+    #[test]
+    fn sidecar_log_file_creates_parent_and_appends() {
+        let temporary = tempfile::tempdir().expect("必须能创建 sidecar 日志测试目录");
+        let path = temporary.path().join("nested").join("sidecar.log");
+        {
+            let mut file = open_sidecar_log_file(&path).expect("首次打开 sidecar 日志必须成功");
+            writeln!(file, "first").expect("写入 sidecar 日志必须成功");
+        }
+        {
+            let mut file = open_sidecar_log_file(&path).expect("再次打开 sidecar 日志必须成功");
+            writeln!(file, "second").expect("追加 sidecar 日志必须成功");
+        }
+        let text = std::fs::read_to_string(&path).expect("必须能读取 sidecar 日志");
+        assert!(text.contains("first"), "独立日志应保留首次写入，实际: {text}");
+        assert!(
+            text.contains("second"),
+            "独立日志应追加第二次写入，实际: {text}"
+        );
+    }
+
+    /// 新建 sidecar 日志必须是 owner-only，已有过宽权限文件必须被收紧。
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_log_file_is_owner_only_and_tightens_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().expect("必须能创建 sidecar 权限测试目录");
+        let created = temporary.path().join("created.log");
+        open_sidecar_log_file(&created).expect("新建 sidecar 日志必须成功");
+        let created_mode = std::fs::symlink_metadata(&created)
+            .expect("必须能读取新建 sidecar 日志权限")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(created_mode, 0o600, "新建 sidecar 日志必须是 0o600");
+
+        let existing = temporary.path().join("existing.log");
+        std::fs::write(&existing, "old\n").expect("必须能写入预先存在的 sidecar 日志");
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644))
+            .expect("必须能把既有 sidecar 日志设为过宽权限");
+        open_sidecar_log_file(&existing).expect("打开既有 sidecar 日志必须成功");
+        let existing_mode = std::fs::symlink_metadata(&existing)
+            .expect("必须能读取收紧后的 sidecar 日志权限")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            existing_mode, 0o600,
+            "已有过宽 sidecar 日志必须被收紧为 0o600"
+        );
+    }
+
+    /// sidecar 日志路径若是符号链接必须 fail-closed，避免跟到产品目录外。
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_log_file_rejects_symlink() {
+        let temporary = tempfile::tempdir().expect("必须能创建 sidecar symlink 测试目录");
+        let target = temporary.path().join("target.log");
+        let link = temporary.path().join("sidecar.log");
+        std::fs::write(&target, "secret\n").expect("必须能写入 symlink 目标");
+        std::os::unix::fs::symlink(&target, &link).expect("必须能创建 sidecar 日志 symlink");
+        let error = open_sidecar_log_file(&link).expect_err("sidecar 日志 symlink 必须被拒绝");
+        assert!(
+            matches!(error, SupervisorError::Io { operation, .. } if operation == "打开 sidecar 日志文件"),
+            "symlink 必须按日志文件打开失败处理，实际: {error}"
+        );
     }
 }

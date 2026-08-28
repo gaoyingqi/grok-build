@@ -18,6 +18,7 @@ fn runtime_config() -> HostRuntimeConfig {
     HostRuntimeConfig {
         home_root: PathBuf::from("/tmp/efflab-agent-host-test/home"),
         sidecar_bin: PathBuf::from("/tmp/efflab-agent-host-test/sidecar"),
+        sidecar_log_path: PathBuf::from("/tmp/efflab-agent-host-test/sidecar.log"),
         mcp_exec_root: PathBuf::from("/tmp/efflab-agent-host-test/mcp"),
         idle_after: Duration::from_secs(60),
         l3b: efflab_agent_host::L3bRuntimeConfig::default(),

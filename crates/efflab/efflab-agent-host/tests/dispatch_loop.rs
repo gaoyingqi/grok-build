@@ -300,6 +300,7 @@ impl Harness {
         let config = HostRuntimeConfig {
             home_root: root.join("app-data"),
             sidecar_bin: sidecar.clone(),
+            sidecar_log_path: root.join("sidecar.log"),
             mcp_exec_root: root.join("mcp"),
             idle_after,
             l3b: Default::default(),
@@ -338,6 +339,7 @@ impl Harness {
             HostRuntimeConfig {
                 home_root: home_root.clone(),
                 sidecar_bin: temporary.path().join("must-not-spawn"),
+                sidecar_log_path: temporary.path().join("sidecar.log"),
                 mcp_exec_root: temporary.path().join("mcp"),
                 idle_after: Duration::from_secs(60),
                 l3b: Default::default(),

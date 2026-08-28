@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use anyhow::Result;
+use efflab_agent_contract::{ApprovedMcpConfig, mcp_config::approved_mcp_revision};
 use serde::{Deserialize, Serialize};
 
 /// 产品定义的不透明作用域标识，Host 不将其解释为文件路径。
@@ -33,27 +34,90 @@ pub struct ResolvedMention {
 
 /// 产品为当前 scope 审核过、模型可见的 MCP 工具集合。
 ///
-/// Task 7b 只消费此集合完成运行时 catalog/permission 校验；它不据此启动 MCP
-/// server。默认空集代表当前产品没有启用 Task 11 的领域 MCP。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ApprovedMcpSpec {
+/// 字段只在 Host 内部保存；对外仅提供已校验的 getter 与摘要。Task 7b 只消费
+/// 工具集合完成运行时 catalog/permission 校验，仍不据此启动 MCP server。
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApprovedMcpSpecV1 {
+    servers: ApprovedMcpConfig,
     expected_tools: BTreeSet<String>,
+    revision: String,
 }
 
-impl ApprovedMcpSpec {
-    /// 用审核后的完整工具名构造规格，并丢弃空白名称以保持失败关闭的空集语义。
+/// 兼容 Task 7 并行实现使用的旧类型名；底层类型已经统一为 v1 规格。
+pub type ApprovedMcpSpec = ApprovedMcpSpecV1;
+
+const EMPTY_APPROVED_MCP_REVISION: &str =
+    "sha256:7095b2a0427c1cb2248ed6befc9d832fa7fb34c05aae78a8a083cdfa6eb3f09b";
+
+impl fmt::Debug for ApprovedMcpSpecV1 {
+    /// 只输出数量和摘要，绝不回显 MCP URL、command、args 或其他内部字段。
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApprovedMcpSpecV1")
+            .field("server_count", &self.servers.servers.len())
+            .field("expected_tool_count", &self.expected_tools.len())
+            .field("revision", &self.revision)
+            .finish()
+    }
+}
+
+impl Default for ApprovedMcpSpecV1 {
+    /// 默认规格是稳定的空集，不触发任何 MCP transport。
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl ApprovedMcpSpecV1 {
+    /// 先拒绝 stdio，再校验 literal loopback HTTP、名称和摘要输入。
+    pub fn from_approved(
+        servers: ApprovedMcpConfig,
+        expected_tools: BTreeSet<String>,
+    ) -> Result<Self> {
+        // 第一项业务调用固定为 Task 3 的 stdio 拒绝 helper，避免触碰 command/args。
+        efflab_agent_contract::deny_stdio_mcp(&servers)?;
+        let revision = approved_mcp_revision(&servers, &expected_tools)?;
+        Ok(Self {
+            servers,
+            expected_tools,
+            revision,
+        })
+    }
+
+    /// 兼容 Task 7 的仅工具名构造；非法输入失败关闭为空规格。
     pub fn with_expected_tools(names: impl IntoIterator<Item = String>) -> Self {
-        Self {
-            expected_tools: names
-                .into_iter()
-                .filter(|name| !name.trim().is_empty())
-                .collect(),
+        let expected_tools = names
+            .into_iter()
+            .filter(|name| !name.trim().is_empty())
+            .collect();
+        match Self::from_approved(ApprovedMcpConfig::default(), expected_tools) {
+            Ok(spec) => spec,
+            Err(_) => Self::empty(),
         }
     }
 
-    /// 返回稳定排序的模型可见工具名；调用方不得把原始 MCP 配置泄漏到产品协议。
+    /// 返回已审核的 MCP 配置；调用方不得将其 Debug 或序列化到 Kit 协议。
+    pub fn servers(&self) -> &ApprovedMcpConfig {
+        &self.servers
+    }
+
+    /// 返回稳定排序的模型可见 qualified tool 名称。
     pub fn expected_tools(&self) -> &BTreeSet<String> {
         &self.expected_tools
+    }
+
+    /// 返回不含 MCP 原文的稳定审核 revision。
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+
+    /// 构造默认空规格；固定摘要与 contract canonical JSON 保持一致。
+    fn empty() -> Self {
+        Self {
+            servers: ApprovedMcpConfig::default(),
+            expected_tools: BTreeSet::new(),
+            revision: EMPTY_APPROVED_MCP_REVISION.to_string(),
+        }
     }
 }
 
@@ -219,7 +283,7 @@ pub trait HostApp: Send + Sync {
     }
 
     /// 返回当前作用域可用的 MCP 规格；Task 1 不调用。
-    fn mcp_for_scope(&self, scope: &ScopeId) -> Result<ApprovedMcpSpec>;
+    fn mcp_for_scope(&self, scope: &ScopeId) -> Result<ApprovedMcpSpecV1>;
 
     /// 可选的领域 mention 解析端口；缺省表示产品不支持 mention。
     fn mentions(&self) -> Option<&dyn HostAppMentions> {
@@ -238,11 +302,15 @@ pub trait HostAppMentions: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
     use anyhow::Result;
+    use efflab_agent_contract::{ApprovedMcpConfig, McpServerSpec};
 
     use super::{
-        ApprovedMcpSpec, HostApp, LlmChannelConfig, LlmSecretSlot, ScopeId, SealedSecret,
-        SecretGuard,
+        ApprovedMcpSpec, ApprovedMcpSpecV1, HostApp, LlmChannelConfig, LlmSecretSlot, ScopeId,
+        SealedSecret, SecretGuard,
     };
 
     /// 仅实现旧通用密封端口的 legacy adapter；它没有声明任何 Channel 槽位绑定。
@@ -292,5 +360,102 @@ mod tests {
                 "未声明的 {slot:?} 解封槽必须 fail-closed"
             );
         }
+    }
+
+    /// 直接构造单个 HTTP 审核配置，确保测试进入 v1 literal URL 校验。
+    fn http_config(url: &str) -> ApprovedMcpConfig {
+        let mut config = ApprovedMcpConfig::default();
+        config.servers.insert(
+            "demo".to_string(),
+            McpServerSpec::Http {
+                url: url.to_string(),
+            },
+        );
+        config
+    }
+
+    /// 直接构造 stdio 配置，验证 v1 拒绝前不读取 command 或启动进程。
+    fn stdio_config() -> ApprovedMcpConfig {
+        let mut config = ApprovedMcpConfig::default();
+        config.servers.insert(
+            "demo".to_string(),
+            McpServerSpec::Stdio {
+                command: PathBuf::from("/path/that-must-not-be-inspected"),
+                args: vec!["secret-argument".to_string()],
+            },
+        );
+        config
+    }
+
+    /// Host-facing v1 构造必须在任何 stdio 路径检查前稳定拒绝该 transport。
+    #[test]
+    fn approved_mcp_spec_v1_rejects_stdio_with_stable_error() {
+        let error = ApprovedMcpSpecV1::from_approved(stdio_config(), BTreeSet::new())
+            .expect_err("stdio MCP 在本轮必须拒绝");
+
+        assert!(error.to_string().contains("stdio_mcp_unavailable"));
+    }
+
+    /// v1 只接受字面量 loopback HTTP，并拒绝旧 validator 允许的宽松 URL 形状。
+    #[test]
+    fn approved_mcp_spec_v1_accepts_literal_http_and_rejects_invalid_urls() {
+        for url in ["http://127.0.0.1:4313/mcp"] {
+            let spec = ApprovedMcpSpecV1::from_approved(
+                http_config(url),
+                BTreeSet::from(["demo__search".to_string()]),
+            )
+            .expect("literal loopback HTTP 必须通过 v1 审核");
+            assert_eq!(spec.servers().servers.len(), 1);
+            assert_eq!(spec.expected_tools().len(), 1);
+            assert!(spec.revision().starts_with("sha256:"));
+        }
+
+        for url in [
+            "http://localhost:4313/mcp",
+            "https://127.0.0.1:4313/mcp",
+            "http://127.0.0.1/mcp",
+            "http://127.0.0.1:0/mcp",
+            "http://127.0.0.1:65536/mcp",
+            "http://127.0.0.1:4313",
+            "http://127.0.0.1:4313/mcp?token=secret",
+            "http://127.0.0.1:4313/mcp#fragment",
+        ] {
+            let result = ApprovedMcpSpecV1::from_approved(http_config(url), BTreeSet::new());
+            assert!(result.is_err(), "非法 HTTP URL 必须拒绝: {url}");
+        }
+    }
+
+    /// 兼容 Task 7 的工具集合构造，同时保持空规格和稳定 revision 语义。
+    #[test]
+    fn approved_mcp_spec_v1_empty_and_legacy_constructor_are_stable() {
+        let empty = ApprovedMcpSpecV1::default();
+        assert!(empty.servers().servers.is_empty());
+        assert!(empty.expected_tools().is_empty());
+        assert_eq!(
+            empty.revision(),
+            "sha256:7095b2a0427c1cb2248ed6befc9d832fa7fb34c05aae78a8a083cdfa6eb3f09b"
+        );
+
+        let compatible =
+            ApprovedMcpSpec::with_expected_tools(["demo__search".to_string(), " ".to_string()]);
+        assert_eq!(
+            compatible.expected_tools(),
+            &BTreeSet::from(["demo__search".to_string()])
+        );
+    }
+
+    /// 自定义 Debug 只显示计数与摘要，不回显审核配置中的 URL、command 或参数。
+    #[test]
+    fn approved_mcp_spec_v1_debug_does_not_expose_private_fields() {
+        let spec = ApprovedMcpSpecV1::from_approved(
+            http_config("http://127.0.0.1:4313/mcp"),
+            BTreeSet::from(["demo__search".to_string()]),
+        )
+        .expect("合法 HTTP 配置必须通过 v1 审核");
+        let debug = format!("{spec:?}");
+
+        assert!(debug.contains("ApprovedMcpSpecV1"));
+        assert!(!debug.contains("http://127.0.0.1:4313/mcp"));
+        assert!(!debug.contains("command"));
     }
 }

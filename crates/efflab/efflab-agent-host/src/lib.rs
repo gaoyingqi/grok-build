@@ -19,10 +19,11 @@ pub use acp_runtime::{
     AcpRuntime, Inbound, MAX_ACP_LINE_BYTES, METHOD_NOT_FOUND, RequestId, RpcError, ValidatedReply,
 };
 pub use app_port::{
-    ApprovedMcpSpec, HostApp, HostAppMentions, LlmChannelConfig, LlmSecretSlot, MentionId,
-    ResolvedMention, ScopeId, SealedSecret, SecretGuard,
+    ApprovedMcpSpec, ApprovedMcpSpecV1, HostApp, HostAppMentions, LlmChannelConfig, LlmSecretSlot,
+    MentionId, ResolvedMention, ScopeId, SealedSecret, SecretGuard,
 };
 pub use config::{HostRuntimeConfig, L3bRuntimeConfig};
+pub use efflab_agent_contract::{ApprovedMcpConfig, McpServerSpec};
 pub use event_sink::{KitEventSink, ValidatedKitEventSink};
 pub use llm_channel::{
     ChannelChange, LlmChannelError, LlmChannelManager, LlmChannelService, SetLlmChannelRequest,

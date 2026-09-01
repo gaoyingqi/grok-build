@@ -4,9 +4,17 @@
     "method": "initialize",
     "params": {
       "protocolVersion": 1,
-      "capabilities": { "terminal": false, "fs": false },
-      "client": { "mcpServers": [] },
-      "_meta": { "modelId": "grok-code-fast" }
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
     },
     "expect": "allow"
   },
@@ -14,19 +22,37 @@
     "name": "initialize rejects missing protocolVersion",
     "method": "initialize",
     "params": {
-      "capabilities": { "terminal": false, "fs": false },
-      "client": { "mcpServers": [] }
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
     },
     "expect": "reject",
     "rejection": "MissingRequiredField"
   },
   {
-    "name": "initialize rejects non-integer protocolVersion",
+    "name": "initialize rejects legacy string protocolVersion",
     "method": "initialize",
     "params": {
       "protocolVersion": "1",
-      "capabilities": { "terminal": false, "fs": false },
-      "client": { "mcpServers": [] }
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
     },
     "expect": "reject",
     "rejection": "InvalidFieldType"
@@ -36,8 +62,17 @@
     "method": "initialize",
     "params": {
       "protocolVersion": 2,
-      "capabilities": { "terminal": false, "fs": false },
-      "client": { "mcpServers": [] }
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
     },
     "expect": "reject",
     "rejection": "UnsupportedProtocolVersion"
@@ -47,138 +82,706 @@
     "method": "initialize",
     "params": {
       "protocolVersion": 1,
-      "capabilities": { "terminal": false, "fs": false },
-      "client": { "mcpServers": [] },
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      },
       "authentication": {}
     },
     "expect": "reject",
     "rejection": "UnknownField"
   },
   {
-    "name": "initialize terminal capability",
+    "name": "initialize rejects terminal capability",
     "method": "initialize",
     "params": {
-      "capabilities": { "terminal": true, "fs": false },
-      "client": { "mcpServers": [] }
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": true
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
     },
     "expect": "reject",
     "rejection": "TerminalCapabilityEnabled"
   },
   {
-    "name": "initialize fs capability",
+    "name": "initialize rejects fs readTextFile capability",
     "method": "initialize",
     "params": {
-      "capabilities": { "terminal": false, "fs": true },
-      "client": { "mcpServers": [] }
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": true,
+          "writeTextFile": false
+        },
+        "terminal": false
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
     },
     "expect": "reject",
     "rejection": "FsCapabilityEnabled"
   },
   {
-    "name": "initialize client mcpServers",
+    "name": "initialize rejects fs writeTextFile capability",
     "method": "initialize",
     "params": {
-      "capabilities": { "terminal": false, "fs": false },
-      "client": { "mcpServers": [{ "name": "evil" }] }
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": true
+        },
+        "terminal": false
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
     },
     "expect": "reject",
-    "rejection": "ClientMcpServersNotAllowed"
+    "rejection": "FsCapabilityEnabled"
   },
   {
-    "name": "initialize rejects empty params because security fields are required",
+    "name": "initialize rejects legacy client mcpServers",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      },
+      "client": {
+        "mcpServers": [
+          {
+            "name": "evil"
+          }
+        ]
+      }
+    },
+    "expect": "reject",
+    "rejection": "UnknownField"
+  },
+  {
+    "name": "initialize rejects legacy capabilities field",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      },
+      "capabilities": {
+        "terminal": false,
+        "fs": false
+      }
+    },
+    "expect": "reject",
+    "rejection": "UnknownField"
+  },
+  {
+    "name": "initialize rejects empty params because protocolVersion is required",
     "method": "initialize",
     "params": {},
     "expect": "reject",
     "rejection": "MissingRequiredField"
   },
   {
-    "name": "initialize rejects empty capabilities",
-    "method": "initialize",
-    "params": {
-      "capabilities": {},
-      "client": { "mcpServers": [] }
-    },
-    "expect": "reject",
-    "rejection": "MissingRequiredField"
-  },
-  {
-    "name": "initialize rejects empty client",
-    "method": "initialize",
-    "params": {
-      "capabilities": { "terminal": false, "fs": false },
-      "client": {}
-    },
-    "expect": "reject",
-    "rejection": "MissingRequiredField"
-  },
-  {
-    "name": "initialize rejects unknown capabilities key",
-    "method": "initialize",
-    "params": {
-      "capabilities": { "terminal": false, "fs": false, "network": false },
-      "client": { "mcpServers": [] }
-    },
-    "expect": "reject",
-    "rejection": "UnknownNestedField"
-  },
-  {
-    "name": "initialize rejects unknown client key",
-    "method": "initialize",
-    "params": {
-      "capabilities": { "terminal": false, "fs": false },
-      "client": { "mcpServers": [], "plugins": [] }
-    },
-    "expect": "reject",
-    "rejection": "UnknownNestedField"
-  },
-  {
-    "name": "initialize unknown meta key",
+    "name": "initialize rejects missing clientCapabilities",
     "method": "initialize",
     "params": {
       "protocolVersion": 1,
-      "capabilities": { "terminal": false, "fs": false },
-      "client": { "mcpServers": [] },
-      "_meta": { "sneaky": 1 }
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
+    },
+    "expect": "reject",
+    "rejection": "MissingRequiredField"
+  },
+  {
+    "name": "initialize rejects empty clientCapabilities",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {},
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
+    },
+    "expect": "reject",
+    "rejection": "MissingRequiredField"
+  },
+  {
+    "name": "initialize rejects missing clientInfo",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false
+      }
+    },
+    "expect": "reject",
+    "rejection": "MissingRequiredField"
+  },
+  {
+    "name": "initialize rejects empty clientInfo",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false
+      },
+      "clientInfo": {}
+    },
+    "expect": "reject",
+    "rejection": "MissingRequiredField"
+  },
+  {
+    "name": "initialize rejects missing clientCapabilities.fs",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "terminal": false
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
+    },
+    "expect": "reject",
+    "rejection": "MissingRequiredField"
+  },
+  {
+    "name": "initialize rejects missing clientCapabilities.terminal",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        }
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
+    },
+    "expect": "reject",
+    "rejection": "MissingRequiredField"
+  },
+  {
+    "name": "initialize rejects missing clientCapabilities.fs.readTextFile",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "writeTextFile": false
+        },
+        "terminal": false
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
+    },
+    "expect": "reject",
+    "rejection": "MissingRequiredField"
+  },
+  {
+    "name": "initialize rejects missing clientCapabilities.fs.writeTextFile",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false
+        },
+        "terminal": false
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
+    },
+    "expect": "reject",
+    "rejection": "MissingRequiredField"
+  },
+  {
+    "name": "initialize rejects unknown clientCapabilities key",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false,
+        "network": false
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
+    },
+    "expect": "reject",
+    "rejection": "UnknownNestedField"
+  },
+  {
+    "name": "initialize rejects unknown clientInfo key",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0",
+        "plugins": []
+      }
+    },
+    "expect": "reject",
+    "rejection": "UnknownNestedField"
+  },
+  {
+    "name": "initialize rejects optional clientInfo title",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "title": "Efflab Test Client",
+        "version": "0.1.0"
+      }
+    },
+    "expect": "reject",
+    "rejection": "UnknownNestedField"
+  },
+  {
+    "name": "initialize rejects clientInfo meta",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0",
+        "_meta": {}
+      }
+    },
+    "expect": "reject",
+    "rejection": "UnknownNestedField"
+  },
+  {
+    "name": "initialize rejects clientCapabilities meta",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false,
+        "_meta": {}
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
+    },
+    "expect": "reject",
+    "rejection": "UnknownNestedField"
+  },
+  {
+    "name": "initialize rejects clientCapabilities fs meta",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false,
+          "_meta": {}
+        },
+        "terminal": false
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
+    },
+    "expect": "reject",
+    "rejection": "UnknownNestedField"
+  },
+  {
+    "name": "initialize rejects unstable auth capability",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false,
+        "auth": { "terminal": false }
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
+    },
+    "expect": "reject",
+    "rejection": "UnknownNestedField"
+  },
+  {
+    "name": "initialize rejects unstable auth nested meta",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false,
+        "auth": { "terminal": false, "_meta": {} }
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
+    },
+    "expect": "reject",
+    "rejection": "UnknownNestedField"
+  },
+  {
+    "name": "initialize rejects unstable elicitation capability",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false,
+        "elicitation": { "form": {} }
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
+    },
+    "expect": "reject",
+    "rejection": "UnknownNestedField"
+  },
+  {
+    "name": "initialize rejects unstable nes capability",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false,
+        "nes": { "jump": {} }
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
+    },
+    "expect": "reject",
+    "rejection": "UnknownNestedField"
+  },
+  {
+    "name": "initialize rejects unstable positionEncodings",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false,
+        "positionEncodings": ["utf-16"]
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
+    },
+    "expect": "reject",
+    "rejection": "UnknownNestedField"
+  },
+  {
+    "name": "initialize rejects unknown meta key",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      },
+      "_meta": {
+        "sneaky": 1
+      }
     },
     "expect": "reject",
     "rejection": "UnknownMetaKey"
   },
   {
-    "name": "initialize unknown top-level field",
+    "name": "initialize rejects unknown top-level field",
     "method": "initialize",
-    "params": { "sneakyField": 1 },
+    "params": {
+      "sneakyField": 1
+    },
     "expect": "reject",
     "rejection": "UnknownField"
   },
   {
-    "name": "initialize capabilities non-object",
+    "name": "initialize rejects clientCapabilities non-object",
     "method": "initialize",
     "params": {
-      "capabilities": [],
-      "client": { "mcpServers": [] }
+      "protocolVersion": 1,
+      "clientCapabilities": [],
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
     },
     "expect": "reject",
     "rejection": "InvalidFieldType"
   },
   {
-    "name": "initialize client non-object",
+    "name": "initialize rejects clientInfo non-object",
     "method": "initialize",
     "params": {
-      "capabilities": { "terminal": false, "fs": false },
-      "client": "invalid"
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false
+      },
+      "clientInfo": "invalid"
     },
     "expect": "reject",
     "rejection": "InvalidFieldType"
   },
   {
-    "name": "initialize terminal wrong type",
+    "name": "initialize rejects terminal wrong type",
     "method": "initialize",
     "params": {
-      "capabilities": { "terminal": "false", "fs": false },
-      "client": { "mcpServers": [] }
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": "false"
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
     },
     "expect": "reject",
     "rejection": "InvalidFieldType"
+  },
+  {
+    "name": "initialize rejects fs readTextFile wrong type",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": "false",
+          "writeTextFile": false
+        },
+        "terminal": false
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
+    },
+    "expect": "reject",
+    "rejection": "InvalidFieldType"
+  },
+  {
+    "name": "initialize rejects fs writeTextFile wrong type",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": "false"
+        },
+        "terminal": false
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": "0.1.0"
+      }
+    },
+    "expect": "reject",
+    "rejection": "InvalidFieldType"
+  },
+  {
+    "name": "initialize rejects clientInfo name wrong type",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false
+      },
+      "clientInfo": {
+        "name": 1,
+        "version": "0.1.0"
+      }
+    },
+    "expect": "reject",
+    "rejection": "InvalidFieldType"
+  },
+  {
+    "name": "initialize rejects clientInfo version wrong type",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": 1
+      }
+    },
+    "expect": "reject",
+    "rejection": "InvalidFieldType"
+  },
+  {
+    "name": "initialize rejects empty clientInfo name",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false
+      },
+      "clientInfo": {
+        "name": "",
+        "version": "0.1.0"
+      }
+    },
+    "expect": "reject",
+    "rejection": "ForbiddenField"
+  },
+  {
+    "name": "initialize rejects empty clientInfo version",
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 1,
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false
+      },
+      "clientInfo": {
+        "name": "efflab-test-client",
+        "version": ""
+      }
+    },
+    "expect": "reject",
+    "rejection": "ForbiddenField"
   },
   {
     "name": "session/new ok",
@@ -186,9 +789,20 @@
     "params": {
       "cwd": "{{CWD}}",
       "mcpServers": [],
-      "_meta": { "modelId": "grok-code-fast" }
+      "_meta": { "modelId": "byok" }
     },
     "expect": "allow"
+  },
+  {
+    "name": "session/new rejects sessionId",
+    "method": "session/new",
+    "params": {
+      "sessionId": "must-not-be-forwarded",
+      "cwd": "{{CWD}}",
+      "mcpServers": []
+    },
+    "expect": "reject",
+    "rejection": "UnknownField"
   },
   {
     "name": "session/new cwd mismatch",
@@ -284,7 +898,12 @@
   {
     "name": "session/load ok",
     "method": "session/load",
-    "params": { "sessionId": "s1", "cwd": "{{CWD}}", "mcpServers": [] },
+    "params": {
+      "sessionId": "s1",
+      "cwd": "{{CWD}}",
+      "mcpServers": [],
+      "_meta": { "modelId": "byok" }
+    },
     "expect": "allow"
   },
   {
@@ -293,6 +912,46 @@
     "params": { "cwd": "{{CWD}}", "mcpServers": [] },
     "expect": "reject",
     "rejection": "MissingRequiredField"
+  },
+  {
+    "name": "session/load rejects null sessionId",
+    "method": "session/load",
+    "params": { "sessionId": null, "cwd": "{{CWD}}", "mcpServers": [] },
+    "expect": "reject",
+    "rejection": "InvalidFieldType"
+  },
+  {
+    "name": "session/load rejects numeric sessionId",
+    "method": "session/load",
+    "params": { "sessionId": 123, "cwd": "{{CWD}}", "mcpServers": [] },
+    "expect": "reject",
+    "rejection": "InvalidFieldType"
+  },
+  {
+    "name": "session/load rejects object sessionId",
+    "method": "session/load",
+    "params": { "sessionId": {}, "cwd": "{{CWD}}", "mcpServers": [] },
+    "expect": "reject",
+    "rejection": "InvalidFieldType"
+  },
+  {
+    "name": "session/load rejects empty sessionId",
+    "method": "session/load",
+    "params": { "sessionId": "", "cwd": "{{CWD}}", "mcpServers": [] },
+    "expect": "reject",
+    "rejection": "InvalidFieldType"
+  },
+  {
+    "name": "session/load rejects cursor",
+    "method": "session/load",
+    "params": {
+      "sessionId": "s1",
+      "cwd": "{{CWD}}",
+      "mcpServers": [],
+      "cursor": "replay-cursor"
+    },
+    "expect": "reject",
+    "rejection": "UnknownField"
   },
   {
     "name": "session/load unknown top-level field",
@@ -327,29 +986,56 @@
   {
     "name": "x.ai/mcp/list ok",
     "method": "x.ai/mcp/list",
-    "params": {},
+    "params": { "sessionId": "s1" },
     "expect": "allow"
+  },
+  {
+    "name": "x.ai/mcp/list allows empty meta",
+    "method": "x.ai/mcp/list",
+    "params": { "sessionId": "s1", "_meta": {} },
+    "expect": "allow"
+  },
+  {
+    "name": "x.ai/mcp/list rejects missing sessionId",
+    "method": "x.ai/mcp/list",
+    "params": {},
+    "expect": "reject",
+    "rejection": "MissingRequiredField"
+  },
+  {
+    "name": "x.ai/mcp/list rejects null sessionId",
+    "method": "x.ai/mcp/list",
+    "params": { "sessionId": null },
+    "expect": "reject",
+    "rejection": "InvalidFieldType"
+  },
+  {
+    "name": "x.ai/mcp/list rejects numeric sessionId",
+    "method": "x.ai/mcp/list",
+    "params": { "sessionId": 123 },
+    "expect": "reject",
+    "rejection": "InvalidFieldType"
+  },
+  {
+    "name": "x.ai/mcp/list rejects empty sessionId",
+    "method": "x.ai/mcp/list",
+    "params": { "sessionId": "" },
+    "expect": "reject",
+    "rejection": "InvalidFieldType"
   },
   {
     "name": "x.ai/mcp/list unknown meta",
     "method": "x.ai/mcp/list",
-    "params": { "_meta": { "sneaky": 1 } },
+    "params": { "sessionId": "s1", "_meta": { "sneaky": 1 } },
     "expect": "reject",
     "rejection": "UnknownMetaKey"
   },
   {
     "name": "x.ai/mcp/list meta null",
     "method": "x.ai/mcp/list",
-    "params": { "_meta": null },
+    "params": { "sessionId": "s1", "_meta": null },
     "expect": "reject",
     "rejection": "ForbiddenField"
-  },
-  {
-    "name": "x.ai/mcp/list top-level modelId",
-    "method": "x.ai/mcp/list",
-    "params": { "modelId": "grok-code-fast" },
-    "expect": "reject",
-    "rejection": "UnknownField"
   },
   {
     "name": "unknown method",
@@ -384,12 +1070,12 @@
     "rejection": "InvalidFieldType"
   },
   {
-    "name": "modelId not allowed",
+    "name": "provider model string is not a Channel",
     "method": "session/new",
     "params": {
       "cwd": "{{CWD}}",
       "mcpServers": [],
-      "_meta": { "modelId": "grok-code-evil" }
+      "_meta": { "modelId": "grok-code-fast" }
     },
     "expect": "reject",
     "rejection": "ModelIdNotAllowed"
@@ -708,9 +1394,9 @@
     "rejection": "UnknownField"
   },
   {
-    "name": "session/list rejects additional_directories",
+    "name": "session/list rejects additionalDirectories",
     "method": "session/list",
-    "params": { "cwd": "{{CWD}}", "additional_directories": ["{{OTHER}}"] },
+    "params": { "cwd": "{{CWD}}", "additionalDirectories": ["{{OTHER}}"] },
     "expect": "reject",
     "rejection": "UnknownField"
   },
@@ -734,5 +1420,45 @@
     "params": { "cwd": "{{CWD}}", "_meta": { "modelId": "grok-code-fast" } },
     "expect": "reject",
     "rejection": "UnknownField"
+  },
+  {
+    "name": "session_prompt_with_flat_text",
+    "method": "session/prompt",
+    "params": {
+      "sessionId": "s1",
+      "text": "不能使用扁平 text",
+      "prompt": [
+        { "type": "text", "text": "正常内容" }
+      ],
+      "_meta": { "promptId": "submission-1" }
+    },
+    "expect": "reject",
+    "rejection": "UnknownField"
+  },
+  {
+    "name": "session_prompt_with_prompt_id",
+    "method": "session/prompt",
+    "params": {
+      "sessionId": "s1",
+      "prompt": [
+        { "type": "text", "text": "使用 promptId 的正常 prompt" }
+      ],
+      "_meta": { "promptId": "submission-1" }
+    },
+    "expect": "allow"
+  },
+  {
+    "name": "session_list_with_limit",
+    "method": "session/list",
+    "params": { "cwd": "{{CWD}}", "limit": 30 },
+    "expect": "reject",
+    "rejection": "UnknownField"
+  },
+  {
+    "name": "ext_session_list_is_rejected",
+    "method": "_x.ai/session/list",
+    "params": { "cwd": "{{CWD}}", "allowRelax": true },
+    "expect": "reject",
+    "rejection": "UnknownMethod"
   }
 ]

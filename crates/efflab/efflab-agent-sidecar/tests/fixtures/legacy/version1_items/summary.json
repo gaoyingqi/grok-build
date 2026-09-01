@@ -1,0 +1,12 @@
+{
+  "info": {"id": "legacy-1", "cwd": "/legacy/workspace"},
+  "session_summary": "Version one fixture",
+  "created_at": "2026-08-29T00:00:00Z",
+  "updated_at": "2026-08-29T00:00:01Z",
+  "num_messages": 4,
+  "num_chat_messages": 4,
+  "current_model_id": "fixture-model",
+  "chat_format_version": 1,
+  "generated_title": "Legacy fixture title",
+  "title_is_manual": false
+}

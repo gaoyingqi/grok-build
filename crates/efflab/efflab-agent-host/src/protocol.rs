@@ -79,7 +79,8 @@ impl fmt::Debug for KitCommand {
                 .field("scope_id", scope_id)
                 .field("session_id", session_id)
                 .field("submission_id", submission_id)
-                .field("text", text)
+                // prompt 可含用户隐私；Debug 只显示固定脱敏标记和 Unicode 字符数。
+                .field("text", &redacted_text_debug(text))
                 .field("mentions", mentions)
                 .finish(),
             Self::Cancel {
@@ -139,6 +140,11 @@ impl fmt::Debug for KitCommand {
             Self::Unknown { cmd } => formatter.debug_struct("Unknown").field("cmd", cmd).finish(),
         }
     }
+}
+
+/// 生成不含原文的 prompt 调试摘要；长度只按 Unicode 标量计数。
+fn redacted_text_debug(text: &str) -> String {
+    format!("[REDACTED; len={}]", text.chars().count())
 }
 
 impl KitCommand {
@@ -632,6 +638,23 @@ fn is_session_status(code: &str) -> bool {
     )
 }
 
+/// 判断事件是否可以进入 Host 的可恢复 transcript；control/fence 与未知诊断永不入表。
+///
+/// 旧的 `skipped_update` / `replay_skipped` 仍保留为解析兼容的开放 status code，但不在
+/// 此白名单中，因此新 Host 不会发送或恢复它们。
+pub fn is_recoverable_product_event(event: &KitProductEvent) -> bool {
+    match &event.block {
+        KitBlock::User { .. }
+        | KitBlock::Assistant { .. }
+        | KitBlock::Thinking { .. }
+        | KitBlock::Tool { .. } => true,
+        KitBlock::Status { code, .. } => {
+            matches!(code.as_str(), "turn_completed" | "cancelled" | "error")
+        }
+        KitBlock::Error(_) | KitBlock::Retry { .. } | KitBlock::Unknown { .. } => false,
+    }
+}
+
 /// `get_capability` 命令的 wire 形状。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GetCapabilityCommand {
@@ -974,5 +997,27 @@ impl From<UnknownBlock> for KitBlock {
         Self::Unknown {
             unknown_kind: block.unknown_kind,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Send 的 Debug 只能暴露固定长度摘要，不能回显用户 prompt。
+    #[test]
+    fn send_debug_redacts_prompt_text() {
+        let secret = "用户私密 prompt：不要写入日志";
+        let command = KitCommand::Send {
+            scope_id: "scope-a".to_string(),
+            session_id: "session-a".to_string(),
+            submission_id: "submission-a".to_string(),
+            text: secret.to_string(),
+            mentions: None,
+        };
+
+        let debug = format!("{command:?}");
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("[REDACTED; len="));
     }
 }

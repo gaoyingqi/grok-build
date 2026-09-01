@@ -2,10 +2,10 @@
 //!
 //! 职责：可信 Host 在写入 sidecar stdin 前，必须对每个 ACP 请求执行
 //! **字段白名单**（非黑名单）校验：
-//! - `initialize` 仅允许固定协议版本、客户端、能力与 `_meta` 字段；
+//! - `initialize` 仅允许固定协议版本、客户端能力、客户端信息与 `_meta` 字段；
 //!   `protocolVersion` 必须精确等于 Host 固定 ACP 版本，
-//!   `capabilities.terminal` / `capabilities.fs` 必须为 false，
-//!   `client.mcpServers` 必须为空数组（MCP 全部来自 `--mcp-config`）。
+//!   `clientCapabilities.terminal`、`clientCapabilities.fs.readTextFile` 与
+//!   `clientCapabilities.fs.writeTextFile` 必须为 false。
 //! - `session/new` / `session/load` 仅允许会话、cwd、MCP 与 `_meta` 字段；
 //!   `cwd` 精确匹配策略指定值，`mcpServers` 必须为空数组。
 //! - `session/prompt` 只接受纯文本 ContentBlock，并在写入前阻断 grok-shell
@@ -15,7 +15,7 @@
 //! - 未知字段与未知 method 默认拒绝（fail-closed）。
 //!
 //! 字段拼写遵循 ACP wire 协议（camelCase）：`_meta`、`cwd`、`mcpServers`、
-//! `capabilities`、`sessionId`、`modelId`。
+//! `clientCapabilities`、`clientInfo`、`sessionId`、`modelId`。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -26,11 +26,27 @@ use thiserror::Error;
 /// Host 支持且写入每个 `initialize` 请求的唯一 ACP 协议版本。
 pub const HOST_ACP_PROTOCOL_VERSION: u64 = 1;
 
-/// `initialize` 顶层 params 的唯一允许字段集合。
-const INITIALIZE_ALLOWED_FIELDS: &[&str] = &["protocolVersion", "client", "capabilities", "_meta"];
+/// promptId 的共享持久化边界；按 UTF-8 字节计算，而不是 Unicode 字符数。
+const MAX_PROMPT_ID_BYTES: usize = 1024;
 
-/// `session/new` 与 `session/load` 顶层 params 的唯一允许字段集合。
-const SESSION_ALLOWED_FIELDS: &[&str] = &["sessionId", "cwd", "mcpServers", "_meta"];
+/// 校验 ACP `_meta.promptId` 的非空、无控制字符和字节上限合同。
+pub fn is_prompt_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= MAX_PROMPT_ID_BYTES && !value.chars().any(char::is_control)
+}
+
+/// `initialize` 顶层 params 的唯一允许字段集合。
+const INITIALIZE_ALLOWED_FIELDS: &[&str] = &[
+    "protocolVersion",
+    "clientCapabilities",
+    "clientInfo",
+    "_meta",
+];
+
+/// `session/new` 顶层 params 的唯一允许字段集合。
+const SESSION_NEW_ALLOWED_FIELDS: &[&str] = &["cwd", "mcpServers", "_meta"];
+
+/// `session/load` 顶层 params 的唯一允许字段集合。
+const SESSION_LOAD_ALLOWED_FIELDS: &[&str] = &["sessionId", "cwd", "mcpServers", "_meta"];
 
 /// `session/prompt` 顶层 params 的唯一允许字段集合。
 const SESSION_PROMPT_ALLOWED_FIELDS: &[&str] = &["sessionId", "prompt", "_meta"];
@@ -68,12 +84,24 @@ impl HostPolicy {
         }
     }
 
-    /// 为一个指定 method 追加允许的 `_meta` 键。
+    /// 为一个指定 method 追加合同允许的 `_meta` 键。
+    ///
+    /// 保持 fluent API 兼容，但非法组合会被忽略，不能通过 builder 改写固定合同。
     pub fn with_meta_key_for(mut self, method: impl Into<String>, key: impl Into<String>) -> Self {
-        self.allowed_meta_keys_by_method
-            .entry(method.into())
-            .or_default()
-            .push(key.into());
+        let method = method.into();
+        let key = key.into();
+        let allowed = matches!(
+            (method.as_str(), key.as_str()),
+            ("session/new", "modelId")
+                | ("session/load", "modelId")
+                | ("session/prompt", "promptId")
+        );
+        if allowed {
+            self.allowed_meta_keys_by_method
+                .entry(method)
+                .or_default()
+                .push(key);
+        }
         self
     }
 
@@ -171,8 +199,8 @@ pub fn validate_host_request(
         "session/prompt" => validate_session_prompt(params, policy),
         "session/cancel" => validate_session_cancel(params),
         "session/list" => validate_session_list(params, policy),
-        // 只读协议方法：仍校验 _meta 与未知字段，但放宽 cwd/mcpServers 约束。
-        "x.ai/mcp/list" => validate_meta_only(method, params, policy),
+        // 只读协议方法：要求 sessionId，并只允许空 _meta。
+        "x.ai/mcp/list" => validate_mcp_list(params),
         // 已由 validate_top_level_fields 拒绝；保留分支防止未来修改绕过 fail-closed。
         _ => Err(HostRejection::UnknownMethod(method.to_string())),
     }
@@ -182,7 +210,8 @@ pub fn validate_host_request(
 fn validate_top_level_fields(method: &str, params: &Value) -> Result<(), HostRejection> {
     let allowed_fields = match method {
         "initialize" => INITIALIZE_ALLOWED_FIELDS,
-        "session/new" | "session/load" => SESSION_ALLOWED_FIELDS,
+        "session/new" => SESSION_NEW_ALLOWED_FIELDS,
+        "session/load" => SESSION_LOAD_ALLOWED_FIELDS,
         "session/prompt" => SESSION_PROMPT_ALLOWED_FIELDS,
         "session/cancel" => SESSION_CANCEL_ALLOWED_FIELDS,
         "session/list" => SESSION_LIST_ALLOWED_FIELDS,
@@ -217,53 +246,11 @@ fn validate_meta_field_type(method: &str, params: &Value) -> Result<(), HostReje
     Ok(())
 }
 
-/// `initialize`：安全能力与 MCP 字段必须完整且精确，遗漏即 fail-closed。
-fn validate_initialize(params: &Value, policy: &HostPolicy) -> Result<(), HostRejection> {
+/// `initialize`：按真实 ACP `InitializeRequest` 校验客户端能力与身份，遗漏即 fail-closed。
+fn validate_initialize(params: &Value, _policy: &HostPolicy) -> Result<(), HostRejection> {
     let method = "initialize";
 
-    // `capabilities` 是安全边界：必须存在、为对象，且只含 terminal/fs 两个显式关闭项。
-    // client 的标准 `name` 为描述性字段，除此和 `mcpServers` 外的嵌套键均拒绝。
-    let capabilities = params
-        .get("capabilities")
-        .ok_or_else(|| HostRejection::MissingRequiredField {
-            method: method.to_string(),
-            field: "capabilities".to_string(),
-        })?
-        .as_object()
-        .ok_or_else(|| HostRejection::InvalidFieldType {
-            method: method.to_string(),
-            field: "capabilities".to_string(),
-        })?;
-    validate_nested_fields(method, capabilities, "capabilities", &["terminal", "fs"])?;
-    validate_disabled_capability(method, capabilities, "terminal")?;
-    validate_disabled_capability(method, capabilities, "fs")?;
-
-    // `client` 是 MCP 注入边界：必须存在、为对象，且只允许固定空 server 数组。
-    let client = params
-        .get("client")
-        .ok_or_else(|| HostRejection::MissingRequiredField {
-            method: method.to_string(),
-            field: "client".to_string(),
-        })?
-        .as_object()
-        .ok_or_else(|| HostRejection::InvalidFieldType {
-            method: method.to_string(),
-            field: "client".to_string(),
-        })?;
-    validate_nested_fields(method, client, "client", &["name", "mcpServers"])?;
-    let servers = client
-        .get("mcpServers")
-        .ok_or_else(|| HostRejection::MissingRequiredField {
-            method: method.to_string(),
-            field: "client.mcpServers".to_string(),
-        })?;
-    if !servers.as_array().is_some_and(|array| array.is_empty()) {
-        return Err(HostRejection::ClientMcpServersNotAllowed(
-            method.to_string(),
-        ));
-    }
-
-    // Host 与 sidecar 只协商这一固定 ACP 版本；缺失、非无符号整数或其它版本均不能透传。
+    // 先固定协议版本，保证缺失或类型错误返回稳定的 protocolVersion 路径。
     let protocol_version = params
         .get("protocolVersion")
         .ok_or_else(|| HostRejection::MissingRequiredField {
@@ -283,8 +270,64 @@ fn validate_initialize(params: &Value, policy: &HostPolicy) -> Result<(), HostRe
         });
     }
 
-    // _meta 白名单 + modelId 校验。
-    validate_meta_and_model(method, params, policy)
+    // Host 明确声明不提供文件与终端能力；这些字段属于 clientCapabilities，而非 agentCapabilities。
+    let client_capabilities = params
+        .get("clientCapabilities")
+        .ok_or_else(|| HostRejection::MissingRequiredField {
+            method: method.to_string(),
+            field: "clientCapabilities".to_string(),
+        })?
+        .as_object()
+        .ok_or_else(|| HostRejection::InvalidFieldType {
+            method: method.to_string(),
+            field: "clientCapabilities".to_string(),
+        })?;
+    validate_nested_fields(
+        method,
+        client_capabilities,
+        "clientCapabilities",
+        &["fs", "terminal"],
+    )?;
+    validate_disabled_capability(method, client_capabilities, "terminal")?;
+
+    let fs = client_capabilities
+        .get("fs")
+        .ok_or_else(|| HostRejection::MissingRequiredField {
+            method: method.to_string(),
+            field: "clientCapabilities.fs".to_string(),
+        })?
+        .as_object()
+        .ok_or_else(|| HostRejection::InvalidFieldType {
+            method: method.to_string(),
+            field: "clientCapabilities.fs".to_string(),
+        })?;
+    validate_nested_fields(
+        method,
+        fs,
+        "clientCapabilities.fs",
+        &["readTextFile", "writeTextFile"],
+    )?;
+    validate_disabled_capability(method, fs, "readTextFile")?;
+    validate_disabled_capability(method, fs, "writeTextFile")?;
+
+    // clientInfo 是 ACP 的实现身份；Host 固定发送 name/version，不携带可选 title 或 _meta。
+    let client_info = params
+        .get("clientInfo")
+        .ok_or_else(|| HostRejection::MissingRequiredField {
+            method: method.to_string(),
+            field: "clientInfo".to_string(),
+        })?
+        .as_object()
+        .ok_or_else(|| HostRejection::InvalidFieldType {
+            method: method.to_string(),
+            field: "clientInfo".to_string(),
+        })?;
+    validate_nested_fields(method, client_info, "clientInfo", &["name", "version"])?;
+    validate_required_nonempty_string(method, client_info, "name")?;
+    validate_required_nonempty_string(method, client_info, "version")?;
+
+    // initialize 只允许标准空 _meta，避免旧产品 modelId 语义通过策略配置重新进入。
+    validate_meta_keys(method, params, &[])
 }
 
 /// 校验固定安全对象的嵌套白名单，防止未来新能力字段被静默透传。
@@ -306,13 +349,17 @@ fn validate_nested_fields(
     Ok(())
 }
 
-/// 校验 terminal/fs 必须存在且为 false；true 使用既有精确拒绝类型。
+/// 校验 ACP 客户端能力字段必须存在且为 false；true 使用既有精确拒绝类型。
 fn validate_disabled_capability(
     method: &str,
     capabilities: &serde_json::Map<String, Value>,
     name: &str,
 ) -> Result<(), HostRejection> {
-    let field = format!("capabilities.{name}");
+    let field = if name == "terminal" {
+        "clientCapabilities.terminal".to_string()
+    } else {
+        format!("clientCapabilities.fs.{name}")
+    };
     let value = capabilities
         .get(name)
         .ok_or_else(|| HostRejection::MissingRequiredField {
@@ -325,13 +372,38 @@ fn validate_disabled_capability(
         Some(true) if name == "terminal" => {
             Err(HostRejection::TerminalCapabilityEnabled(method.to_string()))
         }
-        Some(true) if name == "fs" => Err(HostRejection::FsCapabilityEnabled(method.to_string())),
-        Some(true) => unreachable!("capability 白名单仅允许 terminal 或 fs"),
+        Some(true) => Err(HostRejection::FsCapabilityEnabled(method.to_string())),
         None => Err(HostRejection::InvalidFieldType {
             method: method.to_string(),
             field,
         }),
     }
+}
+
+/// 校验 ACP `clientInfo` 的必填字符串字段，拒绝空字符串与非字符串值。
+fn validate_required_nonempty_string(
+    method: &str,
+    object: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<(), HostRejection> {
+    let field = format!("clientInfo.{name}");
+    let value = object
+        .get(name)
+        .ok_or_else(|| HostRejection::MissingRequiredField {
+            method: method.to_string(),
+            field: field.clone(),
+        })?;
+    if !value.as_str().is_some_and(|value| !value.is_empty()) {
+        return Err(if value.is_string() {
+            HostRejection::ForbiddenField(method.to_string(), field)
+        } else {
+            HostRejection::InvalidFieldType {
+                method: method.to_string(),
+                field,
+            }
+        });
+    }
+    Ok(())
 }
 
 /// `session/new` / `session/load`：cwd 精确匹配、mcpServers 空、_meta 合规。
@@ -340,12 +412,9 @@ fn validate_session_request(
     params: &Value,
     policy: &HostPolicy,
 ) -> Result<(), HostRejection> {
-    // session/load 必须指定要加载的 session；session/new 的 sessionId 可选。
-    if method == "session/load" && params.get("sessionId").is_none() {
-        return Err(HostRejection::MissingRequiredField {
-            method: method.to_string(),
-            field: "sessionId".to_string(),
-        });
+    // session/load 必须指定非空 sessionId；session/new 不接受该字段。
+    if method == "session/load" {
+        validate_required_non_empty_string(method, params, "sessionId")?;
     }
 
     // cwd 必须存在且与策略一致（canonical 绝对路径比较）。
@@ -610,41 +679,35 @@ fn is_uri_scheme_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
 }
 
-/// 只读方法：仅校验 `_meta` 白名单与 modelId。
-fn validate_meta_only(
-    method: &str,
-    params: &Value,
-    policy: &HostPolicy,
-) -> Result<(), HostRejection> {
-    validate_meta_and_model(method, params, policy)
+/// `x.ai/mcp/list`：要求非空 sessionId，且 `_meta` 只能缺失或为空对象。
+fn validate_mcp_list(params: &Value) -> Result<(), HostRejection> {
+    const METHOD: &str = "x.ai/mcp/list";
+
+    validate_required_non_empty_string(METHOD, params, "sessionId")?;
+    validate_meta_keys(METHOD, params, &[])
 }
 
-/// 校验 `_meta` 键白名单，并在 `_meta`/params 中校验 `modelId`。
+/// 校验 `_meta` 键白名单，并在允许的会话方法中校验 Channel 槽名 `modelId`。
 fn validate_meta_and_model(
     method: &str,
     params: &Value,
     policy: &HostPolicy,
 ) -> Result<(), HostRejection> {
     // _meta 白名单按 method 隔离：未登记键时，_meta 必须缺失或为空对象。
-    // 顶层类型已由 validate_meta_field_type 在分派前校验；此处保留既有语义。
-    if let Some(meta) = params.get("_meta") {
-        if let Some(obj) = meta.as_object() {
-            for key in obj.keys() {
-                if !policy
-                    .meta_keys_for(method)
-                    .iter()
-                    .any(|allowed| allowed == key)
-                {
-                    return Err(HostRejection::UnknownMetaKey(
-                        method.to_string(),
-                        key.clone(),
-                    ));
-                }
-            }
-        } else if !meta.is_null() {
+    validate_meta_keys(method, params, policy.meta_keys_for(method))?;
+
+    // 允许的 _meta.promptId 必须先满足共享边界，不能让空值、控制字符或超长值进入 ACP。
+    if let Some(prompt_id) = params.get("_meta").and_then(|meta| meta.get("promptId")) {
+        let prompt_id = prompt_id
+            .as_str()
+            .ok_or_else(|| HostRejection::InvalidFieldType {
+                method: method.to_string(),
+                field: "_meta.promptId".to_string(),
+            })?;
+        if !is_prompt_id(prompt_id) {
             return Err(HostRejection::ForbiddenField(
                 method.to_string(),
-                "_meta".to_string(),
+                "_meta.promptId".to_string(),
             ));
         }
     }
@@ -669,6 +732,33 @@ fn validate_meta_and_model(
     Ok(())
 }
 
+/// 按调用方提供的白名单校验 `_meta`，用于 initialize 的固定空元数据合同。
+fn validate_meta_keys(
+    method: &str,
+    params: &Value,
+    allowed_meta_keys: &[String],
+) -> Result<(), HostRejection> {
+    if let Some(meta) = params.get("_meta") {
+        if let Some(obj) = meta.as_object() {
+            for key in obj.keys() {
+                if !allowed_meta_keys.iter().any(|allowed| allowed == key) {
+                    return Err(HostRejection::UnknownMetaKey(
+                        method.to_string(),
+                        key.clone(),
+                    ));
+                }
+            }
+        } else if !meta.is_null() {
+            return Err(HostRejection::ForbiddenField(
+                method.to_string(),
+                "_meta".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// cwd 匹配：canonical 化 Host 提供的 cwd 后与期望值精确比较。
 fn cwd_matches(got: &Path, expected: &Path) -> bool {
     match dunce::canonicalize(got) {
@@ -686,13 +776,11 @@ mod tests {
     /// 构造一个默认策略：cwd 指向临时目录。
     fn policy_with(cwd: &Path) -> HostPolicy {
         HostPolicy::new(cwd.to_path_buf())
-            // 保留 Task 1/2 已有 method 的 modelId 行为，同时把 promptId 限在 prompt。
-            .with_meta_key_for("initialize", "modelId")
+            // 仅会话方法接收 modelId；prompt 只接收 promptId，initialize 不携带产品元数据。
             .with_meta_key_for("session/new", "modelId")
             .with_meta_key_for("session/load", "modelId")
-            .with_meta_key_for("x.ai/mcp/list", "modelId")
             .with_meta_key_for("session/prompt", "promptId")
-            .with_model_id("grok-code-fast".to_string())
+            .with_model_id("byok".to_string())
     }
 
     #[test]
@@ -706,19 +794,20 @@ mod tests {
                 "initialize",
                 serde_json::json!({
                     "protocolVersion": 1,
-                    "capabilities": { "terminal": false, "fs": false },
-                    "client": { "mcpServers": [] },
-                    "_meta": { "modelId": "grok-code-fast" }
+                    "clientCapabilities": {
+                        "fs": { "readTextFile": false, "writeTextFile": false },
+                        "terminal": false
+                    },
+                    "clientInfo": { "name": "efflab-test-client", "version": "0.1.0" }
                 }),
             ),
             (
                 "session/new",
                 "session/new",
                 serde_json::json!({
-                    "sessionId": "new-session",
                     "cwd": cwd,
                     "mcpServers": [],
-                    "_meta": { "modelId": "grok-code-fast" }
+                    "_meta": { "modelId": "byok" }
                 }),
             ),
             (
@@ -728,16 +817,13 @@ mod tests {
                     "sessionId": "existing-session",
                     "cwd": cwd,
                     "mcpServers": [],
-                    "_meta": { "modelId": "grok-code-fast" }
+                    "_meta": { "modelId": "byok" }
                 }),
             ),
             (
                 "x.ai/mcp/list",
                 "x.ai/mcp/list",
-                serde_json::json!({
-                    "sessionId": "existing-session",
-                    "_meta": { "modelId": "grok-code-fast" }
-                }),
+                serde_json::json!({ "sessionId": "existing-session" }),
             ),
             (
                 "session/prompt",
@@ -774,8 +860,11 @@ mod tests {
         let directory = TempDir::new().expect("必须能创建契约临时目录");
         let policy = policy_with(directory.path());
         let valid_fields = serde_json::json!({
-            "capabilities": { "terminal": false, "fs": false },
-            "client": { "mcpServers": [] },
+            "clientCapabilities": {
+                        "fs": { "readTextFile": false, "writeTextFile": false },
+                        "terminal": false
+                    },
+            "clientInfo": { "name": "efflab-test-client", "version": "0.1.0" },
         });
 
         assert_eq!(
@@ -790,8 +879,11 @@ mod tests {
                 "initialize",
                 &serde_json::json!({
                     "protocolVersion": "1",
-                    "capabilities": { "terminal": false, "fs": false },
-                    "client": { "mcpServers": [] },
+                    "clientCapabilities": {
+                        "fs": { "readTextFile": false, "writeTextFile": false },
+                        "terminal": false
+                    },
+                    "clientInfo": { "name": "efflab-test-client", "version": "0.1.0" },
                 }),
                 &policy,
             ),
@@ -805,8 +897,11 @@ mod tests {
                 "initialize",
                 &serde_json::json!({
                     "protocolVersion": 2,
-                    "capabilities": { "terminal": false, "fs": false },
-                    "client": { "mcpServers": [] },
+                    "clientCapabilities": {
+                        "fs": { "readTextFile": false, "writeTextFile": false },
+                        "terminal": false
+                    },
+                    "clientInfo": { "name": "efflab-test-client", "version": "0.1.0" },
                 }),
                 &policy,
             ),
@@ -821,8 +916,11 @@ mod tests {
                 "initialize",
                 &serde_json::json!({
                     "protocolVersion": HOST_ACP_PROTOCOL_VERSION,
-                    "capabilities": { "terminal": false, "fs": false },
-                    "client": { "mcpServers": [] },
+                    "clientCapabilities": {
+                        "fs": { "readTextFile": false, "writeTextFile": false },
+                        "terminal": false
+                    },
+                    "clientInfo": { "name": "efflab-test-client", "version": "0.1.0" },
                     "authentication": {},
                 }),
                 &policy,
@@ -851,8 +949,145 @@ mod tests {
 
         assert_eq!(prompt_keys, ["promptId"]);
         assert_eq!(new_session_keys, ["modelId"]);
+        assert!(policy.meta_keys_for("x.ai/mcp/list").is_empty());
         assert!(policy.meta_keys_for("session/cancel").is_empty());
         assert!(policy.meta_keys_for("session/list").is_empty());
+    }
+
+    #[test]
+    fn session_new_rejects_session_id() {
+        let dir = TempDir::new().unwrap();
+        let policy = policy_with(dir.path());
+        let params = serde_json::json!({
+            "sessionId": "must-not-be-forwarded",
+            "cwd": dir.path().to_str().unwrap(),
+            "mcpServers": []
+        });
+
+        assert_eq!(
+            validate_host_request("session/new", &params, &policy),
+            Err(HostRejection::UnknownField {
+                method: "session/new".into(),
+                field: "sessionId".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn session_load_requires_non_empty_string_session_id() {
+        let dir = TempDir::new().unwrap();
+        let policy = policy_with(dir.path());
+        for session_id in [
+            serde_json::json!(null),
+            serde_json::json!(123),
+            serde_json::json!({}),
+            serde_json::json!(""),
+        ] {
+            let params = serde_json::json!({
+                "sessionId": session_id,
+                "cwd": dir.path().to_str().unwrap(),
+                "mcpServers": []
+            });
+            assert_eq!(
+                validate_host_request("session/load", &params, &policy),
+                Err(HostRejection::InvalidFieldType {
+                    method: "session/load".into(),
+                    field: "sessionId".into(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_list_requires_non_empty_string_session_id() {
+        let dir = TempDir::new().unwrap();
+        let policy = policy_with(dir.path());
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({ "sessionId": null }),
+            serde_json::json!({ "sessionId": 123 }),
+            serde_json::json!({ "sessionId": {} }),
+            serde_json::json!({ "sessionId": "" }),
+        ] {
+            let expected = if params.get("sessionId").is_none() {
+                HostRejection::MissingRequiredField {
+                    method: "x.ai/mcp/list".into(),
+                    field: "sessionId".into(),
+                }
+            } else {
+                HostRejection::InvalidFieldType {
+                    method: "x.ai/mcp/list".into(),
+                    field: "sessionId".into(),
+                }
+            };
+            assert_eq!(
+                validate_host_request("x.ai/mcp/list", &params, &policy),
+                Err(expected)
+            );
+        }
+
+        assert!(
+            validate_host_request(
+                "x.ai/mcp/list",
+                &serde_json::json!({ "sessionId": "s1", "_meta": {} }),
+                &policy,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn initialize_rejects_unstable_client_capabilities() {
+        let dir = TempDir::new().unwrap();
+        let policy = policy_with(dir.path());
+        for (field, value) in [
+            ("auth", serde_json::json!({ "terminal": false })),
+            ("elicitation", serde_json::json!({ "form": {} })),
+            ("nes", serde_json::json!({ "jump": {} })),
+            ("positionEncodings", serde_json::json!(["utf-16"])),
+        ] {
+            let mut params = serde_json::json!({
+                "protocolVersion": HOST_ACP_PROTOCOL_VERSION,
+                "clientCapabilities": {
+                    "fs": { "readTextFile": false, "writeTextFile": false },
+                    "terminal": false
+                },
+                "clientInfo": { "name": "efflab-test-client", "version": "0.1.0" }
+            });
+            params
+                .get_mut("clientCapabilities")
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_string(), value);
+            assert_eq!(
+                validate_host_request("initialize", &params, &policy),
+                Err(HostRejection::UnknownNestedField {
+                    method: "initialize".into(),
+                    field: format!("clientCapabilities.{field}"),
+                })
+            );
+        }
+
+        let nested_meta = serde_json::json!({
+            "protocolVersion": HOST_ACP_PROTOCOL_VERSION,
+            "clientCapabilities": {
+                "fs": {
+                    "readTextFile": false,
+                    "writeTextFile": false,
+                    "_meta": {}
+                },
+                "terminal": false
+            },
+            "clientInfo": { "name": "efflab-test-client", "version": "0.1.0" }
+        });
+        assert_eq!(
+            validate_host_request("initialize", &nested_meta, &policy),
+            Err(HostRejection::UnknownNestedField {
+                method: "initialize".into(),
+                field: "clientCapabilities.fs._meta".into(),
+            })
+        );
     }
 
     #[test]
@@ -958,8 +1193,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let p = policy_with(dir.path());
         let params = serde_json::json!({
-            "capabilities": { "terminal": true, "fs": false },
-            "client": { "mcpServers": [] }
+            "protocolVersion": HOST_ACP_PROTOCOL_VERSION,
+            "clientCapabilities": {
+                "fs": { "readTextFile": false, "writeTextFile": false },
+                "terminal": true
+            },
+            "clientInfo": { "name": "efflab-test-client", "version": "0.1.0" }
         });
         assert_eq!(
             validate_host_request("initialize", &params, &p),
@@ -974,8 +1213,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let p = policy_with(dir.path());
         let params = serde_json::json!({
-            "capabilities": { "terminal": false, "fs": true },
-            "client": { "mcpServers": [] }
+            "protocolVersion": HOST_ACP_PROTOCOL_VERSION,
+            "clientCapabilities": {
+                "fs": { "readTextFile": true, "writeTextFile": false },
+                "terminal": false
+            },
+            "clientInfo": { "name": "efflab-test-client", "version": "0.1.0" }
         });
         assert_eq!(
             validate_host_request("initialize", &params, &p),
@@ -984,17 +1227,57 @@ mod tests {
     }
 
     #[test]
-    fn initialize_rejects_client_mcp_servers() {
+    fn initialize_rejects_legacy_client_and_capabilities_fields() {
         let dir = TempDir::new().unwrap();
         let p = policy_with(dir.path());
+        for (field, value) in [
+            ("client", serde_json::json!({ "mcpServers": [] })),
+            (
+                "capabilities",
+                serde_json::json!({ "terminal": false, "fs": false }),
+            ),
+        ] {
+            let mut params = serde_json::json!({
+                "protocolVersion": HOST_ACP_PROTOCOL_VERSION,
+                "clientCapabilities": {
+                    "fs": { "readTextFile": false, "writeTextFile": false },
+                    "terminal": false
+                },
+                "clientInfo": { "name": "efflab-test-client", "version": "0.1.0" }
+            });
+            params
+                .as_object_mut()
+                .expect("initialize params 必须为对象")
+                .insert(field.to_string(), value);
+            assert_eq!(
+                validate_host_request("initialize", &params, &p),
+                Err(HostRejection::UnknownField {
+                    method: "initialize".into(),
+                    field: field.into(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn initialize_rejects_model_id_as_unknown_meta_key() {
+        let dir = TempDir::new().unwrap();
+        let policy = policy_with(dir.path());
         let params = serde_json::json!({
-            "capabilities": { "terminal": false, "fs": false },
-            "client": { "mcpServers": [{ "name": "evil" }] }
+            "protocolVersion": HOST_ACP_PROTOCOL_VERSION,
+            "clientCapabilities": {
+                "fs": { "readTextFile": false, "writeTextFile": false },
+                "terminal": false
+            },
+            "clientInfo": { "name": "efflab-test-client", "version": "0.1.0" },
+            "_meta": { "modelId": "grok-code-fast" }
         });
+
         assert_eq!(
-            validate_host_request("initialize", &params, &p),
-            Err(HostRejection::ClientMcpServersNotAllowed(
-                "initialize".into()
+            validate_host_request("initialize", &params, &policy),
+            Err(HostRejection::UnknownMetaKey(
+                "initialize".into(),
+                "modelId".into(),
             ))
         );
     }
@@ -1084,7 +1367,7 @@ mod tests {
         let params = serde_json::json!({
             "cwd": dir.path().to_str().unwrap(),
             "mcpServers": [],
-            "_meta": { "modelId": "grok-code-fast", "sneaky": 1 }
+            "_meta": { "modelId": "byok", "sneaky": 1 }
         });
         assert_eq!(
             validate_host_request("session/new", &params, &p),
@@ -1176,51 +1459,64 @@ mod tests {
                 HostRejection::ForbiddenField("x.ai/mcp/list".into(), "non-object params".into()),
             ),
             (
-                "capabilities 非对象",
+                "clientCapabilities 非对象",
                 "initialize",
                 serde_json::json!({
-                    "capabilities": [],
-                    "client": { "mcpServers": [] }
+                    "protocolVersion": HOST_ACP_PROTOCOL_VERSION,
+                    "clientCapabilities": [],
+                    "clientInfo": { "name": "efflab-test-client", "version": "0.1.0" }
                 }),
                 HostRejection::InvalidFieldType {
                     method: "initialize".into(),
-                    field: "capabilities".into(),
+                    field: "clientCapabilities".into(),
                 },
             ),
             (
-                "client 非对象",
+                "clientInfo 非对象",
                 "initialize",
                 serde_json::json!({
-                    "capabilities": { "terminal": false, "fs": false },
-                    "client": "not-an-object"
+                    "protocolVersion": HOST_ACP_PROTOCOL_VERSION,
+                    "clientCapabilities": {
+                        "fs": { "readTextFile": false, "writeTextFile": false },
+                        "terminal": false
+                    },
+                    "clientInfo": "not-an-object"
                 }),
                 HostRejection::InvalidFieldType {
                     method: "initialize".into(),
-                    field: "client".into(),
+                    field: "clientInfo".into(),
                 },
             ),
             (
                 "terminal 为字符串 false",
                 "initialize",
                 serde_json::json!({
-                    "capabilities": { "terminal": "false", "fs": false },
-                    "client": { "mcpServers": [] }
+                    "protocolVersion": HOST_ACP_PROTOCOL_VERSION,
+                    "clientCapabilities": {
+                        "fs": { "readTextFile": false, "writeTextFile": false },
+                        "terminal": "false"
+                    },
+                    "clientInfo": { "name": "efflab-test-client", "version": "0.1.0" }
                 }),
                 HostRejection::InvalidFieldType {
                     method: "initialize".into(),
-                    field: "capabilities.terminal".into(),
+                    field: "clientCapabilities.terminal".into(),
                 },
             ),
             (
                 "fs 为数字 0",
                 "initialize",
                 serde_json::json!({
-                    "capabilities": { "terminal": false, "fs": 0 },
-                    "client": { "mcpServers": [] }
+                    "protocolVersion": HOST_ACP_PROTOCOL_VERSION,
+                    "clientCapabilities": {
+                        "fs": 0,
+                        "terminal": false
+                    },
+                    "clientInfo": { "name": "efflab-test-client", "version": "0.1.0" }
                 }),
                 HostRejection::InvalidFieldType {
                     method: "initialize".into(),
-                    field: "capabilities.fs".into(),
+                    field: "clientCapabilities.fs".into(),
                 },
             ),
             (
@@ -1236,8 +1532,11 @@ mod tests {
                 "_meta 为标量",
                 "initialize",
                 serde_json::json!({
-                    "capabilities": { "terminal": false, "fs": false },
-                    "client": { "mcpServers": [] },
+                    "clientCapabilities": {
+                        "fs": { "readTextFile": false, "writeTextFile": false },
+                        "terminal": false
+                    },
+                    "clientInfo": { "name": "efflab-test-client", "version": "0.1.0" },
                     "_meta": "invalid"
                 }),
                 HostRejection::ForbiddenField("initialize".into(), "_meta".into()),
@@ -1251,7 +1550,7 @@ mod tests {
             (
                 "_meta 为 null",
                 "x.ai/mcp/list",
-                serde_json::json!({ "_meta": null }),
+                serde_json::json!({ "sessionId": "s1", "_meta": null }),
                 HostRejection::ForbiddenField("x.ai/mcp/list".into(), "_meta".into()),
             ),
             (
@@ -1299,19 +1598,13 @@ mod tests {
             (
                 "mcp/list 未知 meta 键",
                 "x.ai/mcp/list",
-                serde_json::json!({ "_meta": { "sneaky": 1 } }),
+                serde_json::json!({ "sessionId": "s1", "_meta": { "sneaky": 1 } }),
                 HostRejection::UnknownMetaKey("x.ai/mcp/list".into(), "sneaky".into()),
-            ),
-            (
-                "mcp/list 不允许的 meta modelId",
-                "x.ai/mcp/list",
-                serde_json::json!({ "_meta": { "modelId": "grok-code-evil" } }),
-                HostRejection::ModelIdNotAllowed("x.ai/mcp/list".into(), "grok-code-evil".into()),
             ),
             (
                 "mcp/list 顶层 modelId",
                 "x.ai/mcp/list",
-                serde_json::json!({ "modelId": "grok-code-fast" }),
+                serde_json::json!({ "sessionId": "s1", "modelId": "grok-code-fast" }),
                 HostRejection::UnknownField {
                     method: "x.ai/mcp/list".into(),
                     field: "modelId".into(),

@@ -1,25 +1,29 @@
+#[cfg(not(windows))]
 #[test]
-fn capability_policy_is_recorded_off_windows_without_rewriting_current_value() {
+fn unix_sidecar_capability_is_available_and_records_windows_gap() {
     let cap = efflab_agent_host::capability();
-    #[cfg(windows)]
-    {
-        let _ = cap;
-    }
-    #[cfg(not(windows))]
-    {
-        // 非 Windows 只记录未证明状态，当前 capability 仍由生产实现决定。
-        assert!(matches!(
-            cap,
-            efflab_agent_host::SupervisorCapability::Available
-        ));
-        let directory = std::env::temp_dir().join("efflab-sidecar-pr0");
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(
-            directory.join("windows-hardening.txt"),
-            "runner=non-windows\nproven=false\nwindows_capability=unproven\nmacos_capability=Available\n",
-        )
-        .unwrap();
-    }
+    assert!(matches!(
+        cap,
+        efflab_agent_host::SupervisorCapability::Available
+    ));
+    // 非 Windows 只记录 Windows 尚未证明的状态，不把 Unix 结果伪装成跨平台通过。
+    let directory = tempfile::tempdir().expect("capability 记录目录必须可创建");
+    std::fs::write(
+        directory.path().join("windows-hardening.txt"),
+        "runner=non-windows\nproven=false\nwindows_capability=unproven\nmacos_capability=Available\n",
+    )
+    .expect("capability 记录必须可写入");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_sidecar_capability_is_unavailable_fail_closed() {
+    assert_eq!(
+        efflab_agent_host::capability(),
+        efflab_agent_host::SupervisorCapability::Unavailable {
+            reason: efflab_agent_host::UnavailableReason::SidecarHardeningUnavailable,
+        }
+    );
 }
 
 #[cfg(windows)]

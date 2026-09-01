@@ -1,10 +1,14 @@
-//! LLM Channel 与 L3b 回环出口的集成契约测试。
+//! LLM Channel 与 L3b 回环出口的集成契约测试（Unix-only）。
+//!
+//! 这些测试使用 Unix shell sidecar 与真实 loopback TCP；Windows 不执行该运行时
+//! 覆盖，Windows capability/unavailable 门禁见 `pr0_windows_hardening.rs`。
 //!
 //! 测试只使用本地 TCP 上游，验证绑定令牌、凭据替换、流式转发和真实 sidecar 启动
 //! 的安全边界；测试诊断中绝不输出用户 Key 或 binding token。
 
 #![cfg(unix)]
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -16,10 +20,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use efflab_agent_contract::load_runtime_config_v1_from_str;
 use efflab_agent_host::{
-    ApprovedMcpSpec, HostApp, HostRuntimeConfig, L3bLoopback, L3bRuntimeConfig, LlmChannelConfig,
-    LlmChannelError, LlmChannelKind, LlmChannelManager, LlmChannelService, LlmSecretSlot,
-    MAX_L3B_REQUEST_BODY_BYTES, ScopeId, SealedSecret, SecretGuard, SetLlmChannelRequest,
+    ApprovedMcpConfig, ApprovedMcpSpec, HostApp, HostRuntimeConfig, L3bLoopback, L3bRuntimeConfig,
+    LlmChannelConfig, LlmChannelError, LlmChannelKind, LlmChannelManager, LlmChannelService,
+    LlmSecretSlot, MAX_L3B_REQUEST_BODY_BYTES, McpServerSpec, ScopeId, SealedSecret, SecretGuard,
+    SetLlmChannelRequest,
 };
 
 /// 本地网络测试的单次等待上限，避免回环异常时无限阻塞测试进程。
@@ -28,6 +34,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(3);
 /// 提供可计数密封/解封行为的产品端口假实现。
 struct FakeApp {
     config: Mutex<LlmChannelConfig>,
+    mcp: ApprovedMcpSpec,
     persist_calls: AtomicUsize,
     seal_calls: AtomicUsize,
     unseal_calls: AtomicUsize,
@@ -36,12 +43,18 @@ struct FakeApp {
 impl FakeApp {
     /// 用固定的 BYOK 配置构造测试产品端口；该 Key 仅是本地测试占位符。
     fn byok(base_url: String, model_id: &str, key: &str) -> Self {
+        Self::byok_with_mcp(base_url, model_id, key, ApprovedMcpSpec::default())
+    }
+
+    /// 为单个真实 spawn 用例注入已审核的 loopback HTTP MCP；默认构造仍保持空 MCP。
+    fn byok_with_mcp(base_url: String, model_id: &str, key: &str, mcp: ApprovedMcpSpec) -> Self {
         Self {
             config: Mutex::new(LlmChannelConfig::Byok {
                 base_url,
                 model_id: model_id.to_string(),
                 api_key: SealedSecret::new(key.as_bytes().to_vec()),
             }),
+            mcp,
             persist_calls: AtomicUsize::new(0),
             seal_calls: AtomicUsize::new(0),
             unseal_calls: AtomicUsize::new(0),
@@ -52,6 +65,7 @@ impl FakeApp {
     fn unconfigured() -> Self {
         Self {
             config: Mutex::new(LlmChannelConfig::Unconfigured),
+            mcp: ApprovedMcpSpec::default(),
             persist_calls: AtomicUsize::new(0),
             seal_calls: AtomicUsize::new(0),
             unseal_calls: AtomicUsize::new(0),
@@ -101,8 +115,50 @@ impl HostApp for FakeApp {
     }
 
     fn mcp_for_scope(&self, _scope: &ScopeId) -> Result<ApprovedMcpSpec> {
-        Ok(ApprovedMcpSpec::default())
+        Ok(self.mcp.clone())
     }
+}
+
+/// 构造仅供真实 launch 用例使用的合法 loopback HTTP MCP 规格。
+fn launch_mcp_spec() -> ApprovedMcpSpec {
+    let mut config = ApprovedMcpConfig::default();
+    config.servers.insert(
+        "demo".to_string(),
+        McpServerSpec::Http {
+            url: "http://127.0.0.1:4313/mcp".to_string(),
+        },
+    );
+    ApprovedMcpSpec::from_approved(config, BTreeSet::from(["demo__search".to_string()]))
+        .expect("真实 launch 的 loopback HTTP MCP 规格必须合法")
+}
+
+/// 把任意临时路径变成 POSIX shell 单引号字面量，避免路径字符改变 shell 语义。
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+/// 把测试用字符串安全编码为 POSIX shell 单引号字面量，避免比较值触发 shell 语义。
+fn shell_quote_text(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// 按当前目标平台重建生产 ChildEnvironment 的精确变量名集合。
+fn expected_platform_environment_names() -> BTreeSet<&'static str> {
+    let mut names = BTreeSet::from(["EFFLAB_L3B_BIND"]);
+    for name in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] {
+        if std::env::var_os(name).is_some() {
+            names.insert(name);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("DYLD_LIBRARY_PATH").is_some() {
+        names.insert("DYLD_LIBRARY_PATH");
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if std::env::var_os("LD_LIBRARY_PATH").is_some() {
+        names.insert("LD_LIBRARY_PATH");
+    }
+    names
 }
 
 /// 按策略构造已加载的 Channel manager，避免每个测试复制安全配置。
@@ -111,6 +167,28 @@ fn manager(app: Arc<FakeApp>, allow_loopback_llm: bool) -> Arc<LlmChannelManager
         LlmChannelManager::new(app, allow_loopback_llm)
             .expect("测试 BYOK 配置必须可加载为 Channel manager"),
     )
+}
+
+/// 断言 sidecar 只看到平台白名单与当前代 binding 的变量名，不读取变量值。
+fn assert_sidecar_environment_names(captured_env: &str) {
+    let inherited_variables: BTreeSet<_> = captured_env
+        .lines()
+        .filter(|line| !line.contains('='))
+        .filter(|name| !matches!(*name, "_" | "PWD" | "SHLVL"))
+        .collect();
+    assert_eq!(
+        inherited_variables,
+        expected_platform_environment_names(),
+        "sidecar 环境名必须精确匹配当前平台生产白名单"
+    );
+    assert!(
+        !inherited_variables.contains("XAI_API_KEY"),
+        "sidecar 环境不得包含 XAI_API_KEY"
+    );
+    assert!(
+        !inherited_variables.contains("GROK_CODE_XAI_API_KEY"),
+        "sidecar 环境不得包含 GROK_CODE_XAI_API_KEY"
+    );
 }
 
 /// 启动一口 IPv4 L3b 回环服务；真实本地上游测试显式允许 loopback。
@@ -238,7 +316,22 @@ fn wait_for_file(path: &Path) {
     let deadline = Instant::now() + TEST_TIMEOUT;
     while !path.exists() {
         assert!(Instant::now() < deadline, "等待 sidecar 测试产物超时");
-        thread::sleep(Duration::from_millis(10));
+        thread::yield_now();
+    }
+}
+
+/// 等待 sidecar generation marker 达到指定数量，不用固定时延猜测重启完成。
+fn wait_for_line_count(path: &Path, expected: usize) {
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    loop {
+        let count = fs::read_to_string(path)
+            .map(|source| source.lines().count())
+            .unwrap_or(0);
+        if count >= expected {
+            return;
+        }
+        assert!(Instant::now() < deadline, "等待 sidecar generation 超时");
+        thread::yield_now();
     }
 }
 
@@ -254,7 +347,10 @@ fn loaded_channel_accepts_secret_bearing_url_without_exposing_the_key() {
     let manager = LlmChannelManager::new(app, false).expect("用户填写的 URL 必须可加载");
     let view = manager.view().expect("已加载 Channel view 必须可读取");
 
-    assert_eq!(view.base_url.as_deref(), Some(base_url));
+    assert!(
+        view.base_url.as_deref() == Some(base_url),
+        "已加载 Channel 必须保留用户 URL 原文"
+    );
     assert!(manager.has_active_byok().expect("Channel 状态锁必须可用"));
     assert!(
         !format!("{view:?}").contains("test-user-key"),
@@ -415,8 +511,14 @@ fn upstream_authorization_uses_user_key_not_binding_token() {
         .expect("上游必须收到 L3b 转发请求");
     upstream.join().expect("固定上游线程必须退出");
 
-    assert_eq!(authorization, format!("Bearer {user_key}"));
-    assert_ne!(authorization, format!("Bearer {token}"));
+    assert!(
+        authorization == format!("Bearer {user_key}"),
+        "上游 Authorization 必须使用用户 Key"
+    );
+    assert!(
+        authorization != format!("Bearer {token}"),
+        "上游 Authorization 不得使用 binding token"
+    );
 }
 
 /// SSE 的第一个块必须在上游结束前被下游看到，禁止把完整响应缓冲后再转发。
@@ -894,7 +996,10 @@ fn channel_set_accepts_user_http_loopback_and_lan_without_development_flag() {
                 ..SetLlmChannelRequest::default()
             })
             .expect("用户自己填写的代理 URL 必须可保存");
-        assert_eq!(view.view.base_url.as_deref(), Some(url));
+        assert!(
+            view.view.base_url.as_deref() == Some(url),
+            "持久化后的代理 URL 必须保持用户输入"
+        );
         assert_eq!(app.persist_calls.load(Ordering::SeqCst), 1);
         assert_eq!(app.seal_calls.load(Ordering::SeqCst), 1);
     }
@@ -906,7 +1011,10 @@ fn channel_change_keeps_committed_view_when_live_scope_restart_fails() {
     let temporary = tempfile::tempdir().expect("必须能创建 restart 失败测试目录");
     let ready_path = temporary.path().join("sidecar-ready");
     let script_path = temporary.path().join("first-launch-only.sh");
-    let script = format!("#!/bin/sh\n: > {ready_path:?}\nwhile IFS= read -r _; do :; done\n");
+    let script = format!(
+        "#!/bin/sh\n: > {ready}\nwhile IFS= read -r _; do :; done\n",
+        ready = shell_quote(&ready_path),
+    );
     fs::write(&script_path, script).expect("必须能写入 first launch sidecar");
     fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
         .expect("first launch sidecar 必须可执行");
@@ -985,40 +1093,156 @@ fn unconfigured_channel_neither_listens_nor_spawns() {
 
 /// 完整 spawn 必须在 child 开始前已有监听、binding 和权威 config，且环境没有用户 Key。
 #[test]
-fn real_launch_writes_loopback_config_and_keeps_user_key_out_of_sidecar_environment() {
+fn real_launch_and_rotation_keep_user_keys_out_of_sidecar_environment() {
     let temporary = tempfile::tempdir().expect("必须能创建 sidecar launch 临时目录");
-    let capture_path = temporary.path().join("captured-env");
-    let config_capture_path = temporary.path().join("captured-config");
-    let script_path = temporary.path().join("fake-sidecar.sh");
+    let launch_root = temporary.path().join("host's launch");
+    fs::create_dir(&launch_root).expect("必须能创建含 apostrophe 的 launch 子目录");
+    let capture_path = launch_root.join("captured-env");
+    let ready_path = launch_root.join("sidecar-ready");
+    let script_path = launch_root.join("fake-sidecar.sh");
+    let sidecar_log_path = temporary.path().join("sidecar.log");
     let user_key = "sidecar-must-not-see-this-test-key";
+    let rotated_key = "sidecar-must-not-see-rotated-test-key";
+    let user_endpoint = "https://8.8.8.8/v1";
+    let home_root = launch_root.join("app-data");
+    let canonical_launch_root =
+        fs::canonicalize(&launch_root).expect("launch 根的现有前缀必须可 canonicalize");
+    let expected_scope_root = canonical_launch_root
+        .join("app-data")
+        .join("loopback-test-app")
+        .join("library-a");
+    let expected_home = expected_scope_root.join("home");
+    let expected_runtime_config = expected_home.join("runtime-config.v1.toml");
+    let expected_session_cwd = expected_scope_root.join("workspace");
+    let expected_session_cwd = expected_session_cwd
+        .to_str()
+        .expect("测试 session cwd 必须是 UTF-8")
+        .to_owned();
     let script = format!(
-        "#!/bin/sh\n\
-         home=\"\"\n\
-         while [ \"$#\" -gt 0 ]; do\n\
-           if [ \"$1\" = \"--grok-home\" ]; then home=\"$2\"; break; fi\n\
-           shift\n\
-         done\n\
-         test -n \"$EFFLAB_L3B_BIND\" || exit 11\n\
-         test -f \"$home/config.toml\" || exit 12\n\
-         /usr/bin/env | /usr/bin/sed 's/=.*$//' | /usr/bin/sort > {capture:?}\n\
-         /bin/cp \"$home/config.toml\" {config_capture:?}\n\
-         while IFS= read -r _; do :; done\n",
-        capture = capture_path,
-        config_capture = config_capture_path,
+        r#"#!/bin/sh
+capture_path={capture}
+ready_path={ready}
+expected_home={home}
+expected_session_cwd={session_cwd}
+env_tmp="$capture_path.tmp.$$"
+home=""
+runtime_config=""
+session_cwd=""
+runtime_config_count=0
+home_count=0
+session_cwd_count=0
+stdio_count=0
+arg_position=0
+while [ "$#" -gt 0 ]; do
+  case "$arg_position:$1" in
+    0:--runtime-config)
+      runtime_config_count=$((runtime_config_count + 1))
+      [ "$runtime_config_count" -eq 1 ] || exit 11
+      [ "$#" -ge 2 ] || exit 12
+      [ -n "$2" ] || exit 13
+      case "$2" in --*) exit 14 ;; esac
+      runtime_config="$2"
+      shift 2
+      arg_position=2
+      ;;
+    2:--home)
+      home_count=$((home_count + 1))
+      [ "$home_count" -eq 1 ] || exit 15
+      [ "$#" -ge 2 ] || exit 16
+      [ -n "$2" ] || exit 17
+      case "$2" in --*) exit 18 ;; esac
+      home="$2"
+      shift 2
+      arg_position=4
+      ;;
+    4:--session-cwd)
+      session_cwd_count=$((session_cwd_count + 1))
+      [ "$session_cwd_count" -eq 1 ] || exit 19
+      [ "$#" -ge 2 ] || exit 20
+      [ -n "$2" ] || exit 21
+      case "$2" in --*) exit 22 ;; esac
+      session_cwd="$2"
+      shift 2
+      arg_position=6
+      ;;
+    6:--stdio)
+      stdio_count=$((stdio_count + 1))
+      [ "$stdio_count" -eq 1 ] || exit 23
+      shift
+      arg_position=7
+      ;;
+    *:--grok-home|*:--mcp-config|*:--mcp-exec-root)
+      exit 24
+      ;;
+    *)
+      exit 25
+      ;;
+  esac
+done
+[ "$arg_position" -eq 7 ] || exit 26
+[ "$runtime_config_count" -eq 1 ] || exit 27
+[ "$home_count" -eq 1 ] || exit 28
+[ "$session_cwd_count" -eq 1 ] || exit 29
+[ "$stdio_count" -eq 1 ] || exit 30
+[ -n "$home" ] || exit 31
+[ -n "$runtime_config" ] || exit 32
+[ -n "$session_cwd" ] || exit 33
+test "$home" = "$expected_home" || exit 34
+test "$runtime_config" = "$home/runtime-config.v1.toml" || exit 35
+test "$session_cwd" = "$expected_session_cwd" || exit 36
+test -n "$EFFLAB_L3B_BIND" || exit 35
+/usr/bin/env | /usr/bin/grep -q '^XAI_API_KEY=' && exit 36
+/usr/bin/env | /usr/bin/grep -q '^GROK_CODE_XAI_API_KEY=' && exit 37
+test -f "$runtime_config" || exit 38
+/usr/bin/grep -q '^schema_version = 1$' "$runtime_config" || exit 39
+/usr/bin/grep -q '^backend = "chat_completions"$' "$runtime_config" || exit 40
+/usr/bin/grep -q '^token_env = "EFFLAB_L3B_BIND"$' "$runtime_config" || exit 41
+generation=1
+if [ -f "$ready_path" ]; then
+  generation=$(( $(/usr/bin/wc -l < "$ready_path") + 1 ))
+fi
+capture_target="$capture_path"
+if [ "$generation" -gt 1 ]; then
+  capture_target="$capture_path.$generation"
+fi
+# 只记录变量名；binding 的实际值和任何用户秘密都不落盘。
+/usr/bin/env | /usr/bin/sed 's/=.*$//' | /usr/bin/sort > "$env_tmp" || exit 42
+/bin/mv -f "$env_tmp" "$capture_target" || exit 43
+/usr/bin/printf '%s\n' "$generation" >> "$ready_path" || exit 44
+while IFS= read -r _; do :; done
+"#,
+        capture = shell_quote(&capture_path),
+        ready = shell_quote(&ready_path),
+        home = shell_quote(&expected_home),
+        session_cwd = shell_quote_text(&expected_session_cwd),
+    );
+    // 先约束 fixture 自身：捕获脚本不能把用户秘密或端点物化到磁盘。
+    assert!(
+        !script.contains(user_key),
+        "fake sidecar 脚本不得包含初始用户 Key 原文"
+    );
+    assert!(
+        !script.contains(rotated_key),
+        "fake sidecar 脚本不得包含轮换用户 Key 原文"
+    );
+    assert!(
+        !script.contains(user_endpoint),
+        "fake sidecar 脚本不得包含用户 endpoint 原文"
     );
     fs::write(&script_path, script).expect("必须能写入 fake sidecar");
     fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
         .expect("fake sidecar 必须可执行");
 
-    let app = Arc::new(FakeApp::byok(
-        "https://8.8.8.8/v1".to_string(),
+    let app = Arc::new(FakeApp::byok_with_mcp(
+        user_endpoint.to_string(),
         "launch-model",
         user_key,
+        launch_mcp_spec(),
     ));
     let runtime_config = HostRuntimeConfig {
-        home_root: temporary.path().join("app-data"),
+        home_root,
         sidecar_bin: script_path,
-        sidecar_log_path: temporary.path().join("sidecar.log"),
+        sidecar_log_path: sidecar_log_path.clone(),
         mcp_exec_root: temporary.path().join("mcp"),
         idle_after: Duration::from_secs(60),
         l3b: L3bRuntimeConfig::default(),
@@ -1033,39 +1257,121 @@ fn real_launch_writes_loopback_config_and_keeps_user_key_out_of_sidecar_environm
     service
         .launch_scope("library-a")
         .expect("真实 launch 零件必须能按安全顺序启动 fake sidecar");
-    wait_for_file(&capture_path);
-    wait_for_file(&config_capture_path);
+    wait_for_file(&ready_path);
 
-    let captured_env = fs::read_to_string(&capture_path).expect("必须能读取 child 环境快照");
-    let captured_config = fs::read_to_string(&config_capture_path).expect("必须能读取权威配置快照");
+    let captured_env =
+        fs::read_to_string(&capture_path).expect("ready marker 后必须能读取 child 环境 marker");
+    let runtime_config_text = fs::read_to_string(&expected_runtime_config)
+        .expect("ready marker 后必须能读取 Host 写出的 v1 配置");
+    // 初代配置和日志在轮换前就必须完成秘密隔离，不能只检查轮换后被覆盖的文件。
+    assert!(
+        !runtime_config_text.contains(user_key),
+        "初代 runtime config 不得包含初始用户 Key"
+    );
+    assert!(
+        !runtime_config_text.contains(rotated_key),
+        "初代 runtime config 不得预埋轮换用户 Key"
+    );
+    let initial_sidecar_log =
+        fs::read_to_string(&sidecar_log_path).expect("初代 sidecar 启动后必须能读取注入日志");
+    assert!(
+        !initial_sidecar_log.contains(user_key),
+        "初代 sidecar 日志不得包含初始用户 Key"
+    );
+    assert!(
+        !initial_sidecar_log.contains(rotated_key),
+        "初代 sidecar 日志不得预埋轮换用户 Key"
+    );
+
+    // loader 成功返回即表示 Host 写出的配置满足 schema、stdio 与 runtime_revision 约束。
+    let config = load_runtime_config_v1_from_str(&runtime_config_text)
+        .unwrap_or_else(|_| panic!("Host 写出的 runtime config 必须通过 contract loader 校验"));
+    assert!(
+        config.schema_version == 1,
+        "runtime config schema version 必须为 1"
+    );
+    assert!(
+        config.session_store_version == 1,
+        "runtime config session store version 必须为 1"
+    );
+    assert!(
+        config.runtime_revision.starts_with("sha256:"),
+        "runtime config revision 必须使用 sha256 marker"
+    );
+    assert!(
+        config.session_cwd == expected_session_cwd,
+        "runtime config session cwd 必须匹配 Host scope workspace"
+    );
+    assert!(
+        config.model.model_id == "launch-model",
+        "runtime config model id 必须来自 Host Channel"
+    );
     let loopback_address = service
         .loopback_addr()
         .expect("成功 launch 后必须存在进程级 L3b 监听");
+    assert!(
+        config.model.base_url == format!("http://127.0.0.1:{}/v1", loopback_address.port()),
+        "runtime config upstream 必须指向 Host L3b loopback"
+    );
+    assert!(
+        config.model.backend == "chat_completions",
+        "runtime config backend 必须为 chat_completions"
+    );
+    assert!(
+        config.model.token_env == "EFFLAB_L3B_BIND",
+        "runtime config token env 必须为固定 binding 名"
+    );
+    assert!(
+        config.approved_mcp.servers.len() == 1,
+        "runtime config 必须保留一个已审核 MCP server"
+    );
+    assert!(
+        config.approved_mcp.servers.get("demo")
+            == Some(&McpServerSpec::Http {
+                url: "http://127.0.0.1:4313/mcp".to_string(),
+            }),
+        "runtime config 必须保留已审核 HTTP MCP"
+    );
+    assert!(
+        !config.approved_mcp.servers.contains_key("demo__search"),
+        "runtime config server map 不得混入工具名"
+    );
+    assert!(
+        config.expected_tools == BTreeSet::from(["demo__search".to_string()]),
+        "runtime config 必须保留已审核工具名"
+    );
 
-    // 测试脚本仅落盘环境变量名，避免测试产物记录真实 binding token。
-    assert!(captured_env.lines().any(|name| name == "EFFLAB_L3B_BIND"));
-    assert!(!captured_env.lines().any(|name| name == "GROK_HOME"));
-    assert!(!captured_env.lines().any(|name| name == "XAI_API_KEY"));
-    assert!(!captured_env.contains(user_key));
-    // `/bin/sh` 会自行生成 `_`、`PWD`、`SHLVL`；去掉这三项后，execve 收到的
-    // 业务环境必须只剩 Host 生成的 binding token，不得继承平台或用户变量。
-    let inherited_variables: Vec<_> = captured_env
+    assert_sidecar_environment_names(&captured_env);
+    let inherited_variables: BTreeSet<_> = captured_env
         .lines()
+        .filter(|line| !line.contains('='))
         .filter(|name| !matches!(*name, "_" | "PWD" | "SHLVL"))
         .collect();
-    assert_eq!(
-        inherited_variables,
-        vec!["EFFLAB_L3B_BIND"],
-        "sidecar 除 shell 自生成变量外只能继承 binding token"
-    );
-    assert!(!captured_config.contains(user_key));
-    assert!(!captured_config.contains("https://8.8.8.8/v1"));
-    assert!(captured_config.contains(&format!(
-        "base_url = \"http://127.0.0.1:{}/v1\"",
-        loopback_address.port()
-    )));
-    assert!(captured_config.contains("model = \"launch-model\""));
-    assert!(captured_config.contains("env_key = \"EFFLAB_L3B_BIND\""));
+    #[cfg(target_os = "macos")]
+    assert!(!inherited_variables.contains("LD_LIBRARY_PATH"));
+    #[cfg(all(unix, not(target_os = "macos")))]
+    assert!(!inherited_variables.contains("DYLD_LIBRARY_PATH"));
+
+    let change = service
+        .set(SetLlmChannelRequest {
+            api_key: Some(rotated_key.to_string()),
+            ..SetLlmChannelRequest::default()
+        })
+        .expect("轮换 Key 必须重启当前 live sidecar");
+    assert!(change.changed, "轮换 Key 必须创建新的 Channel revision");
+    wait_for_line_count(&ready_path, 2);
+    let rotated_capture = capture_path.with_extension("2");
+    let rotated_env = fs::read_to_string(&rotated_capture)
+        .expect("轮换后的 sidecar 必须留下第二代环境变量名 marker");
+    assert_sidecar_environment_names(&rotated_env);
+
+    let persisted_config = fs::read_to_string(&expected_runtime_config)
+        .expect("轮换后仍必须能读取当前代 runtime config");
+    assert!(!persisted_config.contains(user_key));
+    assert!(!persisted_config.contains(rotated_key));
+    let sidecar_log = fs::read_to_string(&sidecar_log_path).expect("必须能读取 sidecar 日志");
+    assert!(!sidecar_log.contains(user_key));
+    assert!(!sidecar_log.contains(rotated_key));
 }
 
 /// sidecar stderr 必须落到产品注入的独立日志文件，Host 不得假定任何产品目录。
@@ -1079,8 +1385,8 @@ fn real_launch_writes_sidecar_stderr_to_injected_log_file() {
         .join("agent-sidecar.log");
     let script_path = temporary.path().join("stderr-sidecar.sh");
     let script = format!(
-        "#!/bin/sh\necho sidecar-stderr-marker >&2\n: > {ready:?}\nwhile IFS= read -r _; do :; done\n",
-        ready = marker_path,
+        "#!/bin/sh\nprintf '%s\\n' sidecar-stderr-marker >&2\n: > {ready}\nwhile IFS= read -r _; do :; done\n",
+        ready = shell_quote(&marker_path),
     );
     fs::write(&script_path, script).expect("必须能写入 stderr sidecar");
     fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
@@ -1110,10 +1416,10 @@ fn real_launch_writes_sidecar_stderr_to_injected_log_file() {
     let text = fs::read_to_string(&log_path).expect("必须能读取产品注入的 sidecar 日志");
     assert!(
         text.contains("sidecar-stderr-marker"),
-        "独立日志应包含 sidecar stderr，实际: {text}"
+        "独立日志应包含 sidecar stderr marker"
     );
     assert!(
         text.contains("scope=library-a"),
-        "独立日志应包含 Host 写入的 spawn 头，实际: {text}"
+        "独立日志应包含 Host 写入的 spawn marker"
     );
 }

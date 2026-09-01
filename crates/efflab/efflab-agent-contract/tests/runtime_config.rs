@@ -4,7 +4,8 @@ use std::path::PathBuf;
 
 use efflab_agent_contract::{
     ApprovedMcpConfig, LoopbackModelSpec, McpServerSpec, RuntimeConfigV1,
-    is_literal_loopback_http_url, load_runtime_config_v1, render_runtime_config_v1,
+    is_literal_loopback_http_url, is_prompt_id, is_qualified_tool_name, load_runtime_config_v1,
+    load_runtime_config_v1_from_str, render_runtime_config_v1,
 };
 use serde::Serialize;
 use tempfile::TempDir;
@@ -108,7 +109,7 @@ fn loaded_fixture(name: &str) -> (FixturePath, RuntimeConfigV1) {
     (fixture, loaded)
 }
 
-/// 断言 loader 报告指定字段，避免把解析失败归因到后续 revision 校验。
+/// 断言 loader 报告预期的安全分类，避免把解析失败归因到后续 revision 校验。
 fn assert_loader_error(source: &str, expected: &str) {
     let (_directory, path) = write_config_source(source);
     let error = load_runtime_config_v1(&path).expect_err("非法 runtime config 必须拒绝");
@@ -124,7 +125,95 @@ fn assert_http_url_rejected(url: &str) {
     let source = materialize_cwd(fixture_source("runtime_config_v1_http_mcp.toml"))
         .replace("http://127.0.0.1:4313/mcp", url);
     let source = with_independent_revision(&source);
-    assert_loader_error(&source, "approved_mcp.servers.demo.url");
+    assert_loader_error(&source, "approved_mcp.servers.url_invalid");
+}
+
+#[test]
+fn runtime_config_v1_can_validate_already_read_source() {
+    let source = materialize_fixture_source("runtime_config_v1_empty.toml");
+    let from_path = loaded_fixture("runtime_config_v1_empty.toml").1;
+    let from_source = load_runtime_config_v1_from_str(&source).expect("已读取的 config 应可校验");
+
+    assert_eq!(from_source, from_path);
+}
+
+#[test]
+fn runtime_config_session_cwd_uses_one_absolute_utf8_lexical_contract() {
+    let exact_limit = format!("/{}", "x".repeat(4095));
+    let source = materialize_cwd(fixture_source("runtime_config_v1_empty.toml")).replace(
+        &session_cwd_assignment(),
+        &format!("session_cwd = {}", toml::Value::String(exact_limit.clone())),
+    );
+    let source = with_independent_revision(&source);
+    let (_directory, path) = write_config_source(&source);
+    assert!(
+        load_runtime_config_v1(&path).is_ok(),
+        "4096 字节绝对 UTF-8 session_cwd 应通过 shape 校验"
+    );
+
+    for (invalid, expected) in [
+        ("relative/session", "绝对"),
+        ("/safe/../session", ".."),
+        ("/safe\0session", "NUL"),
+    ] {
+        let source = materialize_cwd(fixture_source("runtime_config_v1_empty.toml")).replace(
+            &session_cwd_assignment(),
+            &format!("session_cwd = {}", toml::Value::String(invalid.to_owned())),
+        );
+        let source = with_independent_revision(&source);
+        let (_directory, path) = write_config_source(&source);
+        let error = load_runtime_config_v1(&path).expect_err("非法 session_cwd 必须拒绝");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(expected),
+            "session_cwd 错误应包含 {expected:?}，实际为 {rendered:?}"
+        );
+        assert!(
+            !rendered.contains(invalid),
+            "session_cwd 错误不得回显输入值: {rendered:?}"
+        );
+    }
+
+    let oversized = format!("/{}", "x".repeat(4096));
+    let source = materialize_cwd(fixture_source("runtime_config_v1_empty.toml")).replace(
+        &session_cwd_assignment(),
+        &format!("session_cwd = {}", toml::Value::String(oversized)),
+    );
+    let source = with_independent_revision(&source);
+    let (_directory, path) = write_config_source(&source);
+    assert_loader_error(&source, "4096");
+    assert!(load_runtime_config_v1(&path).is_err());
+}
+
+#[test]
+fn runtime_config_errors_never_echo_mcp_server_names_or_control_characters() {
+    let malicious_name = "evil\u{001b}[31mserver";
+    let server_key = toml::Value::String(malicious_name.to_owned()).to_string();
+    let invalid_server_key = materialize_cwd(fixture_source("runtime_config_v1_empty.toml"))
+        .replace(
+            "[approved_mcp]\nservers = {}",
+            &format!("[approved_mcp.servers.{server_key}]\nurl = \"http://127.0.0.1:4313/mcp\""),
+        );
+    let error = load_runtime_config_v1_from_str(&invalid_server_key)
+        .expect_err("非法 MCP server key 必须拒绝");
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("approved_mcp.servers.name_invalid"),
+        "非法 server key 应归类为固定错误: {rendered:?}"
+    );
+    assert!(!rendered.contains(malicious_name));
+    assert!(!rendered.contains('\u{001b}'));
+
+    let invalid_url = materialize_cwd(fixture_source("runtime_config_v1_empty.toml")).replace(
+        "[approved_mcp]\nservers = {}",
+        "[approved_mcp.servers.demo]\nurl = \"http://localhost:4313/mcp\"",
+    );
+    let invalid_url = with_independent_revision(&invalid_url);
+    let error = load_runtime_config_v1_from_str(&invalid_url).expect_err("非回环 MCP URL 必须拒绝");
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("approved_mcp.servers.url_invalid"));
+    assert!(!rendered.contains(malicious_name));
+    assert!(!rendered.contains('\u{001b}'));
 }
 
 #[test]
@@ -158,7 +247,73 @@ fn expected_tools_under_servers_table_is_rejected() {
         "runtime_config_v1_expected_tools_under_servers.toml",
     ))
     .replace(REVISION_PLACEHOLDER, &format!("sha256:{}", "0".repeat(64)));
-    assert_loader_error(&source, "expected_tools");
+    assert_loader_error(&source, "runtime_config_invalid");
+}
+
+#[test]
+fn runtime_config_loader_rejects_invalid_expected_tool_names() {
+    for name in [
+        "",
+        "demo",
+        "demo__",
+        "demo__search__extra",
+        "1demo__search",
+        "demo__1search",
+        "demo__search.name",
+        "demo__search name",
+    ] {
+        let expected_tools = toml::Value::String(name.to_owned()).to_string();
+        let source = materialize_cwd(fixture_source("runtime_config_v1_http_mcp.toml")).replace(
+            "expected_tools = [\"demo__search\"]",
+            &format!("expected_tools = [{expected_tools}]"),
+        );
+        let source = with_independent_revision(&source);
+        assert_loader_error(&source, "expected_tools");
+    }
+}
+
+#[test]
+fn runtime_config_loader_keeps_long_tool_segment_before_record_limit() {
+    let tool_name = format!("tool_{}", "x".repeat(64));
+    let qualified_name = format!("demo__{tool_name}");
+    let expected_tools = toml::Value::String(qualified_name.clone()).to_string();
+    let source = materialize_cwd(fixture_source("runtime_config_v1_http_mcp.toml")).replace(
+        "expected_tools = [\"demo__search\"]",
+        &format!("expected_tools = [{expected_tools}]"),
+    );
+    let source = with_independent_revision(&source);
+    let loaded = load_runtime_config_v1_from_str(&source)
+        .expect("合法且超过 64 字节的 tool segment 不应被 loader 错误拒绝");
+    assert_eq!(loaded.expected_tools, BTreeSet::from([qualified_name]));
+}
+
+/// RuntimeConfigV1 的 server map key 必须执行 64-byte 和字符集边界，不能退回非空判断。
+#[test]
+fn runtime_config_loader_rejects_oversized_and_invalid_server_keys() {
+    // 通过合法 HTTP 条目重算 revision，使断言命中 server key 校验而不是摘要错误。
+    let source_for_server = |name: &str| {
+        let key = toml::Value::String(name.to_owned()).to_string();
+        let source = materialize_cwd(fixture_source("runtime_config_v1_empty.toml")).replace(
+            "[approved_mcp]\nservers = {}",
+            &format!("[approved_mcp.servers.{key}]\nurl = \"http://127.0.0.1:4313/mcp\""),
+        );
+        with_independent_revision(&source)
+    };
+
+    let oversized = source_for_server(&"s".repeat(65));
+    assert_loader_error(&oversized, "approved_mcp.servers.name_invalid");
+
+    for name in [
+        "",
+        "1demo",
+        "demo.name",
+        "demo name",
+        "demo/tool",
+        "demo__server",
+    ] {
+        let source = source_for_server(name);
+        assert_loader_error(&source, "approved_mcp.servers.name_invalid");
+    }
 }
 
 #[test]
@@ -333,12 +488,12 @@ fn runtime_config_loader_rejects_unknown_fields_at_each_wire_level() {
     let empty = materialize_fixture_source("runtime_config_v1_empty.toml");
     assert_loader_error(
         &empty.replace("\n[model]\n", "\nunknown_root = true\n\n[model]\n"),
-        "unknown field `unknown_root`",
+        "runtime_config_invalid",
     );
 
     assert_loader_error(
         &empty.replace("[model]\n", "[model]\nunknown_model = true\n"),
-        "unknown field `unknown_model`",
+        "runtime_config_invalid",
     );
 
     assert_loader_error(
@@ -346,7 +501,7 @@ fn runtime_config_loader_rejects_unknown_fields_at_each_wire_level() {
             "[approved_mcp]\nservers = {}",
             "[approved_mcp]\nservers = {}\nunknown_approved = true",
         ),
-        "unknown field `unknown_approved`",
+        "runtime_config_invalid",
     );
 
     let http = materialize_fixture_source("runtime_config_v1_http_mcp.toml");
@@ -355,51 +510,39 @@ fn runtime_config_loader_rejects_unknown_fields_at_each_wire_level() {
             "url = \"http://127.0.0.1:4313/mcp\"",
             "url = \"http://127.0.0.1:4313/mcp\"\nunknown_http = true",
         ),
-        "unknown field `unknown_http`",
+        "runtime_config_invalid",
     );
 
     let stdio = materialize_fixture_source("runtime_config_v1_empty.toml").replace(
         "[approved_mcp]\nservers = {}",
         "[approved_mcp.servers.demo]\ncommand = \"echo\"\nargs = []\nunknown_stdio = true",
     );
-    assert_loader_error(&stdio, "unknown field `unknown_stdio`");
+    assert_loader_error(&stdio, "runtime_config_invalid");
 }
 
 #[test]
 fn runtime_config_loader_rejects_missing_required_fields_independently() {
     let empty = materialize_fixture_source("runtime_config_v1_empty.toml");
-    for (source, expected) in [
-        (
-            empty.replace("schema_version = 1\n", ""),
-            "missing field `schema_version`",
-        ),
-        (
-            empty.replace("expected_tools = []\n", ""),
-            "missing field `expected_tools`",
-        ),
-        (
-            empty.replace("model_id = \"byok-user-model\"\n", ""),
-            "missing field `model_id`",
-        ),
-        (
-            empty.replace("[approved_mcp]\nservers = {}", "[approved_mcp]"),
-            "missing field `servers`",
-        ),
+    for source in [
+        empty.replace("schema_version = 1\n", ""),
+        empty.replace("expected_tools = []\n", ""),
+        empty.replace("model_id = \"byok-user-model\"\n", ""),
+        empty.replace("[approved_mcp]\nservers = {}", "[approved_mcp]"),
     ] {
-        assert_loader_error(&source, expected);
+        assert_loader_error(&source, "runtime_config_invalid");
     }
 
     let http = materialize_fixture_source("runtime_config_v1_http_mcp.toml");
     assert_loader_error(
         &http.replace("url = \"http://127.0.0.1:4313/mcp\"\n", ""),
-        "url",
+        "runtime_config_invalid",
     );
 
     let stdio = materialize_fixture_source("runtime_config_v1_empty.toml").replace(
         "[approved_mcp]\nservers = {}",
         "[approved_mcp.servers.demo]\nargs = []",
     );
-    assert_loader_error(&stdio, "command");
+    assert_loader_error(&stdio, "runtime_config_invalid");
 }
 
 #[test]
@@ -771,4 +914,57 @@ fn golden_cwd_changed() -> &'static str {
     {
         r"C:\efflab\changed"
     }
+}
+
+#[test]
+fn qualified_tool_name_helper_enforces_shared_wire_shape() {
+    assert!(is_qualified_tool_name("demo__search"));
+    assert!(is_qualified_tool_name(&format!(
+        "demo__tool_{}",
+        "x".repeat(64)
+    )));
+
+    for invalid in [
+        "",
+        "demo",
+        "demo__",
+        "demo__search__extra",
+        "1demo__search",
+        "demo__1search",
+        "demo__search.name",
+        "demo__search name",
+        "demo__search/tool",
+        "demo__search\u{0000}",
+        "demo__search\u{001b}[31m",
+        "demo__tool__suffix",
+    ] {
+        assert!(
+            !is_qualified_tool_name(invalid),
+            "非法 qualified tool name 不得通过共享 helper: {invalid:?}"
+        );
+    }
+
+    assert!(!is_qualified_tool_name(&format!(
+        "{}__search",
+        "s".repeat(65)
+    )));
+}
+
+#[test]
+fn prompt_id_helper_enforces_non_empty_control_free_byte_boundary() {
+    assert!(is_prompt_id("prompt-1"));
+    assert!(is_prompt_id(&"x".repeat(1024)));
+    assert!(is_prompt_id(&"é".repeat(512)), "UTF-8 1024 bytes 应通过");
+
+    for invalid in ["", "prompt\n", "prompt\u{0000}", "prompt\u{001f}"] {
+        assert!(
+            !is_prompt_id(invalid),
+            "非法 promptId 不得通过共享 helper: {invalid:?}"
+        );
+    }
+    assert!(!is_prompt_id(&"x".repeat(1025)));
+    assert!(
+        !is_prompt_id(&"é".repeat(513)),
+        "超过 1024 UTF-8 bytes 应拒绝"
+    );
 }

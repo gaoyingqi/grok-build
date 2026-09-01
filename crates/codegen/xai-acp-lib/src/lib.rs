@@ -23,8 +23,11 @@ pub use self::{
     },
 };
 
-pub use self::line_reader::LineBufferedRead;
-pub use self::stdin_reader::spawn_stdin_line_reader;
+pub use self::line_reader::{
+    AcpTransportErrorKind, AcpTransportReader, AcpTransportState, AcpTransportWriter,
+    LineBufferedRead,
+};
+pub use self::stdin_reader::{spawn_stdin_line_reader, spawn_stdin_line_reader_with_errors};
 
 #[doc(hidden)]
 pub use self::common::compact_json;

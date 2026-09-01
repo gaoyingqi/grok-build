@@ -1,455 +1,1010 @@
-//! Sidecar 启动前的私有文件系统与环境加固。
+//! sidecar 启动所需的私有 home、文件权限和环境边界硬化。
 //!
-//! 本模块只能在任何 xai shell API、Tokio runtime 或其他可能触发
-//! `xai_grok_config::grok_home()` 的代码之前调用。这样 `GROK_HOME` 的
-//! `OnceLock` 才会缓存本 sidecar 明确指定的私有目录，而不会继承用户环境。
+//! 本模块只在 Unix 上开放启动能力。Windows/非 Unix 的等价权限与进程边界尚未
+//! proven，因此直接返回 fail-closed 错误，不读取 runtime config 或创建目录。
 
 use std::env;
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+#[cfg(unix)]
 use fs2::FileExt;
+#[cfg(unix)]
+use std::ffi::CString;
+#[cfg(unix)]
+use std::fs::File;
+#[cfg(not(unix))]
+use std::fs::File;
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// 私有目录的 Unix 权限：仅当前用户可访问。
+#[cfg(unix)]
 const DIRECTORY_MODE: u32 = 0o700;
-/// 私有文件的 Unix 权限：仅当前用户可读写。
+#[cfg(unix)]
 const FILE_MODE: u32 = 0o600;
-/// 同一私有 home 的 sidecar 进程互斥锁文件名。
+#[cfg(unix)]
 const HOME_LOCK_FILENAME: &str = ".efflab-sidecar.lock";
-/// 私有 home 中不得存在的上游策略层；其优先级可能覆盖本模块生成的配置。
-const FORBIDDEN_PRIVATE_POLICY_FILES: [&str; 2] = ["managed_config.toml", "requirements.toml"];
-/// 物化后的固定 AgentDefinition 文件名。
-const DEFAULT_AGENT_FILENAME: &str = "efflab-default.md";
-/// 编译期嵌入的密封默认 AgentDefinition，运行时绝不从用户目录读取它。
-const DEFAULT_AGENT_DEFINITION: &str = include_str!("../assets/efflab-default-agent.md");
+const L3B_BIND_ENV: &str = "EFFLAB_L3B_BIND";
+/// RuntimeConfigV1 的固定读取上限，防止启动阶段无界分配。
+pub const MAX_RUNTIME_CONFIG_BYTES: usize = 64 * 1024;
 
-/// 不允许继承的非 compat 环境变量。
-const SANITIZED_ENV_VARS: [&str; 5] = [
-    "GROK_EXTERNAL_OTEL",
-    "GROK_SUBAGENTS",
-    "GROK_STORAGE_MODE",
-    "GROK_MANAGED_MCPS_ENABLED",
-    "GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED",
-];
-
-/// 上游认证路径可能读取的 first-party 用户凭据环境变量。
-///
-/// 清单依据 `xai-grok-shell/src/agent/config.rs` 的认证变量审计固定；sidecar 不依赖
-/// 上游私有常量，但上游新增认证来源时必须同步审计此列表。唯一允许保留的 L3b
-/// 绑定令牌 `EFFLAB_L3B_BIND` 不在本列表中。
-const FIRST_PARTY_CREDENTIAL_ENV_VARS: [&str; 9] = [
-    "XAI_API_KEY",
-    "GROK_CODE_XAI_API_KEY",
-    "GROK_AUTH",
-    "GROK_AUTH_PATH",
-    "GROK_DEPLOYMENT_KEY",
-    "GROK_EXTRA_AUTH_KEY",
-    "GROK_TRACE_UPLOAD_CREDENTIALS_FILE",
-    "OTEL_EXPORTER_OTLP_HEADERS",
-    "GROK_INTERNAL_OTLP_HEADERS",
-];
-
-/// `COMPAT_CELLS` 当前登记的全部 18 个环境变量。
-///
-/// 此列表依据 `xai-grok-tools/src/types/compat.rs` 的 `COMPAT_CELLS` 固定，
-/// 不使用宽泛的 `GROK_*` 黑名单，以免删除无关启动配置。
-const COMPAT_ENV_VARS: [&str; 18] = [
-    "GROK_CURSOR_SKILLS_ENABLED",
-    "GROK_CURSOR_RULES_ENABLED",
-    "GROK_CURSOR_AGENTS_ENABLED",
-    "GROK_CURSOR_MCPS_ENABLED",
-    "GROK_CURSOR_HOOKS_ENABLED",
-    "GROK_CURSOR_SESSIONS_ENABLED",
-    "GROK_CLAUDE_SKILLS_ENABLED",
-    "GROK_CLAUDE_RULES_ENABLED",
-    "GROK_CLAUDE_AGENTS_ENABLED",
-    "GROK_CLAUDE_MCPS_ENABLED",
-    "GROK_CLAUDE_HOOKS_ENABLED",
-    "GROK_CLAUDE_SESSIONS_ENABLED",
-    "GROK_CODEX_SKILLS_ENABLED",
-    "GROK_CODEX_RULES_ENABLED",
-    "GROK_CODEX_AGENTS_ENABLED",
-    "GROK_CODEX_MCPS_ENABLED",
-    "GROK_CODEX_HOOKS_ENABLED",
-    "GROK_CODEX_SESSIONS_ENABLED",
-];
-
-/// 创建并校验仅属于 sidecar 的私有 `GROK_HOME`。
-///
-/// 本函数只使用传入的路径，刻意不读取通用 `GROK_HOME` 环境变量。目录会递归
-/// 创建并收紧为 `0700`；若已存在任一私有 managed/requirements 策略层，则拒绝
-/// 启动，避免其覆盖权威 `config.toml` 的安全字段。
-pub fn prepare_private_home(grok_home: &Path) -> Result<()> {
-    require_absolute_path(grok_home, "私有 GROK_HOME")?;
-    create_private_directory(grok_home)?;
-    reject_private_policy_layers(grok_home)
+/// Windows/非 Unix capability 尚未 proven；在所有文件读取和 env 清理前执行。
+#[cfg(unix)]
+pub fn ensure_platform_supported() -> Result<()> {
+    Ok(())
 }
 
-/// 获取私有 home 的非阻塞 fs2 独占锁。
-///
-/// 返回值是承载锁的 `std::fs::File`（`fs2` 提供的是 `FileExt` 扩展 trait）。
-/// 调用方必须将其保留到进程退出；File drop 时锁自动释放。同一 home 已被另一
-/// sidecar 进程锁定时，本函数立即失败而不会等待。
-pub fn acquire_home_lock(grok_home: &Path) -> Result<File> {
-    prepare_private_home(grok_home)?;
-
-    let lock_path = grok_home.join(HOME_LOCK_FILENAME);
-    reject_symlink_if_present(&lock_path, "私有 home 锁文件")?;
-    let lock_file = open_private_file(&lock_path)?;
-
-    FileExt::try_lock_exclusive(&lock_file).with_context(|| {
-        format!(
-            "拒绝并发启动：私有 GROK_HOME 已被另一 sidecar 占用: {}",
-            grok_home.display()
-        )
-    })?;
-
-    Ok(lock_file)
+/// 非 Unix 不允许直接拉起 sidecar，避免把未证明的权限模型当作安全边界。
+#[cfg(not(unix))]
+pub fn ensure_platform_supported() -> Result<()> {
+    bail!("sidecar_hardening_unavailable: Windows/非 Unix capability 尚未 proven")
 }
 
-/// 以临时文件、文件同步、原子改名和父目录同步的顺序覆盖私有文件。
+/// 保存启动阶段已经 no-follow 校验过的 home 与 session 目录句柄。
 ///
-/// 临时文件始终创建在目标文件所在目录，因此 rename 不跨文件系统。函数从不读取
-/// 或合并旧内容；成功返回时目标文件权限为 `0600`。当前 POC 仅支持 Unix/macOS，
-/// 其他平台会 fail-closed。
-pub fn atomic_write_private(path: &Path, content: &[u8]) -> Result<()> {
-    require_absolute_path(path, "原子写目标")?;
-    if path.file_name().is_none() {
-        bail!("原子写目标必须是文件路径: {}", path.display());
-    }
+/// 主入口必须在配置校验后继续使用这组句柄，避免按同名路径重新解析到被替换的目录。
+#[cfg(unix)]
+pub struct StartupHandles {
+    home_directory: File,
+    session_cwd_directory: File,
+}
 
-    let parent = path.parent().context("原子写目标缺少父目录")?;
-    ensure_real_directory(parent, "原子写目标父目录")?;
-    reject_symlink_if_present(path, "原子写目标")?;
+/// 非 Unix 不暴露任何可用的启动句柄。
+#[cfg(not(unix))]
+pub struct StartupHandles;
 
-    #[cfg(not(unix))]
+/// 为一次启动打开并保存 home/session 目录 fd；runtime config 后续从 home fd 读取。
+#[cfg(unix)]
+pub fn open_startup_handles(home: &Path, session_cwd: &Path) -> Result<StartupHandles> {
+    let session_cwd_directory = match open_existing_private_directory(session_cwd, "--session-cwd")
     {
-        let _ = content;
-        bail!("私有原子写仅支持 Unix/macOS 文件权限模型");
-    }
-
-    #[cfg(unix)]
-    {
-        // 临时文件与目标文件同目录，rename 才具备本文件系统内的原子替换语义。
-        let mut temporary = tempfile::NamedTempFile::new_in(parent)
-            .with_context(|| format!("无法在私有目录创建原子写临时文件: {}", parent.display()))?;
-        set_private_permissions(temporary.path(), FILE_MODE, "原子写临时文件")?;
-        let temporary_path = temporary.path().to_path_buf();
-
-        {
-            let temporary_file = temporary.as_file_mut();
-            temporary_file
-                .write_all(content)
-                .with_context(|| format!("写入原子写临时文件失败: {}", temporary_path.display()))?;
-            temporary_file
-                .sync_all()
-                .with_context(|| format!("同步原子写临时文件失败: {}", temporary_path.display()))?;
+        Ok(directory) => directory,
+        Err(error) => {
+            tracing::debug!(
+                event = "session_fd_open_failed",
+                "打开 session 目录句柄失败"
+            );
+            return Err(error);
         }
+    };
+    let home_directory = match open_existing_private_home_directory(home) {
+        Ok(directory) => directory,
+        Err(error) => {
+            tracing::debug!(event = "home_fd_open_failed", "打开 home 目录句柄失败");
+            return Err(error);
+        }
+    };
+    tracing::debug!(
+        event = "startup_fds_opened",
+        "启动 home 与 session 目录句柄已打开"
+    );
+    Ok(StartupHandles {
+        home_directory,
+        session_cwd_directory,
+    })
+}
 
-        fs::rename(&temporary_path, path).with_context(|| {
-            format!(
-                "原子替换私有文件失败: {} -> {}",
-                temporary_path.display(),
-                path.display()
-            )
-        })?;
-        sync_parent_directory(parent)?;
+/// 非 Unix 在创建任何启动句柄前 fail-closed。
+#[cfg(not(unix))]
+pub fn open_startup_handles(_home: &Path, _session_cwd: &Path) -> Result<StartupHandles> {
+    ensure_platform_supported()?;
+    bail!("sidecar_hardening_unavailable")
+}
 
+#[cfg(unix)]
+impl StartupHandles {
+    /// 从已打开的 home fd 读取固定 runtime config，避免按外部路径重新解析父目录。
+    pub fn read_private_runtime_config(&self, path: &Path) -> Result<String> {
+        require_absolute_path(path, "--runtime-config")?;
+        let filename = path.file_name().context("--runtime-config 必须指向文件")?;
+        if filename != std::ffi::OsStr::new("runtime-config.v1.toml") {
+            bail!("--runtime-config 必须指向 runtime-config.v1.toml");
+        }
+        match read_private_runtime_config_at(&self.home_directory, filename) {
+            Ok(source) => Ok(source),
+            Err(error) => {
+                tracing::debug!(
+                    event = "runtime_config_read_failed",
+                    "从受保护 home fd 读取 runtime config 失败"
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// 只检查 home fd 下旧配置目录项是否存在，不读取旧配置内容。
+    pub fn legacy_config_present(&self) -> Result<bool> {
+        match path_entry_exists_at(
+            &self.home_directory,
+            std::ffi::OsStr::new("config.toml"),
+            "旧 config.toml",
+        ) {
+            Ok(present) => {
+                tracing::debug!(
+                    event = "legacy_config_checked",
+                    present,
+                    "旧配置目录项已检查"
+                );
+                Ok(present)
+            }
+            Err(error) => {
+                tracing::debug!(event = "legacy_config_check_failed", "旧配置目录项检查失败");
+                Err(error)
+            }
+        }
+    }
+
+    /// 在已打开的 home fd 下获取非阻塞独占锁，并由调用方保持返回句柄。
+    pub fn acquire_home_lock(&self) -> Result<File> {
+        let lock_file = match open_private_lock(&self.home_directory) {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::debug!(event = "home_lock_open_failed", "打开 home 锁文件失败");
+                return Err(error);
+            }
+        };
+        if let Err(error) = FileExt::try_lock_exclusive(&lock_file) {
+            tracing::debug!(event = "home_lock_acquire_failed", "取得 home 独占锁失败");
+            return Err(error).context("拒绝并发启动：私有 home 已被另一 sidecar 占用");
+        }
+        Ok(lock_file)
+    }
+
+    /// 用已打开的 session fd 切换 cwd，不重新解析 session 路径。
+    pub fn set_current_dir_secure(&self) -> Result<()> {
+        // SAFETY: session_cwd_directory 由 open_existing_directory 以目录 no-follow 方式取得。
+        let result = unsafe { libc::fchdir(self.session_cwd_directory.as_raw_fd()) };
+        if result != 0 {
+            tracing::debug!(
+                event = "session_cwd_fd_switch_failed",
+                "切换 session cwd 失败"
+            );
+            return Err(std::io::Error::last_os_error()).context("切换 --session-cwd 失败");
+        }
+        tracing::debug!(
+            event = "session_cwd_fd_switched",
+            "已使用 session cwd 目录句柄切换 cwd"
+        );
         Ok(())
     }
 }
 
-/// 将编译期嵌入的默认 AgentDefinition 物化到私有 home。
-///
-/// 文件被原子覆盖到 `GROK_HOME/agents/efflab-default.md`，并返回已 canonicalize
-/// 的绝对路径。该路径可同时供 `[agent].definition`、`agent_profile_path` 与
-/// `GROK_AGENT` 使用，避免任何用户级 agent discovery。
-pub fn materialize_agent_definition(grok_home: &Path) -> Result<PathBuf> {
-    prepare_private_home(grok_home)?;
-    let canonical_home = dunce::canonicalize(grok_home)
-        .with_context(|| format!("无法归一化私有 GROK_HOME: {}", grok_home.display()))?;
-    let agents_directory = canonical_home.join("agents");
-    create_private_directory(&agents_directory)?;
-
-    let agent_definition_path = agents_directory.join(DEFAULT_AGENT_FILENAME);
-    atomic_write_private(&agent_definition_path, DEFAULT_AGENT_DEFINITION.as_bytes())?;
-
-    Ok(agent_definition_path)
-}
-
-/// 清除可重开受限能力的变量，以及上游可能读取的 first-party 用户凭据。
-///
-/// 唯一允许的 L3b 绑定令牌 `EFFLAB_L3B_BIND` 不在清理集合中。必须在创建 Tokio
-/// runtime 和调用任何 shell API 前调用。`std::env` 在 Unix 上是进程全局状态；调用方
-/// 必须保证此时没有其他线程读取或修改环境变量。
-pub fn sanitize_env() -> Result<()> {
-    // 先快照所有 OTEL 前缀 key，随后再统一删除，避免在迭代环境时原地修改它。
-    let otel_keys: Vec<_> = env::vars_os()
-        .filter_map(|(key, _)| is_otel_environment_key(&key).then_some(key))
-        .collect();
-
-    // SAFETY: sidecar 的启动顺序要求本函数在 Tokio runtime 和任何 shell API 前调用，
-    // 此时尚未创建并发读取环境变量的线程；测试也以本模块互斥锁串行化这些修改。
-    unsafe {
-        for name in FIRST_PARTY_CREDENTIAL_ENV_VARS {
-            env::remove_var(name);
-        }
-        for name in SANITIZED_ENV_VARS {
-            env::remove_var(name);
-        }
-        for name in COMPAT_ENV_VARS {
-            env::remove_var(name);
-        }
-        for key in otel_keys {
-            env::remove_var(key);
-        }
-    }
-
-    Ok(())
-}
-
-/// 设置最终的私有 `GROK_HOME` 环境变量。
-///
-/// 必须在任何会触发 `xai_grok_config::grok_home()` 的 shell API 前调用，因为该 API
-/// 用进程级 `OnceLock` 缓存首次解析结果。
-pub fn set_grok_home(path: &Path) -> Result<()> {
-    set_absolute_path_environment("GROK_HOME", path)
-}
-
-/// 设置最终 AgentDefinition 的绝对路径到 `GROK_AGENT`。
-///
-/// 调用顺序应位于 [`sanitize_env`] 之后，并与 `[agent].definition` 指向同一物化文件。
-pub fn set_grok_agent(path: &Path) -> Result<()> {
-    set_absolute_path_environment("GROK_AGENT", path)
-}
-
-/// 要求由启动边界传入的敏感路径均为绝对路径。
-fn require_absolute_path(path: &Path, description: &str) -> Result<()> {
-    if !path.is_absolute() {
-        bail!("{description} 必须是绝对路径: {}", path.display());
-    }
-    if path
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        bail!("{description} 不允许包含 ..: {}", path.display());
-    }
-    Ok(())
-}
-
-/// 在 Unix 上递归创建并收紧一个私有目录，拒绝以符号链接作为最终目录。
-#[cfg(unix)]
-fn create_private_directory(path: &Path) -> Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
-    builder.mode(DIRECTORY_MODE);
-    builder
-        .create(path)
-        .with_context(|| format!("创建私有目录失败: {}", path.display()))?;
-
-    ensure_real_directory(path, "私有目录")?;
-    set_private_permissions(path, DIRECTORY_MODE, "私有目录")?;
-    Ok(())
-}
-
-/// 非 Unix 平台无法表达本 POC 的私有目录权限契约，因此拒绝继续。
 #[cfg(not(unix))]
-fn create_private_directory(path: &Path) -> Result<()> {
-    let _ = path;
-    bail!("私有目录权限硬化仅支持 Unix/macOS 文件权限模型");
+impl StartupHandles {
+    /// 非 Unix 不读取 runtime config。
+    pub fn read_private_runtime_config(&self, _path: &Path) -> Result<String> {
+        ensure_platform_supported()?;
+        bail!("sidecar_hardening_unavailable")
+    }
+
+    /// 非 Unix 不检查旧配置。
+    pub fn legacy_config_present(&self) -> Result<bool> {
+        ensure_platform_supported()?;
+        bail!("sidecar_hardening_unavailable")
+    }
+
+    /// 非 Unix 不获取 home 锁。
+    pub fn acquire_home_lock(&self) -> Result<File> {
+        ensure_platform_supported()?;
+        bail!("sidecar_hardening_unavailable")
+    }
+
+    /// 非 Unix 不切换 sidecar cwd。
+    pub fn set_current_dir_secure(&self) -> Result<()> {
+        ensure_platform_supported()
+    }
 }
 
-/// 拒绝私有 home 中可能以更高优先级覆盖安全配置的文件或符号链接。
-fn reject_private_policy_layers(grok_home: &Path) -> Result<()> {
-    for filename in FORBIDDEN_PRIVATE_POLICY_FILES {
-        let policy_path = grok_home.join(filename);
-        match fs::symlink_metadata(&policy_path) {
-            Ok(_) => {
-                bail!(
-                    "拒绝启动：私有 GROK_HOME 中存在未受控策略层: {}",
-                    policy_path.display()
-                );
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("检查私有策略层失败: {}", policy_path.display()));
-            }
-        }
+/// 校验 Host 注入的短生命周期绑定令牌，不在错误或日志中回显其值。
+pub fn validate_l3b_bind() -> Result<()> {
+    let Some(value) = env::var_os(L3B_BIND_ENV) else {
+        bail!("l3b_bind_invalid")
+    };
+    let Some(value) = value.to_str() else {
+        bail!("l3b_bind_invalid")
+    };
+    if value.is_empty() || value.chars().any(|character| character.is_control()) {
+        bail!("l3b_bind_invalid")
     }
     Ok(())
 }
 
-/// 确保一个目录真实存在且不是符号链接，避免私有写入被重定向。
-fn ensure_real_directory(path: &Path, description: &str) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("读取{description}元数据失败: {}", path.display()))?;
-    if metadata.file_type().is_symlink() {
-        bail!("{description} 不能是符号链接: {}", path.display());
-    }
-    if !metadata.is_dir() {
-        bail!("{description} 必须是目录: {}", path.display());
-    }
-    Ok(())
-}
-
-/// 若锁文件已存在且是符号链接，则 fail-closed，避免锁被重定向到外部位置。
-fn reject_symlink_if_present(path: &Path, description: &str) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            bail!("{description} 不能是符号链接: {}", path.display());
-        }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("检查{description}失败: {}", path.display()))
-        }
-    }
-}
-
-/// 以创建时和事后两次设置确保锁文件为 `0600`。
+/// 创建并校验仅属于 sidecar 的私有 home。
 #[cfg(unix)]
-fn open_private_file(path: &Path) -> Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
+pub fn prepare_private_home(home: &Path) -> Result<()> {
+    let _home_directory = open_private_home_directory(home)?;
+    Ok(())
+}
 
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .mode(FILE_MODE)
-        .open(path)
-        .with_context(|| format!("打开私有文件失败: {}", path.display()))?;
-    set_private_permissions(path, FILE_MODE, "私有文件")?;
+/// 非 Unix 不创建任何 sidecar 文件系统状态。
+#[cfg(not(unix))]
+pub fn prepare_private_home(_home: &Path) -> Result<()> {
+    ensure_platform_supported()
+}
+
+/// 获取私有 home 的非阻塞独占锁；返回的 File 必须保留到进程退出。
+#[cfg(unix)]
+pub fn acquire_home_lock(home: &Path) -> Result<File> {
+    let home_directory = open_private_home_directory(home)?;
+    let lock_file = open_private_lock(&home_directory)?;
+    FileExt::try_lock_exclusive(&lock_file)
+        .context("拒绝并发启动：私有 home 已被另一 sidecar 占用")?;
+    Ok(lock_file)
+}
+
+/// 非 Unix 不打开或创建锁文件。
+#[cfg(not(unix))]
+pub fn acquire_home_lock(_home: &Path) -> Result<File> {
+    ensure_platform_supported()?;
+    bail!("sidecar_hardening_unavailable")
+}
+
+/// 从同一次受保护的 Unix 文件句柄读取 runtime config，避免路径检查与读取之间的替换。
+#[cfg(unix)]
+pub fn read_private_runtime_config(path: &Path) -> Result<String> {
+    require_absolute_path(path, "--runtime-config")?;
+    let parent = path.parent().context("--runtime-config 缺少父目录")?;
+    let parent_directory = open_existing_directory(parent, "--runtime-config 父目录")?;
+    let filename = path.file_name().context("--runtime-config 必须指向文件")?;
+    read_private_runtime_config_at(&parent_directory, filename)
+}
+
+#[cfg(unix)]
+fn read_private_runtime_config_at(parent: &File, filename: &std::ffi::OsStr) -> Result<String> {
+    let file = open_file_at(parent, filename, "--runtime-config")?;
+    verify_private_file(&file, FILE_MODE, "--runtime-config")?;
+
+    // 先用 fd 元数据拒绝明显超限文件，再用有界读取覆盖并发增长场景。
+    let file_size = file
+        .metadata()
+        .context("读取 --runtime-config 大小失败")?
+        .len();
+    if file_size > MAX_RUNTIME_CONFIG_BYTES as u64 {
+        tracing::debug!(
+            event = "runtime_config_rejected",
+            reason = "size_limit",
+            "runtime config 超过大小上限"
+        );
+        bail!("runtime_config_invalid");
+    }
+
+    let mut bytes = Vec::with_capacity(file_size as usize);
+    (&file)
+        .take(MAX_RUNTIME_CONFIG_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .context("读取 RuntimeConfigV1 TOML 失败")?;
+    if bytes.len() > MAX_RUNTIME_CONFIG_BYTES {
+        tracing::debug!(
+            event = "runtime_config_rejected",
+            reason = "size_limit",
+            "runtime config 读取期间超过大小上限"
+        );
+        bail!("runtime_config_invalid");
+    }
+
+    let source = String::from_utf8(bytes).context("读取 RuntimeConfigV1 TOML 失败")?;
+    tracing::debug!(
+        event = "runtime_config_read",
+        "runtime config 已从受保护 fd 读取"
+    );
+    Ok(source)
+}
+
+/// 非 Unix 在 capability 关闭期间不读取 runtime config。
+#[cfg(not(unix))]
+pub fn read_private_runtime_config(_path: &Path) -> Result<String> {
+    ensure_platform_supported()?;
+    bail!("sidecar_hardening_unavailable")
+}
+
+/// 校验可递归创建的 home 已有路径组件；缺失的最终叶子留给安全创建阶段。
+#[cfg(all(unix, test))]
+pub(crate) fn validate_private_home_path(path: &Path) -> Result<()> {
+    require_absolute_path(path, "私有 home")?;
+    reject_shared_home_root(path)?;
+    let components = normal_components(path, "私有 home")?;
+    let mut current = open_root_directory().context("打开根目录失败")?;
+    for component in components {
+        match try_open_directory_at(&current, &component) {
+            Ok(next) => current = next,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                if component_is_symlink(&current, &component)? {
+                    bail!("私有 home 路径组件不能是符号链接");
+                }
+                return Err(secure_component_error(error, "私有 home"));
+            }
+        }
+    }
+    verify_private_directory(&current, "私有 home")
+}
+
+/// 使用 no-follow 目录句柄切换 cwd，避免先检查路径再按路径重新打开。
+#[cfg(unix)]
+pub fn set_current_dir_secure(path: &Path) -> Result<()> {
+    let directory = open_existing_private_directory(path, "--session-cwd")?;
+    // SAFETY: directory 是本函数通过 O_DIRECTORY|O_NOFOLLOW 打开的有效目录 fd。
+    let result = unsafe { libc::fchdir(directory.as_raw_fd()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("切换 --session-cwd 失败");
+    }
+    Ok(())
+}
+
+/// 非 Unix 不切换 sidecar cwd。
+#[cfg(not(unix))]
+pub fn set_current_dir_secure(_path: &Path) -> Result<()> {
+    ensure_platform_supported()
+}
+
+/// 只判断同一安全父目录下的最终目录项是否存在，不读取其内容。
+#[cfg(unix)]
+pub fn path_entry_exists(path: &Path) -> Result<bool> {
+    require_absolute_path(path, "路径")?;
+    let parent = path.parent().context("路径缺少父目录")?;
+    let parent_directory = open_existing_directory(parent, "路径父目录")?;
+    let filename = path.file_name().context("路径必须包含目录项")?;
+    path_entry_exists_at(&parent_directory, filename, "路径")
+}
+
+#[cfg(unix)]
+fn path_entry_exists_at(
+    parent_directory: &File,
+    filename: &std::ffi::OsStr,
+    description: &str,
+) -> Result<bool> {
+    let name = component_name(filename, description)?;
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: parent_directory 是有效 fd，metadata 指向可写未初始化存储，name 是 NUL 终止字符串。
+    let result = unsafe {
+        libc::fstatat(
+            parent_directory.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        Ok(false)
+    } else {
+        Err(error).context("检查路径目录项失败")
+    }
+}
+
+/// 非 Unix 不检查 sidecar 文件系统目录项。
+#[cfg(not(unix))]
+pub fn path_entry_exists(_path: &Path) -> Result<bool> {
+    ensure_platform_supported()?;
+    bail!("sidecar_hardening_unavailable")
+}
+
+/// 在同一父目录中原子替换私有文件，并在 Unix 上固定为 owner-only `0600`。
+///
+/// Task 12 当前只读 Host 的 runtime config；该通用 helper 为后续 session journal 保留
+/// 同目录临时文件、文件同步、rename 和父目录同步的安全写入语义。
+#[cfg(unix)]
+pub fn atomic_write_private(path: &Path, content: &[u8]) -> Result<()> {
+    require_absolute_path(path, "原子写目标")?;
+    let filename = path.file_name().context("原子写目标必须是文件路径")?;
+    let parent = path.parent().context("原子写目标缺少父目录")?;
+    let parent_directory = open_existing_directory(parent, "原子写目标父目录")?;
+    atomic_write_private_at(&parent_directory, filename, content, "原子写目标")
+}
+
+#[cfg(unix)]
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(unix)]
+struct PrivateTemporaryFile {
+    file: File,
+    parent_fd: libc::c_int,
+    name: CString,
+    committed: bool,
+}
+
+#[cfg(unix)]
+impl Drop for PrivateTemporaryFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            // SAFETY: parent_fd 与 name 来自同一次受保护的 openat；清理失败不应覆盖原始错误。
+            unsafe {
+                libc::unlinkat(self.parent_fd, self.name.as_ptr(), 0);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn atomic_write_private_at(
+    parent: &File,
+    filename: &std::ffi::OsStr,
+    content: &[u8],
+    description: &str,
+) -> Result<()> {
+    reject_final_symlink(parent, filename, description)?;
+    let mut temporary = create_private_temp_file(parent, description)?;
+    set_private_permissions(&temporary.file, FILE_MODE, "原子写临时文件")?;
+    verify_private_file(&temporary.file, FILE_MODE, "原子写临时文件")?;
+    temporary
+        .file
+        .write_all(content)
+        .context("写入原子写临时文件失败")?;
+    temporary
+        .file
+        .sync_all()
+        .context("同步原子写临时文件失败")?;
+
+    let target_name = component_name(filename, description)?;
+    // SAFETY: parent 与临时文件均由同一父目录 fd 管理；renameat 不按外部路径重解析。
+    let result = unsafe {
+        libc::renameat(
+            parent.as_raw_fd(),
+            temporary.name.as_ptr(),
+            parent.as_raw_fd(),
+            target_name.as_ptr(),
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("原子替换私有文件失败");
+    }
+    temporary.committed = true;
+    sync_parent_directory(parent)
+}
+
+#[cfg(unix)]
+fn create_private_temp_file(parent: &File, description: &str) -> Result<PrivateTemporaryFile> {
+    for _ in 0..128 {
+        let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let name = CString::new(format!(".efflab-sidecar-tmp-{counter}"))
+            .context("固定原子写临时文件名无效")?;
+        // SAFETY: parent 是有效目录 fd，name 是单一 NUL 终止目录项；O_EXCL 防止名称碰撞覆盖。
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                FILE_MODE as libc::mode_t as libc::c_uint,
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: fd 是刚由 openat 返回、尚未被其他 owner 管理的有效 fd。
+            return Ok(PrivateTemporaryFile {
+                file: unsafe { File::from_raw_fd(fd) },
+                parent_fd: parent.as_raw_fd(),
+                name,
+                committed: false,
+            });
+        }
+
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EEXIST) {
+            continue;
+        }
+        return Err(error).with_context(|| format!("无法创建 {description} 原子写临时文件"));
+    }
+
+    bail!("无法为 {description} 原子写临时文件分配唯一名称")
+}
+
+/// 非 Unix 不执行私有文件原子写。
+#[cfg(not(unix))]
+pub fn atomic_write_private(_path: &Path, _content: &[u8]) -> Result<()> {
+    ensure_platform_supported()
+}
+
+/// 清空进程环境，只恢复固定平台变量和短生命周期 L3b 绑定令牌。
+///
+/// 调用方必须在创建 Tokio runtime 或任何并发任务之前调用；Rust 2024 的环境变量
+/// 修改 API 因此集中在这个启动阶段的单线程边界内。
+pub fn sanitize_env() -> Result<()> {
+    let allowed: Vec<OsString> = runtime_environment_allowlist()
+        .iter()
+        .chain(std::iter::once(&L3B_BIND_ENV))
+        .map(OsString::from)
+        .collect();
+    let existing_keys: Vec<OsString> = env::vars_os().map(|(key, _)| key).collect();
+
+    // SAFETY: main 在创建 runtime 前调用本函数；该时序禁止其他 sidecar 线程访问环境。
+    unsafe {
+        for key in existing_keys {
+            if !allowed.iter().any(|allowed_key| allowed_key == &key) {
+                env::remove_var(key);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 进程启动所需的最小平台环境；代理、凭据、telemetry 和用户开关均不在此列。
+#[cfg(target_os = "macos")]
+pub(crate) fn runtime_environment_allowlist() -> &'static [&'static str] {
+    &["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"]
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn runtime_environment_allowlist() -> &'static [&'static str] {
+    &["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"]
+}
+
+#[cfg(windows)]
+pub(crate) fn runtime_environment_allowlist() -> &'static [&'static str] {
+    &[
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "TMP",
+        "TEMP",
+        "SystemRoot",
+        "WINDIR",
+        "ComSpec",
+        "PATHEXT",
+    ]
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn runtime_environment_allowlist() -> &'static [&'static str] {
+    &[]
+}
+
+/// 只允许绝对路径、有效 UTF-8、有限长度且拒绝词法 `..`。
+pub(crate) fn require_absolute_path(path: &Path, description: &str) -> Result<()> {
+    let value = path
+        .to_str()
+        .with_context(|| format!("{description} 必须是有效 UTF-8 路径"))?;
+    // 复用 contract 的纯字符串 shape 校验，确保 Host/sidecar 对 session_cwd 的边界一致。
+    efflab_agent_contract::validate_session_cwd(value)
+        .with_context(|| format!("{description} 路径格式无效"))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn reject_shared_home_root(path: &Path) -> Result<()> {
+    reject_shared_directory_root(path, "私有 home")
+}
+
+/// 拒绝已知共享系统根目录，避免仅凭路径存在就当作隔离目录。
+#[cfg(unix)]
+fn reject_shared_directory_root(path: &Path, description: &str) -> Result<()> {
+    if [
+        "/",
+        "/tmp",
+        "/var",
+        "/var/tmp",
+        "/private",
+        "/private/tmp",
+        "/private/var",
+        "/private/var/tmp",
+        "/shared",
+        "/Users",
+        "/Volumes",
+    ]
+    .into_iter()
+    .map(Path::new)
+    .any(|shared_root| path == shared_root)
+    {
+        bail!("{description} 必须是专用叶目录");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_private_home_directory(home: &Path) -> Result<File> {
+    require_absolute_path(home, "私有 home")?;
+    reject_shared_home_root(home)?;
+    let (directory, created) = open_directory_chain(home, true, "私有 home")?;
+    if created {
+        set_private_permissions(&directory, DIRECTORY_MODE, "新建私有 home")?;
+    }
+    verify_private_directory(&directory, "私有 home")?;
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn open_existing_private_home_directory(home: &Path) -> Result<File> {
+    require_absolute_path(home, "私有 home")?;
+    reject_shared_home_root(home)?;
+    let (directory, _) = open_directory_chain(home, false, "私有 home")?;
+    verify_private_directory(&directory, "私有 home")?;
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn open_existing_directory(path: &Path, description: &str) -> Result<File> {
+    require_absolute_path(path, description)?;
+    let (directory, _) = open_directory_chain(path, false, description)?;
+    verify_directory(&directory, description)?;
+    Ok(directory)
+}
+
+/// 打开并验证 session cwd 的最终目录必须属于当前用户且为 0700。
+#[cfg(unix)]
+fn open_existing_private_directory(path: &Path, description: &str) -> Result<File> {
+    require_absolute_path(path, description)?;
+    reject_shared_directory_root(path, description)?;
+    let (directory, _) = open_directory_chain(path, false, description)?;
+    verify_private_directory(&directory, description)?;
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn open_directory_chain(
+    path: &Path,
+    allow_create: bool,
+    description: &str,
+) -> Result<(File, bool)> {
+    let components = normal_components(path, description)?;
+    let mut current = open_root_directory().context("打开根目录失败")?;
+    let mut final_created = false;
+
+    for (index, component) in components.iter().enumerate() {
+        let is_final = index + 1 == components.len();
+        match try_open_directory_at(&current, component) {
+            Ok(next) => {
+                verify_directory(&next, description)?;
+                current = next;
+            }
+            Err(error) if allow_create && error.kind() == std::io::ErrorKind::NotFound => {
+                let name = component_name(component, description)?;
+                let mut created = false;
+                // SAFETY: current 是本函数通过 no-follow 方式取得的目录 fd，name 已校验无 NUL。
+                let result = unsafe {
+                    libc::mkdirat(
+                        current.as_raw_fd(),
+                        name.as_ptr(),
+                        DIRECTORY_MODE as libc::mode_t,
+                    )
+                };
+                if result == 0 {
+                    created = true;
+                } else {
+                    let mkdir_error = std::io::Error::last_os_error();
+                    if mkdir_error.raw_os_error() != Some(libc::EEXIST) {
+                        return Err(mkdir_error).context("创建私有 home 目录失败");
+                    }
+                }
+                let next = match try_open_directory_at(&current, component) {
+                    Ok(next) => next,
+                    Err(open_error) => {
+                        if component_is_symlink(&current, component)? {
+                            bail!("{description} 路径组件不能是符号链接");
+                        }
+                        return Err(secure_component_error(open_error, description));
+                    }
+                };
+                verify_directory(&next, description)?;
+                current = next;
+                if is_final {
+                    final_created = created;
+                }
+            }
+            Err(error) => {
+                if component_is_symlink(&current, component)? {
+                    bail!("{description} 路径组件不能是符号链接");
+                }
+                return Err(secure_component_error(error, description));
+            }
+        }
+    }
+
+    Ok((current, final_created))
+}
+
+#[cfg(unix)]
+fn normal_components(path: &Path, description: &str) -> Result<Vec<OsString>> {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::Normal(value) => components.push(value.to_os_string()),
+            std::path::Component::ParentDir => bail!("{description} 不允许包含 .."),
+            std::path::Component::Prefix(_) => bail!("{description} 路径前缀不受支持"),
+        }
+    }
+    Ok(components)
+}
+
+#[cfg(unix)]
+fn open_root_directory() -> std::io::Result<File> {
+    let name = CString::new("/")
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "固定根路径无效"))?;
+    // SAFETY: name 是 NUL 终止的固定路径，返回 fd 的所有权立即交给 File。
+    let fd = unsafe {
+        libc::open(
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        // SAFETY: fd 是刚由 libc::open 返回、尚未被其他 owner 管理的有效 fd。
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(unix)]
+fn try_open_directory_at(parent: &File, component: &OsString) -> std::io::Result<File> {
+    let name = CString::new(component.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL"))?;
+    // SAFETY: parent 是有效目录 fd，name 是 NUL 终止的单一目录项。
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        // SAFETY: fd 是刚由 openat 返回、尚未被其他 owner 管理的有效 fd。
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(unix)]
+fn component_name(component: &std::ffi::OsStr, description: &str) -> Result<CString> {
+    CString::new(component.as_bytes()).with_context(|| format!("{description} 路径组件不合法"))
+}
+
+#[cfg(unix)]
+fn component_is_symlink(parent: &File, component: &OsString) -> Result<bool> {
+    let name = component_name(component.as_os_str(), "路径")?;
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: parent 是有效目录 fd，metadata 指向可写存储，AT_SYMLINK_NOFOLLOW 不解析目录项。
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(false);
+        }
+        return Err(error).context("检查路径组件失败");
+    }
+    // SAFETY: fstatat 成功初始化 metadata。
+    let metadata = unsafe { metadata.assume_init() };
+    Ok((metadata.st_mode as libc::mode_t & libc::S_IFMT) == libc::S_IFLNK)
+}
+
+#[cfg(unix)]
+fn secure_component_error(error: std::io::Error, description: &str) -> anyhow::Error {
+    if matches!(error.raw_os_error(), Some(libc::ELOOP) | Some(libc::EMLINK)) {
+        anyhow::anyhow!("{description} 路径组件不能是符号链接")
+    } else {
+        anyhow::Error::new(error).context(format!("打开 {description} 路径组件失败"))
+    }
+}
+
+#[cfg(unix)]
+fn verify_directory(file: &File, description: &str) -> Result<()> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("读取 {description} 目录元数据失败"))?;
+    if !metadata.is_dir() {
+        bail!("{description} 必须是常规目录");
+    }
+    Ok(())
+}
+
+/// 仅验证 POSIX mode/owner；macOS/Linux 没有本边界可复用的统一扩展 ACL 检测，因此不宣称 ACL 已验证。
+#[cfg(unix)]
+fn verify_private_directory(file: &File, description: &str) -> Result<()> {
+    verify_directory(file, description)?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("读取 {description} 私有元数据失败"))?;
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        bail!("{description} 必须属于当前用户");
+    }
+    let mode = metadata.mode() & 0o7777;
+    if mode != DIRECTORY_MODE {
+        bail!("{description} 已存在时权限必须为 0700");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_file_at(parent: &File, filename: &std::ffi::OsStr, description: &str) -> Result<File> {
+    let name = component_name(filename, description)?;
+    // O_NONBLOCK 防止 FIFO 在完成 regular-file 检查前阻塞启动线程。
+    // SAFETY: parent 是有效目录 fd，name 是单一 NUL 终止目录项。
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(secure_component_error(
+            std::io::Error::last_os_error(),
+            description,
+        ));
+    }
+    // SAFETY: fd 是刚由 openat 返回、尚未被其他 owner 管理的有效 fd。
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn open_private_lock(home: &File) -> Result<File> {
+    let name = CString::new(HOME_LOCK_FILENAME).context("固定 home 锁文件名无效")?;
+    // 先使用 O_EXCL 创建新文件，避免把已有共享权限文件 chmod 成私有文件。
+    // SAFETY: home 是有效私有目录 fd，name 是固定 NUL 终止目录项。
+    let first_fd = unsafe {
+        libc::openat(
+            home.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            FILE_MODE as libc::mode_t as libc::c_uint,
+        )
+    };
+    let (file, created) = if first_fd >= 0 {
+        // SAFETY: first_fd 是刚由 openat 返回、尚未被其他 owner 管理的有效 fd。
+        (unsafe { File::from_raw_fd(first_fd) }, true)
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EEXIST) {
+            return Err(secure_component_error(error, "私有 home 锁文件"));
+        }
+        // SAFETY: home 是有效私有目录 fd，name 是固定 NUL 终止目录项。
+        let existing_fd = unsafe {
+            libc::openat(
+                home.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0,
+            )
+        };
+        if existing_fd < 0 {
+            return Err(secure_component_error(
+                std::io::Error::last_os_error(),
+                "私有 home 锁文件",
+            ));
+        }
+        // SAFETY: existing_fd 是刚由 openat 返回、尚未被其他 owner 管理的有效 fd。
+        (unsafe { File::from_raw_fd(existing_fd) }, false)
+    };
+
+    if created {
+        set_private_permissions(&file, FILE_MODE, "新建私有 home 锁文件")?;
+    }
+    verify_private_file(&file, FILE_MODE, "私有 home 锁文件")?;
     Ok(file)
 }
 
-/// 非 Unix 平台无法用 POSIX mode 表达本 POC 的权限契约，因此拒绝继续。
-#[cfg(not(unix))]
-fn open_private_file(path: &Path) -> Result<File> {
-    let _ = path;
-    bail!("私有文件权限硬化仅支持 Unix/macOS 文件权限模型");
-}
-
-/// 在 Unix 上把文件或目录权限收紧为指定 owner-only mode。
 #[cfg(unix)]
-fn set_private_permissions(path: &Path, mode: u32, description: &str) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).with_context(|| {
-        format!(
-            "设置{description}权限为 {mode:04o} 失败: {}",
-            path.display()
-        )
-    })
-}
-
-/// rename 成功后同步父目录，持久化文件名到目录项的映射。
-fn sync_parent_directory(parent: &Path) -> Result<()> {
-    let directory = File::open(parent)
-        .with_context(|| format!("打开原子写父目录失败: {}", parent.display()))?;
-    directory
-        .sync_all()
-        .with_context(|| format!("同步原子写父目录失败: {}", parent.display()))
-}
-
-/// 判断环境变量名是否匹配要求清除的 `OTEL_` ASCII 前缀。
-fn is_otel_environment_key(key: &std::ffi::OsStr) -> bool {
-    key.to_string_lossy().starts_with("OTEL_")
-}
-
-/// 设置仅接受绝对路径的环境变量，避免最终 shell 配置回退到相对路径。
-fn set_absolute_path_environment(variable: &str, path: &Path) -> Result<()> {
-    require_absolute_path(path, variable)?;
-
-    // SAFETY: 启动主流程在创建 Tokio runtime 前串行调用；该时序与 sanitize_env 的
-    // 约束相同，确保没有并发线程访问进程环境变量。
-    unsafe {
-        env::set_var(variable, path);
+fn verify_private_file(file: &File, required_mode: u32, description: &str) -> Result<()> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("读取 {description} 元数据失败"))?;
+    if !metadata.is_file() {
+        bail!("{description} 必须是常规文件");
     }
-
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        bail!("{description} 必须属于当前用户");
+    }
+    if metadata.nlink() != 1 {
+        bail!("{description} 不能是硬链接");
+    }
+    let mode = metadata.mode() & 0o7777;
+    if mode != required_mode {
+        bail!("{description} 权限必须为 {required_mode:04o}");
+    }
     Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_permissions(file: &File, mode: u32, description: &str) -> Result<()> {
+    // SAFETY: file 借用有效 fd；fchmod 只修改该 fd 指向的 inode 权限，不重新解析路径。
+    let result = unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("设置 {description} 权限失败"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn reject_final_symlink(
+    parent: &File,
+    filename: &std::ffi::OsStr,
+    description: &str,
+) -> Result<()> {
+    let name = component_name(filename, description)?;
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: parent 是有效 fd，metadata 指向可写存储，AT_SYMLINK_NOFOLLOW 不解析最终链接。
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(error).context("检查原子写目标失败");
+    }
+    // SAFETY: fstatat 成功初始化 metadata。
+    let metadata = unsafe { metadata.assume_init() };
+    if (metadata.st_mode as libc::mode_t & libc::S_IFMT) == libc::S_IFLNK {
+        bail!("{description} 不能是符号链接");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &File) -> Result<()> {
+    parent.sync_all().context("同步原子写父目录失败")
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
     use std::env;
     use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
-    use efflab_agent_contract::{
-        ApprovedMcpConfig, McpServerSpec, SidecarModelSpec, render_authoritative_config,
-    };
-
     use super::*;
 
-    /// 渲染器的固定 agent 名称属于共享 contract，而 sidecar 测试仅验证其输出。
-    const DEFAULT_AGENT_NAME: &str = "efflab-default";
-    /// compat 全量显式关闭的供应商集合。
-    const COMPAT_VENDORS: [&str; 3] = ["claude", "cursor", "codex"];
-    /// compat 全量显式关闭的 surface 集合。
-    const COMPAT_SURFACES: [&str; 6] = ["skills", "rules", "agents", "mcps", "hooks", "sessions"];
+    static ENVIRONMENT_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static CURRENT_DIRECTORY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    /// 构造 Host 写盘测试所需的唯一 BYOK 模型，避免测试引入用户凭据。
-    fn byok_model() -> SidecarModelSpec {
-        SidecarModelSpec {
-            model: "efflab-test-model".to_string(),
-            base_url: "http://127.0.0.1:43123/v1".to_string(),
-            name: "BYOK".to_string(),
-            api_backend: "chat_completions".to_string(),
-            env_key: "EFFLAB_L3B_BIND".to_string(),
+    struct CurrentDirectoryRestore(PathBuf);
+
+    impl Drop for CurrentDirectoryRestore {
+        fn drop(&mut self) {
+            let _ = env::set_current_dir(&self.0);
         }
     }
 
-    /// 本 crate 的环境变量测试共享同一把锁，避免相互污染进程全局状态。
-    static ENVIRONMENT_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    /// 上游认证路径实际读取的 first-party 用户凭据环境变量。
-    ///
-    /// 此清单刻意不引用生产常量，使测试能在启动硬化遗漏任一凭据时失败；更新
-    /// 上游认证来源时也必须同步审计本清单。
-    const EXPECTED_FIRST_PARTY_CREDENTIAL_ENV_VARS: [&str; 9] = [
-        "XAI_API_KEY",
-        "GROK_CODE_XAI_API_KEY",
-        "GROK_AUTH",
-        "GROK_AUTH_PATH",
-        "GROK_DEPLOYMENT_KEY",
-        "GROK_EXTRA_AUTH_KEY",
-        "GROK_TRACE_UPLOAD_CREDENTIALS_FILE",
-        "OTEL_EXPORTER_OTLP_HEADERS",
-        "GROK_INTERNAL_OTLP_HEADERS",
-    ];
-
-    /// 在测试结束或断言 panic 时恢复所有被测试修改过的环境变量。
     struct EnvironmentRestore {
         previous: Vec<(OsString, Option<OsString>)>,
     }
 
     impl EnvironmentRestore {
-        /// 快照候选环境变量的当前值，重复 key 只记录一次。
-        fn capture(keys: &[OsString]) -> Self {
+        fn capture(keys: impl IntoIterator<Item = OsString>) -> Self {
             let mut previous = Vec::new();
             for key in keys {
-                if previous.iter().any(|(existing, _)| existing == key) {
+                if previous.iter().any(|(existing, _)| existing == &key) {
                     continue;
                 }
-                previous.push((key.clone(), env::var_os(key)));
+                previous.push((key.clone(), env::var_os(&key)));
             }
             Self { previous }
         }
     }
 
     impl Drop for EnvironmentRestore {
-        /// 无论测试是否 panic 都恢复进程环境，避免影响同一测试二进制的后续测试。
         fn drop(&mut self) {
-            // SAFETY: 本模块的环境变量测试由 ENVIRONMENT_TEST_LOCK 串行化，且这些
-            // key 只被本测试构造和恢复，不会与本 crate 的其他测试并发访问。
+            // SAFETY: 测试持有 ENVIRONMENT_TEST_LOCK，恢复阶段没有并发环境访问者。
             unsafe {
                 for (key, value) in &self.previous {
                     match value {
@@ -461,930 +1016,372 @@ mod tests {
         }
     }
 
-    /// 为环境卫生测试列出所有应清除的 key，外加一个动态 `OTEL_` 恶意变量。
-    fn sanitized_environment_keys() -> Vec<OsString> {
-        let mut keys: Vec<_> = SANITIZED_ENV_VARS.iter().map(OsString::from).collect();
-        keys.extend(COMPAT_ENV_VARS.iter().map(OsString::from));
-        keys.extend(
-            EXPECTED_FIRST_PARTY_CREDENTIAL_ENV_VARS
-                .iter()
-                .map(OsString::from),
-        );
-        keys.extend(
-            env::vars_os().filter_map(|(key, _)| is_otel_environment_key(&key).then_some(key)),
-        );
-        keys.push(OsString::from("OTEL_EFFLAB_MALICIOUS_ENDPOINT"));
-        keys
-    }
-
-    /// 相对私有 home 不能绕过启动边界的绝对路径约束。
     #[test]
-    fn prepare_private_home_rejects_relative_path() {
-        let error = prepare_private_home(Path::new("relative-grok-home"))
-            .expect_err("相对私有 home 必须被拒绝");
-
-        assert!(
-            error.to_string().contains("私有 GROK_HOME 必须是绝对路径"),
-            "错误必须说明绝对路径约束: {error:#}"
-        );
-    }
-
-    /// 含 `..` 的私有 home 会造成词法路径和真实路径不一致，必须 fail-closed。
-    #[test]
-    fn prepare_private_home_rejects_parent_directory_component() {
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-        let grok_home = temporary
-            .path()
-            .join("parent")
-            .join("..")
-            .join("private-grok-home");
-
-        let error =
-            prepare_private_home(&grok_home).expect_err("包含 .. 组件的私有 home 必须被拒绝");
-
-        assert!(
-            error.to_string().contains("私有 GROK_HOME 不允许包含 .."),
-            "错误必须说明拒绝 .. 组件: {error:#}"
-        );
-    }
-
-    /// 已存在的未受控策略文件可能覆盖权威配置，必须拒绝启动。
-    #[test]
-    fn prepare_private_home_rejects_existing_forbidden_policy_files() {
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-
-        for filename in FORBIDDEN_PRIVATE_POLICY_FILES {
-            let grok_home = temporary.path().join(filename).join("private-grok-home");
-            fs::create_dir_all(&grok_home).expect("创建私有 home 应成功");
-            let policy_path = grok_home.join(filename);
-            fs::write(&policy_path, "unsafe = true\n").expect("写入未受控策略文件应成功");
-
-            let error =
-                prepare_private_home(&grok_home).expect_err("存在未受控策略文件时必须拒绝启动");
-            assert!(
-                error.to_string().contains("存在未受控策略层"),
-                "错误必须说明策略层拒绝: {error:#}"
-            );
-            assert!(
-                error.to_string().contains(filename),
-                "错误必须包含被拒绝策略文件名 {filename}: {error:#}"
-            );
-        }
-    }
-
-    /// 符号链接形式的未受控策略文件同样必须拒绝，不能仅检查普通文件。
-    #[cfg(unix)]
-    #[test]
-    fn prepare_private_home_rejects_symlinked_forbidden_policy_files() {
-        use std::os::unix::fs::symlink;
-
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-        let outside_policy = temporary.path().join("outside-policy.toml");
-        fs::write(&outside_policy, "unsafe = true\n").expect("写入外部策略文件应成功");
-
-        for filename in FORBIDDEN_PRIVATE_POLICY_FILES {
-            let grok_home = temporary.path().join(format!("symlink-{filename}"));
-            fs::create_dir_all(&grok_home).expect("创建私有 home 应成功");
-            let policy_path = grok_home.join(filename);
-            symlink(&outside_policy, &policy_path).expect("创建策略符号链接应成功");
-
-            let error = prepare_private_home(&grok_home).expect_err("符号链接策略文件必须被拒绝");
-            assert!(
-                error.to_string().contains("存在未受控策略层"),
-                "错误必须说明策略层拒绝: {error:#}"
-            );
-            assert!(
-                error.to_string().contains(filename),
-                "错误必须包含符号链接策略文件名 {filename}: {error:#}"
-            );
-        }
-    }
-
-    /// 已存在的宽权限目录必须在准备后收紧为 owner-only `0700`。
-    #[cfg(unix)]
-    #[test]
-    fn prepare_private_home_tightens_existing_directory_to_owner_only_mode() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-        let grok_home = temporary.path().join("wide-private-grok-home");
-        fs::create_dir(&grok_home).expect("创建私有 home 应成功");
-        fs::set_permissions(&grok_home, fs::Permissions::from_mode(0o777))
-            .expect("放宽私有 home 权限应成功");
-
-        prepare_private_home(&grok_home).expect("准备私有 home 应成功");
-
-        assert_eq!(
-            permissions_mode(&grok_home),
-            DIRECTORY_MODE,
-            "准备后的私有 home 必须为 0700"
-        );
-    }
-
-    /// 锁文件在首次创建后必须收紧为 owner-only `0600`。
-    #[cfg(unix)]
-    #[test]
-    fn acquire_home_lock_creates_owner_only_lock_file() {
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-        let grok_home = temporary.path().join("private-grok-home");
-
-        let _lock = acquire_home_lock(&grok_home).expect("获取私有 home 锁应成功");
-        let lock_path = grok_home.join(HOME_LOCK_FILENAME);
-
-        assert!(lock_path.is_file(), "锁文件必须被创建");
-        assert_eq!(permissions_mode(&lock_path), FILE_MODE, "锁文件必须为 0600");
-    }
-
-    /// 锁文件符号链接会重定向锁目标，必须 fail-closed。
-    #[cfg(unix)]
-    #[test]
-    fn acquire_home_lock_rejects_symlinked_lock_file() {
-        use std::os::unix::fs::symlink;
-
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-        let grok_home = temporary.path().join("private-grok-home");
-        let outside_lock = temporary.path().join("outside.lock");
-        fs::create_dir_all(&grok_home).expect("创建私有 home 应成功");
-        fs::write(&outside_lock, "outside").expect("写入外部锁文件应成功");
-        symlink(&outside_lock, grok_home.join(HOME_LOCK_FILENAME))
-            .expect("创建锁文件符号链接应成功");
-
-        let error = acquire_home_lock(&grok_home).expect_err("锁文件符号链接必须被拒绝");
-
-        assert!(
-            error
-                .to_string()
-                .contains("私有 home 锁文件 不能是符号链接"),
-            "错误必须说明锁文件符号链接被拒绝: {error:#}"
-        );
-    }
-
-    /// fs2 的非阻塞独占锁必须阻止同一进程再次锁定同一 home。
-    #[cfg(unix)]
-    #[test]
-    fn acquire_home_lock_rejects_second_lock_in_same_process() {
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-        let grok_home = temporary.path().join("private-grok-home");
-
-        let _first_lock = acquire_home_lock(&grok_home).expect("首次获取私有 home 锁应成功");
-        let error = acquire_home_lock(&grok_home).expect_err("同一 home 的第二把锁必须失败");
-
-        assert!(
-            error.to_string().contains("拒绝并发启动"),
-            "错误必须说明并发启动被拒绝: {error:#}"
-        );
-    }
-
-    /// 在替换已有文件后仍须只保留新内容并收紧为 `0600`。
-    #[cfg(unix)]
-    #[test]
-    fn atomic_write_private_replaces_content_with_owner_only_mode() {
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-        let target = temporary.path().join("authoritative.toml");
-        fs::write(&target, b"old = true\n").expect("写入旧配置应成功");
-
-        atomic_write_private(&target, b"new = false\n").expect("原子写应成功");
-
-        assert_eq!(
-            fs::read(&target).expect("读取目标文件应成功"),
-            b"new = false\n"
-        );
-        assert_eq!(permissions_mode(&target), FILE_MODE, "目标文件必须为 0600");
-    }
-
-    /// 原子写目标不能是相对路径，避免写入位置受当前工作目录影响。
-    #[test]
-    fn atomic_write_private_rejects_relative_target_path() {
-        let error = atomic_write_private(Path::new("relative-config.toml"), b"safe = true\n")
-            .expect_err("相对原子写目标必须被拒绝");
-
-        assert!(
-            error.to_string().contains("原子写目标 必须是绝对路径"),
-            "错误必须说明绝对路径约束: {error:#}"
-        );
-    }
-
-    /// 原子写不可隐式创建父目录，避免改变调用方指定的隔离边界。
-    #[test]
-    fn atomic_write_private_rejects_missing_parent_directory() {
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-        let target = temporary.path().join("missing-parent").join("config.toml");
-
-        let error = atomic_write_private(&target, b"safe = true\n")
-            .expect_err("不存在的原子写父目录必须被拒绝");
-
-        assert!(
-            error.to_string().contains("读取原子写目标父目录元数据失败"),
-            "错误必须说明父目录不存在: {error:#}"
-        );
-        assert!(
-            error.chain().any(|cause| cause
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io| { io.kind() == std::io::ErrorKind::NotFound })),
-            "错误链必须保留 NotFound 分类: {error:#}"
-        );
-    }
-
-    /// 原子写父目录若为符号链接，不能跟随到外部目录。
-    #[cfg(unix)]
-    #[test]
-    fn atomic_write_private_rejects_symlinked_parent_directory() {
-        use std::os::unix::fs::symlink;
-
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-        let outside_directory = temporary.path().join("outside-directory");
-        let symlinked_parent = temporary.path().join("symlinked-parent");
-        fs::create_dir(&outside_directory).expect("创建外部目录应成功");
-        symlink(&outside_directory, &symlinked_parent).expect("创建父目录符号链接应成功");
-        let target = symlinked_parent.join("config.toml");
-
-        let error = atomic_write_private(&target, b"safe = true\n")
-            .expect_err("符号链接原子写父目录必须被拒绝");
-
-        assert!(
-            error
-                .to_string()
-                .contains("原子写目标父目录 不能是符号链接"),
-            "错误必须说明父目录符号链接被拒绝: {error:#}"
-        );
-        assert!(
-            !outside_directory.join("config.toml").exists(),
-            "拒绝后不得在符号链接指向的外部目录创建文件"
-        );
-    }
-
-    /// 已存在的符号链接目标不能被原子替换，避免其语义被误解为跟随外部目标写入。
-    #[cfg(unix)]
-    #[test]
-    fn atomic_write_private_rejects_symlinked_target_file() {
-        use std::os::unix::fs::symlink;
-
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-        let outside_target = temporary.path().join("outside-config.toml");
-        let target = temporary.path().join("config.toml");
-        fs::write(&outside_target, b"outside = true\n").expect("写入外部配置应成功");
-        symlink(&outside_target, &target).expect("创建目标文件符号链接应成功");
-
-        let error = atomic_write_private(&target, b"safe = true\n")
-            .expect_err("符号链接原子写目标必须被拒绝");
-
-        assert!(
-            error.to_string().contains("原子写目标 不能是符号链接"),
-            "错误必须说明目标符号链接被拒绝: {error:#}"
-        );
-        assert_eq!(
-            fs::read(&outside_target).expect("读取外部配置应成功"),
-            b"outside = true\n",
-            "拒绝后不得改写外部目标"
-        );
-    }
-
-    /// 无法原子替换时，旧内容必须保留；macOS 上对目标父目录只读稳定返回 EACCES。
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn atomic_write_private_preserves_old_content_when_parent_is_read_only() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-        let parent = temporary.path().join("read-only-private-directory");
-        let target = parent.join("config.toml");
-        fs::create_dir(&parent).expect("创建私有目录应成功");
-        fs::write(&target, b"old = true\n").expect("写入旧配置应成功");
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o500))
-            .expect("收紧父目录为只读应成功");
-
-        let result = atomic_write_private(&target, b"new = false\n");
-
-        // 无论原子写结果如何，先恢复目录权限以允许 TempDir 在测试结束后清理。
-        fs::set_permissions(&parent, fs::Permissions::from_mode(DIRECTORY_MODE))
-            .expect("恢复父目录权限应成功");
-        let error = result.expect_err("只读父目录必须使原子写失败");
-        assert!(
-            error.chain().any(|cause| cause
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)),
-            "错误链必须保留 PermissionDenied 分类: {error:#}"
-        );
-        assert_eq!(
-            fs::read(&target).expect("读取旧配置应成功"),
-            b"old = true\n",
-            "原子写失败后旧内容必须保持不变"
-        );
-    }
-
-    /// 原子写成功后，临时文件必须被 rename 消耗而非遗留在私有目录。
-    #[test]
-    fn atomic_write_private_leaves_no_temporary_file_after_success() {
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-        let target = temporary.path().join("config.toml");
-
-        atomic_write_private(&target, b"safe = true\n").expect("原子写应成功");
-
-        let entries: Vec<_> = fs::read_dir(temporary.path())
-            .expect("读取私有目录应成功")
-            .map(|entry| entry.expect("读取目录项应成功").file_name())
-            .collect();
-        assert_eq!(entries, vec![OsString::from("config.toml")]);
-        assert!(
-            entries
-                .iter()
-                .all(|name| !name.to_string_lossy().contains(".tmp")),
-            "成功后目录不得遗留 .tmp 类临时文件: {entries:?}"
-        );
-    }
-
-    /// 物化内容必须与编译期嵌入的密封默认 AgentDefinition 完全一致。
-    #[test]
-    fn materialize_agent_definition_writes_exact_embedded_asset() {
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-        let grok_home = temporary.path().join("private-grok-home");
-
-        let definition =
-            materialize_agent_definition(&grok_home).expect("物化默认 AgentDefinition 应成功");
-
-        assert_eq!(
-            fs::read_to_string(&definition).expect("读取物化 AgentDefinition 应成功"),
-            include_str!("../assets/efflab-default-agent.md"),
-            "物化内容必须精确等于嵌入 asset"
-        );
-    }
-
-    /// 物化 AgentDefinition 的目录和文件都必须采用 owner-only 权限。
-    #[cfg(unix)]
-    #[test]
-    fn materialize_agent_definition_sets_owner_only_directory_and_file_modes() {
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-        let grok_home = temporary.path().join("private-grok-home");
-
-        let definition =
-            materialize_agent_definition(&grok_home).expect("物化默认 AgentDefinition 应成功");
-
-        assert_eq!(
-            permissions_mode(definition.parent().expect("AgentDefinition 必须有父目录")),
-            DIRECTORY_MODE,
-            "agents 目录必须为 0700"
-        );
-        assert_eq!(
-            permissions_mode(&definition),
-            FILE_MODE,
-            "物化 AgentDefinition 必须为 0600"
-        );
-    }
-
-    /// 再次物化必须覆盖恶意旧内容，而不是读取或合并该内容。
-    #[test]
-    fn materialize_agent_definition_overwrites_malicious_existing_content() {
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-        let grok_home = temporary.path().join("private-grok-home");
-        let agents_directory = grok_home.join("agents");
-        fs::create_dir_all(&agents_directory).expect("创建 agents 目录应成功");
-        let definition = agents_directory.join(DEFAULT_AGENT_FILENAME);
-        fs::write(&definition, "# malicious agent definition\n")
-            .expect("写入恶意 AgentDefinition 应成功");
-
-        let materialized =
-            materialize_agent_definition(&grok_home).expect("重复物化默认 AgentDefinition 应成功");
-
-        assert_eq!(materialized, definition);
-        assert_eq!(
-            fs::read_to_string(&materialized).expect("读取覆盖后的 AgentDefinition 应成功"),
-            include_str!("../assets/efflab-default-agent.md"),
-            "重复物化必须恢复密封 asset 内容"
-        );
-    }
-
-    /// 权威配置必须显式包含所有防护字段和批准后的两种 MCP transport。
-    #[test]
-    fn render_authoritative_config_contains_all_required_fields() {
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-        let grok_home = temporary.path().join("private-grok-home");
-        let agent_definition =
-            materialize_agent_definition(&grok_home).expect("物化默认 AgentDefinition 应成功");
-        let approved_mcp = ApprovedMcpConfig {
-            servers: BTreeMap::from([
-                (
-                    "local-stdio".to_string(),
-                    McpServerSpec::Stdio {
-                        command: PathBuf::from("/bin/echo"),
-                        args: vec!["--safe".to_string()],
-                    },
-                ),
-                (
-                    "local-http".to_string(),
-                    McpServerSpec::Http {
-                        url: "http://127.0.0.1:43123/mcp".to_string(),
-                    },
-                ),
-            ]),
-        };
-
-        let rendered = render_authoritative_config(
-            &grok_home,
-            &agent_definition,
-            Some(&approved_mcp),
-            &[byok_model()],
-        )
-        .expect("渲染权威配置应成功");
-        let parsed: toml::Value = toml::from_str(&rendered).expect("渲染结果必须是合法 TOML");
-
-        assert_eq!(
-            value_at(&parsed, &["features", "remote_fetch"]),
-            Some(&toml::Value::Boolean(false))
-        );
-        for vendor in COMPAT_VENDORS {
-            for surface in COMPAT_SURFACES {
-                assert_eq!(
-                    value_at(&parsed, &["compat", vendor, surface]),
-                    Some(&toml::Value::Boolean(false)),
-                    "compat.{vendor}.{surface} 必须显式关闭"
-                );
-            }
-        }
-        assert_eq!(
-            value_at(&parsed, &["subagents", "enabled"]),
-            Some(&toml::Value::Boolean(false))
-        );
-        assert_eq!(
-            value_at(&parsed, &["managed_mcps", "enabled"]),
-            Some(&toml::Value::Boolean(false))
-        );
-        assert_eq!(
-            value_at(&parsed, &["managed_mcps", "gateway_tools_enabled"]),
-            Some(&toml::Value::Boolean(false))
-        );
-        assert_eq!(
-            value_at(&parsed, &["memory", "enabled"]),
-            Some(&toml::Value::Boolean(false))
-        );
-        assert_eq!(
-            value_at(&parsed, &["skills", "paths"]),
-            Some(&toml::Value::Array(Vec::new()))
-        );
-        assert_eq!(
-            value_at(&parsed, &["agent", "name"]),
-            Some(&toml::Value::String(DEFAULT_AGENT_NAME.to_string()))
-        );
-        assert_eq!(
-            value_at(&parsed, &["agent", "definition"]).and_then(toml::Value::as_str),
-            agent_definition.to_str()
-        );
-        assert_eq!(
-            value_at(&parsed, &["mcp_servers", "local-stdio", "command"])
-                .and_then(toml::Value::as_str),
-            Some("/bin/echo")
-        );
-        let stdio_args = value_at(&parsed, &["mcp_servers", "local-stdio", "args"])
-            .and_then(toml::Value::as_array)
-            .expect("stdio MCP 必须保留 args 数组");
-        assert_eq!(stdio_args.len(), 1, "stdio MCP args 数量必须精确保留");
-        assert_eq!(
-            stdio_args[0].as_str(),
-            Some("--safe"),
-            "stdio MCP args 值必须精确保留"
-        );
-        assert_eq!(
-            value_at(&parsed, &["mcp_servers", "local-http", "url"]).and_then(toml::Value::as_str),
-            Some("http://127.0.0.1:43123/mcp")
-        );
-        assert_eq!(
-            value_at(&parsed, &["models", "default"]).and_then(toml::Value::as_str),
-            Some("byok")
-        );
-        assert_eq!(
-            value_at(&parsed, &["model", "byok", "api_backend"]).and_then(toml::Value::as_str),
-            Some("chat_completions")
-        );
-        assert_eq!(
-            value_at(&parsed, &["model", "byok", "env_key"]).and_then(toml::Value::as_str),
-            Some("EFFLAB_L3B_BIND")
-        );
-        assert_eq!(
-            value_at(&parsed, &["storage", "cleanup_ttl_days"]).and_then(toml::Value::as_integer),
-            Some(36500)
-        );
-        assert_eq!(
-            value_at(&parsed, &["session", "load_envrc"]).and_then(toml::Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            value_at(&parsed, &["marketplace", "default_skills_installs_purged"],)
-                .and_then(toml::Value::as_bool),
-            Some(true),
-            "必须预置上游迁移标记，避免运行时改写 Host 配置"
-        );
-
-        let actual_top_level_keys: BTreeSet<_> = parsed
-            .as_table()
-            .expect("权威配置根节点必须是 TOML table")
-            .keys()
-            .cloned()
-            .collect();
-        let expected_top_level_keys = BTreeSet::from([
-            "features".to_string(),
-            "compat".to_string(),
-            "subagents".to_string(),
-            "managed_mcps".to_string(),
-            "memory".to_string(),
-            "skills".to_string(),
-            "agent".to_string(),
-            "mcp_servers".to_string(),
-            "models".to_string(),
-            "model".to_string(),
-            "storage".to_string(),
-            "session".to_string(),
-            "marketplace".to_string(),
-        ]);
-        assert_eq!(
-            actual_top_level_keys, expected_top_level_keys,
-            "权威配置只能包含固定的顶层键，不能继承额外配置"
-        );
-    }
-
-    /// `$` 必须在渲染文本中双写，且上游配置展开后仍恢复为原始字面值。
-    #[test]
-    fn render_authoritative_config_escapes_dollar_signs_without_changing_runtime_values() {
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-        let grok_home = temporary.path().join("private-grok-home");
-        let agent_definition =
-            materialize_agent_definition(&grok_home).expect("物化默认 AgentDefinition 应成功");
-        let approved_mcp = ApprovedMcpConfig {
-            servers: BTreeMap::from([
-                (
-                    "stdio-dollar".to_string(),
-                    McpServerSpec::Stdio {
-                        command: PathBuf::from("/tmp/$HOME/mcp"),
-                        args: vec!["$HOME".to_string(), "a$b".to_string()],
-                    },
-                ),
-                (
-                    "http-dollar".to_string(),
-                    McpServerSpec::Http {
-                        url: "http://127.0.0.1:43123/$HOME?a=a$b".to_string(),
-                    },
-                ),
-            ]),
-        };
-
-        let rendered =
-            render_authoritative_config(&grok_home, &agent_definition, Some(&approved_mcp), &[])
-                .expect("渲染含 $ 的权威配置应成功");
-        assert!(
-            rendered.contains("/tmp/$$HOME/mcp"),
-            "command 中的 $ 必须双写: {rendered}"
-        );
-        assert!(
-            rendered.contains("\"$$HOME\"") && rendered.contains("\"a$$b\""),
-            "args 中的 $ 必须双写: {rendered}"
-        );
-        assert!(
-            rendered.contains("http://127.0.0.1:43123/$$HOME?a=a$$b"),
-            "url 中的 $ 必须双写: {rendered}"
-        );
-
-        let mut parsed: toml::Value = toml::from_str(&rendered).expect("渲染结果必须是合法 TOML");
-        assert_eq!(
-            value_at(&parsed, &["mcp_servers", "stdio-dollar", "command"])
-                .and_then(toml::Value::as_str),
-            Some("/tmp/$$HOME/mcp"),
-            "TOML 解析必须保留防二次展开的双写 $"
-        );
-        let parsed_args = value_at(&parsed, &["mcp_servers", "stdio-dollar", "args"])
-            .and_then(toml::Value::as_array)
-            .expect("stdio MCP 必须包含 args 数组");
-        assert_eq!(
-            parsed_args
-                .iter()
-                .map(|value| value.as_str())
-                .collect::<Vec<_>>(),
-            vec![Some("$$HOME"), Some("a$$b")],
-            "TOML 解析必须保留 args 的双写 $"
-        );
-        assert_eq!(
-            value_at(&parsed, &["mcp_servers", "http-dollar", "url"]).and_then(toml::Value::as_str),
-            Some("http://127.0.0.1:43123/$$HOME?a=a$$b"),
-            "TOML 解析必须保留 url 的双写 $"
-        );
-
-        // 复用上游的公开展开函数验证 `$$` 在运行时只还原为字面 `$`，而不读取环境变量。
-        xai_grok_shell::config::expand_env_vars_in_toml(&mut parsed);
-        assert_eq!(
-            value_at(&parsed, &["mcp_servers", "stdio-dollar", "command"])
-                .and_then(toml::Value::as_str),
-            Some("/tmp/$HOME/mcp"),
-            "运行时展开后 command 必须恢复原始字面值"
-        );
-        let expanded_args = value_at(&parsed, &["mcp_servers", "stdio-dollar", "args"])
-            .and_then(toml::Value::as_array)
-            .expect("展开后 stdio MCP 必须包含 args 数组");
-        assert_eq!(
-            expanded_args
-                .iter()
-                .map(|value| value.as_str())
-                .collect::<Vec<_>>(),
-            vec![Some("$HOME"), Some("a$b")],
-            "运行时展开后 args 必须恢复原始字面值"
-        );
-        assert_eq!(
-            value_at(&parsed, &["mcp_servers", "http-dollar", "url"]).and_then(toml::Value::as_str),
-            Some("http://127.0.0.1:43123/$HOME?a=a$b"),
-            "运行时展开后 url 必须恢复原始字面值"
-        );
-    }
-
-    /// 命令、参数和 URL 中的引号与换行必须由 TOML string literal 正确转义。
-    #[test]
-    fn render_authoritative_config_escapes_quotes_and_newlines_in_mcp_values() {
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-        let grok_home = temporary.path().join("private-grok-home");
-        let agent_definition =
-            materialize_agent_definition(&grok_home).expect("物化默认 AgentDefinition 应成功");
-        let approved_mcp = ApprovedMcpConfig {
-            servers: BTreeMap::from([
-                (
-                    "stdio-escaped".to_string(),
-                    McpServerSpec::Stdio {
-                        command: PathBuf::from("/tmp/mcp-\"quoted\""),
-                        args: vec!["line one\nline two".to_string(), "a\"b".to_string()],
-                    },
-                ),
-                (
-                    "http-escaped".to_string(),
-                    McpServerSpec::Http {
-                        url: "http://127.0.0.1:43123/mcp?quote=\"x\"\nnext".to_string(),
-                    },
-                ),
-            ]),
-        };
-
-        let rendered =
-            render_authoritative_config(&grok_home, &agent_definition, Some(&approved_mcp), &[])
-                .expect("渲染含引号和换行的权威配置应成功");
-        let parsed: toml::Value = toml::from_str(&rendered).expect("转义后的配置必须是合法 TOML");
-        assert_eq!(
-            value_at(&parsed, &["mcp_servers", "stdio-escaped", "command"])
-                .and_then(toml::Value::as_str),
-            Some("/tmp/mcp-\"quoted\""),
-            "command 必须按字面值保留引号"
-        );
-        let args = value_at(&parsed, &["mcp_servers", "stdio-escaped", "args"])
-            .and_then(toml::Value::as_array)
-            .expect("stdio MCP 必须包含 args 数组");
-        assert_eq!(
-            args.iter().map(|value| value.as_str()).collect::<Vec<_>>(),
-            vec![Some("line one\nline two"), Some("a\"b")],
-            "args 必须按字面值保留换行和引号"
-        );
-        assert_eq!(
-            value_at(&parsed, &["mcp_servers", "http-escaped", "url"])
-                .and_then(toml::Value::as_str),
-            Some("http://127.0.0.1:43123/mcp?quote=\"x\"\nnext"),
-            "url 必须按字面值保留换行和引号"
-        );
-    }
-
-    /// MCP 名称中的引号、点号与数字开头必须使用 TOML literal key 正确解析。
-    #[test]
-    fn render_authoritative_config_preserves_special_mcp_names() {
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-        let grok_home = temporary.path().join("private-grok-home");
-        let agent_definition =
-            materialize_agent_definition(&grok_home).expect("物化默认 AgentDefinition 应成功");
-        let special_name = "1.leading.\"quoted\"".to_string();
-        let approved_mcp = ApprovedMcpConfig {
-            servers: BTreeMap::from([(
-                special_name.clone(),
-                McpServerSpec::Http {
-                    url: "http://127.0.0.1:43123/mcp".to_string(),
-                },
-            )]),
-        };
-
-        let rendered =
-            render_authoritative_config(&grok_home, &agent_definition, Some(&approved_mcp), &[])
-                .expect("渲染含特殊 MCP 名称的配置应成功");
-        let parsed: toml::Value =
-            toml::from_str(&rendered).expect("特殊 MCP 名称必须生成合法 TOML");
-
-        assert_eq!(
-            value_at(&parsed, &["mcp_servers"])
-                .and_then(toml::Value::as_table)
-                .and_then(|servers| servers.get(&special_name))
-                .and_then(toml::Value::as_table)
-                .and_then(|server| server.get("url"))
-                .and_then(toml::Value::as_str),
-            Some("http://127.0.0.1:43123/mcp"),
-            "特殊 MCP 名称必须作为单个正确键保留"
-        );
-    }
-
-    /// 手工绕过输入边界构造的空 MCP 名称必须在渲染层再次被拒绝。
-    #[test]
-    fn render_authoritative_config_rejects_empty_mcp_name() {
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-        let grok_home = temporary.path().join("private-grok-home");
-        let agent_definition =
-            materialize_agent_definition(&grok_home).expect("物化默认 AgentDefinition 应成功");
-        let approved_mcp = ApprovedMcpConfig {
-            servers: BTreeMap::from([(
-                "   ".to_string(),
-                McpServerSpec::Http {
-                    url: "http://127.0.0.1:43123/mcp".to_string(),
-                },
-            )]),
-        };
-
-        let error =
-            render_authoritative_config(&grok_home, &agent_definition, Some(&approved_mcp), &[])
-                .expect_err("空 MCP 名称必须被拒绝");
-
-        assert!(
-            error.to_string().contains("受控 MCP server 名称不能为空"),
-            "错误必须说明 MCP 名称为空: {error:#}"
-        );
-    }
-
-    /// 手工构造相对 stdio command 不能绕过渲染层的绝对路径校验。
-    #[test]
-    fn render_authoritative_config_rejects_relative_stdio_command() {
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-        let grok_home = temporary.path().join("private-grok-home");
-        let agent_definition =
-            materialize_agent_definition(&grok_home).expect("物化默认 AgentDefinition 应成功");
-        let approved_mcp = ApprovedMcpConfig {
-            servers: BTreeMap::from([(
-                "stdio".to_string(),
-                McpServerSpec::Stdio {
-                    command: PathBuf::from("relative-mcp"),
-                    args: Vec::new(),
-                },
-            )]),
-        };
-
-        let error =
-            render_authoritative_config(&grok_home, &agent_definition, Some(&approved_mcp), &[])
-                .expect_err("相对 stdio command 必须被拒绝");
-
-        assert!(
-            error
-                .to_string()
-                .contains("受控 stdio MCP server 'stdio' 的 command 必须为绝对路径"),
-            "错误必须说明 stdio command 的绝对路径约束: {error:#}"
-        );
-    }
-
-    /// 手工构造空 HTTP url 不能绕过渲染层校验。
-    #[test]
-    fn render_authoritative_config_rejects_empty_http_url() {
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-        let grok_home = temporary.path().join("private-grok-home");
-        let agent_definition =
-            materialize_agent_definition(&grok_home).expect("物化默认 AgentDefinition 应成功");
-        let approved_mcp = ApprovedMcpConfig {
-            servers: BTreeMap::from([(
-                "http".to_string(),
-                McpServerSpec::Http {
-                    url: " \t\n ".to_string(),
-                },
-            )]),
-        };
-
-        let error =
-            render_authoritative_config(&grok_home, &agent_definition, Some(&approved_mcp), &[])
-                .expect_err("空 HTTP url 必须被拒绝");
-
-        assert!(
-            error
-                .to_string()
-                .contains("受控 HTTP MCP server 'http' 的 url 不能为空"),
-            "错误必须说明 HTTP url 为空: {error:#}"
-        );
-    }
-
-    /// 非 UTF-8 的 AgentDefinition 路径无法安全写入 TOML，必须 fail-closed。
-    #[cfg(unix)]
-    #[test]
-    fn render_authoritative_config_rejects_non_utf8_agent_definition_path() {
-        use std::os::unix::ffi::{OsStrExt, OsStringExt};
-
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-        let grok_home = temporary.path().join("private-grok-home");
-        let non_utf8_agent_definition =
-            PathBuf::from(OsString::from_vec(b"/tmp/agent-\xFF.md".to_vec()));
-
-        let error = render_authoritative_config(&grok_home, &non_utf8_agent_definition, None, &[])
-            .expect_err("非 UTF-8 AgentDefinition 路径必须被拒绝");
-
-        assert!(
-            error
-                .to_string()
-                .contains("物化 AgentDefinition 不是可写入 TOML 的 UTF-8 路径"),
-            "错误必须说明非 UTF-8 路径被拒绝: {error:#}"
-        );
-        assert_eq!(
-            non_utf8_agent_definition.as_os_str().as_bytes(),
-            b"/tmp/agent-\xFF.md",
-            "测试必须实际构造非 UTF-8 路径"
-        );
-    }
-
-    /// 相对 GROK_HOME 与 GROK_AGENT 都不能写入进程环境，绝对路径必须精确保留。
-    #[test]
-    fn set_grok_environment_variables_require_absolute_paths_and_preserve_absolute_values() {
-        let _test_lock = ENVIRONMENT_TEST_LOCK
+    fn sanitize_env_keeps_only_platform_runtime_allowlist_and_l3b_bind() {
+        let _lock = ENVIRONMENT_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let keys = [OsString::from("GROK_HOME"), OsString::from("GROK_AGENT")];
-        let _restore = EnvironmentRestore::capture(&keys);
-        let temporary = tempfile::tempdir().expect("创建临时目录应成功");
-        let absolute_home = temporary.path().join("private-grok-home");
-        let absolute_agent = absolute_home.join("agents").join(DEFAULT_AGENT_FILENAME);
-
-        for (variable, setter, relative_path) in [
-            (
+        let mut keys: Vec<OsString> = env::vars_os().map(|(key, _)| key).collect();
+        keys.extend(
+            [
+                "EFFLAB_L3B_BIND",
+                "XAI_API_KEY",
                 "GROK_HOME",
-                set_grok_home as fn(&Path) -> Result<()>,
-                Path::new("relative-home"),
-            ),
-            (
-                "GROK_AGENT",
-                set_grok_agent as fn(&Path) -> Result<()>,
-                Path::new("relative-agent.md"),
-            ),
-        ] {
-            let error = setter(relative_path).expect_err("相对环境路径必须被拒绝");
-            assert!(
-                error.to_string().contains("必须是绝对路径"),
-                "{variable} 的错误必须说明绝对路径约束: {error:#}"
-            );
-        }
-
-        set_grok_home(&absolute_home).expect("设置绝对 GROK_HOME 应成功");
-        set_grok_agent(&absolute_agent).expect("设置绝对 GROK_AGENT 应成功");
-        assert_eq!(
-            env::var("GROK_HOME").expect("GROK_HOME 必须已设置"),
-            absolute_home.to_str().expect("临时路径必须是 UTF-8"),
-            "GROK_HOME 必须精确保留绝对路径"
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "NO_PROXY",
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                "DYLD_LIBRARY_PATH",
+                "DYLD_FALLBACK_LIBRARY_PATH",
+                "DYLD_FRAMEWORK_PATH",
+                "DYLD_INSERT_LIBRARIES",
+                "LD_LIBRARY_PATH",
+                "LD_PRELOAD",
+                "RUST_LOG",
+                "EFFLAB_UNREGISTERED_ENV",
+            ]
+            .into_iter()
+            .map(OsString::from),
         );
-        assert_eq!(
-            env::var("GROK_AGENT").expect("GROK_AGENT 必须已设置"),
-            absolute_agent.to_str().expect("临时路径必须是 UTF-8"),
-            "GROK_AGENT 必须精确保留绝对路径"
-        );
-    }
+        let _restore = EnvironmentRestore::capture(keys);
 
-    /// first-party 用户凭据、精确名单和动态 `OTEL_` 前缀变量均不得在清理后残留。
-    #[test]
-    fn sanitize_env_removes_credentials_and_preserves_l3b_bind() {
-        let _test_lock = ENVIRONMENT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut malicious_keys = sanitized_environment_keys();
-        let preserved_key = OsString::from("EFFLAB_L3B_BIND");
-        malicious_keys.push(preserved_key.clone());
-        let _restore = EnvironmentRestore::capture(&malicious_keys);
-
-        // SAFETY: ENVIRONMENT_TEST_LOCK 串行化本模块的环境测试，所有写入都由
-        // EnvironmentRestore 在作用域结束时恢复。
+        // SAFETY: 测试持有环境锁，且 guard 会恢复所有被测试修改的变量。
         unsafe {
-            for key in malicious_keys.iter().filter(|key| *key != &preserved_key) {
-                env::set_var(key, "malicious");
-            }
-            env::set_var(&preserved_key, "preserved");
+            env::set_var("EFFLAB_L3B_BIND", "bind-sentinel");
+            env::set_var("XAI_API_KEY", "user-key-sentinel");
+            env::set_var("GROK_HOME", "/user/home");
+            env::set_var("HTTP_PROXY", "http://proxy.invalid");
+            env::set_var("HTTPS_PROXY", "https://proxy.invalid");
+            env::set_var("ALL_PROXY", "socks5://proxy.invalid");
+            env::set_var("NO_PROXY", "localhost");
+            env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel.invalid");
+            env::set_var("DYLD_LIBRARY_PATH", "dyld-library-sentinel");
+            env::set_var("DYLD_FALLBACK_LIBRARY_PATH", "dyld-fallback-sentinel");
+            env::set_var("DYLD_FRAMEWORK_PATH", "dyld-framework-sentinel");
+            env::set_var("DYLD_INSERT_LIBRARIES", "dyld-insert-sentinel");
+            env::set_var("LD_LIBRARY_PATH", "ld-library-sentinel");
+            env::set_var("LD_PRELOAD", "ld-preload-sentinel");
+            env::set_var("RUST_LOG", "trace");
+            env::set_var("EFFLAB_UNREGISTERED_ENV", "must-drop");
         }
 
-        sanitize_env().expect("环境卫生应成功");
+        sanitize_env().expect("环境 allowlist 清理应成功");
 
-        for key in malicious_keys.iter().filter(|key| *key != &preserved_key) {
-            assert!(
-                env::var_os(key).is_none(),
-                "恶意环境变量必须被清除: {}",
-                key.to_string_lossy()
-            );
-        }
-        assert_eq!(
-            env::var_os(&preserved_key),
-            Some(OsString::from("preserved"))
+        let allowed: BTreeSet<OsString> = runtime_environment_allowlist()
+            .iter()
+            .chain(std::iter::once(&L3B_BIND_ENV))
+            .map(OsString::from)
+            .collect();
+        let unexpected: Vec<_> = env::vars_os()
+            .map(|(key, _)| key)
+            .filter(|key| !allowed.contains(key))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "环境清理只能保留固定平台变量与 L3b token，多出: {unexpected:?}"
         );
+        assert_eq!(
+            env::var_os(L3B_BIND_ENV),
+            Some(OsString::from("bind-sentinel"))
+        );
+        for key in [
+            "XAI_API_KEY",
+            "GROK_HOME",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "DYLD_LIBRARY_PATH",
+            "DYLD_FALLBACK_LIBRARY_PATH",
+            "DYLD_FRAMEWORK_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "LD_LIBRARY_PATH",
+            "LD_PRELOAD",
+            "RUST_LOG",
+            "EFFLAB_UNREGISTERED_ENV",
+        ] {
+            assert!(env::var_os(key).is_none(), "变量 {key} 不得保留");
+        }
     }
 
-    /// 读取 Unix 权限的低九位，屏蔽文件类型等无关元数据。
+    #[test]
+    fn relative_home_is_rejected_without_creation() {
+        let result = prepare_private_home(Path::new("relative-home"));
+        assert!(result.is_err());
+    }
+
     #[cfg(unix)]
-    fn permissions_mode(path: &Path) -> u32 {
+    #[test]
+    fn shared_system_roots_are_rejected_as_home() {
+        for path in [Path::new("/"), Path::new("/tmp"), Path::new("/shared")] {
+            assert!(
+                validate_private_home_path(path).is_err(),
+                "共享系统根目录必须在创建或配置读取前拒绝: {path:?}"
+            );
+            assert!(prepare_private_home(path).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_home_and_lock_keep_private_modes() {
         use std::os::unix::fs::PermissionsExt;
 
-        fs::metadata(path)
-            .expect("读取权限元数据应成功")
+        let temporary = tempfile::tempdir().expect("创建临时目录");
+        let home = temporary.path().join("home");
+        fs::create_dir(&home).expect("创建 home");
+        fs::set_permissions(&home, fs::Permissions::from_mode(DIRECTORY_MODE))
+            .expect("设置 home 私有权限");
+
+        let _lock = acquire_home_lock(&home).expect("获取 home 锁");
+        let home_mode = fs::metadata(&home).expect("读取 home").permissions().mode() & 0o777;
+        let lock_mode = fs::metadata(home.join(HOME_LOCK_FILENAME))
+            .expect("读取 lock")
             .permissions()
             .mode()
-            & 0o777
+            & 0o777;
+        assert_eq!(home_mode, DIRECTORY_MODE);
+        assert_eq!(lock_mode, FILE_MODE);
     }
 
-    /// 从 TOML 根节点按路径获取值，便于断言嵌套权威配置。
-    fn value_at<'a>(value: &'a toml::Value, path: &[&str]) -> Option<&'a toml::Value> {
-        let mut current = value;
-        for key in path {
-            current = current.get(*key)?;
-        }
-        Some(current)
+    #[cfg(unix)]
+    #[test]
+    fn existing_home_with_shared_permissions_is_rejected_without_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().expect("创建临时目录");
+        let home = temporary.path().join("shared-home");
+        fs::create_dir(&home).expect("创建 shared home");
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o755))
+            .expect("设置 shared home 权限");
+
+        let error = prepare_private_home(&home).expect_err("共享 home 必须拒绝");
+
+        assert!(format!("{error:#}").contains("0700"));
+        assert_eq!(
+            fs::metadata(&home)
+                .expect("读取 shared home")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "拒绝共享 home 时不得 chmod"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_validation_rejects_existing_shared_home_before_config_access() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().expect("创建临时目录");
+        let home = temporary.path().join("shared-home");
+        fs::create_dir(&home).expect("创建 shared home");
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o755))
+            .expect("设置 shared home 权限");
+
+        let error = validate_private_home_path(&home).expect_err("共享 home 路径必须预先拒绝");
+
+        assert!(format!("{error:#}").contains("0700"));
+        assert_eq!(
+            fs::metadata(&home)
+                .expect("读取 shared home")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "路径预校验拒绝时不得 chmod"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_lock_with_shared_permissions_is_rejected_without_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().expect("创建临时目录");
+        let home = temporary.path().join("home");
+        fs::create_dir(&home).expect("创建 home");
+        fs::set_permissions(&home, fs::Permissions::from_mode(DIRECTORY_MODE))
+            .expect("设置 home 权限");
+        let lock_path = home.join(HOME_LOCK_FILENAME);
+        fs::write(&lock_path, b"").expect("创建 lock");
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o644)).expect("设置 lock 权限");
+
+        let error = acquire_home_lock(&home).expect_err("共享 lock 必须拒绝");
+
+        assert!(format!("{error:#}").contains("0600"));
+        assert_eq!(
+            fs::metadata(lock_path)
+                .expect("读取 lock")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644,
+            "拒绝共享 lock 时不得 chmod"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_path_validation_rejects_oversized_and_non_utf8_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let oversized = Path::new("/").join("x".repeat(4096));
+        assert!(
+            format!(
+                "{:#}",
+                require_absolute_path(&oversized, "path").unwrap_err()
+            )
+            .contains("4096")
+        );
+
+        let raw_path = OsString::from_vec(vec![b'/', 0xff]);
+        let non_utf8 = Path::new(raw_path.as_os_str());
+        let error = require_absolute_path(non_utf8, "path").expect_err("非 UTF-8 路径必须拒绝");
+        assert!(format!("{error:#}").contains("UTF-8"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_private_replaces_content_with_0600_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().expect("创建临时目录");
+        let target = temporary.path().join("session-record");
+        atomic_write_private(&target, b"safe = true\n").expect("原子写私有文件");
+
+        assert_eq!(fs::read(&target).expect("读取原子写文件"), b"safe = true\n");
+        assert_eq!(
+            fs::metadata(&target)
+                .expect("读取原子写文件权限")
+                .permissions()
+                .mode()
+                & 0o777,
+            FILE_MODE
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_private_uses_open_parent_after_path_replacement() {
+        use std::ffi::OsStr;
+
+        let temporary = tempfile::tempdir().expect("创建临时目录");
+        let parent = temporary.path().join("parent");
+        let moved_parent = temporary.path().join("moved-parent");
+        fs::create_dir(&parent).expect("创建原子写父目录");
+        let parent_directory =
+            open_existing_directory(&parent, "原子写父目录").expect("打开原子写父目录句柄");
+
+        fs::rename(&parent, &moved_parent).expect("移动原子写父目录");
+        fs::create_dir(&parent).expect("创建替换后的同名父目录");
+
+        atomic_write_private_at(
+            &parent_directory,
+            OsStr::new("session-record"),
+            b"safe = true\n",
+            "原子写目标",
+        )
+        .expect("原子写必须使用已打开的父目录句柄");
+
+        assert_eq!(
+            fs::read(moved_parent.join("session-record")).expect("读取原父目录中的原子写文件"),
+            b"safe = true\n"
+        );
+        assert!(
+            !parent.join("session-record").exists(),
+            "父目录路径被替换后不得写入新的同名目录"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_handles_keep_home_config_and_session_fds_after_path_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _cwd_lock = CURRENT_DIRECTORY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temporary = tempfile::tempdir().expect("创建连续 fd fixture");
+        let home = temporary.path().join("home");
+        let session = temporary.path().join("session");
+        let runtime_config = home.join("runtime-config.v1.toml");
+        let moved_home = temporary.path().join("moved-home");
+        let moved_session = temporary.path().join("moved-session");
+        fs::create_dir(&home).expect("创建 home");
+        fs::create_dir(&session).expect("创建 session");
+        fs::set_permissions(&home, fs::Permissions::from_mode(DIRECTORY_MODE))
+            .expect("设置 home 权限");
+        fs::set_permissions(&session, fs::Permissions::from_mode(DIRECTORY_MODE))
+            .expect("设置 session 权限");
+        fs::write(&runtime_config, b"session_cwd = \"original\"\n").expect("创建 runtime config");
+        fs::set_permissions(&runtime_config, fs::Permissions::from_mode(FILE_MODE))
+            .expect("设置 runtime config 权限");
+
+        let handles = open_startup_handles(&home, &session).expect("打开连续启动 fd");
+
+        fs::rename(&home, &moved_home).expect("移动原 home");
+        fs::create_dir(&home).expect("创建替换 home");
+        fs::set_permissions(&home, fs::Permissions::from_mode(DIRECTORY_MODE))
+            .expect("设置替换 home 权限");
+        fs::rename(&session, &moved_session).expect("移动原 session");
+        fs::create_dir(&session).expect("创建替换 session");
+        fs::set_permissions(&session, fs::Permissions::from_mode(DIRECTORY_MODE))
+            .expect("设置替换 session 权限");
+
+        let source = handles
+            .read_private_runtime_config(&runtime_config)
+            .expect("runtime config 应从原 home fd 读取");
+        assert_eq!(source, "session_cwd = \"original\"\n");
+
+        let _lock = handles
+            .acquire_home_lock()
+            .expect("home lock 应从原 home fd 获取");
+        assert!(
+            moved_home.join(HOME_LOCK_FILENAME).exists(),
+            "lock 必须创建在已打开的原 home 中"
+        );
+        assert!(
+            !home.join(HOME_LOCK_FILENAME).exists(),
+            "路径替换后的同名 home 不得收到 lock"
+        );
+
+        let original_cwd = env::current_dir().expect("读取测试 cwd");
+        let _restore_cwd = CurrentDirectoryRestore(original_cwd);
+        handles
+            .set_current_dir_secure()
+            .expect("session cwd 应从原 session fd 切换");
+        assert_eq!(env::current_dir().expect("读取切换后的 cwd"), moved_session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn second_lock_is_rejected_without_blocking() {
+        let temporary = tempfile::tempdir().expect("创建临时目录");
+        let home = temporary.path().join("home");
+        let _first = acquire_home_lock(&home).expect("获取第一把锁");
+        let error = acquire_home_lock(&home).expect_err("第二把锁必须被拒绝");
+        assert!(format!("{error:#}").contains("拒绝并发启动"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_home_lock_is_rejected() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temporary = tempfile::tempdir().expect("创建临时目录");
+        let home = temporary.path().join("home");
+        let outside = temporary.path().join("outside.lock");
+        fs::create_dir(&home).expect("创建 home");
+        fs::set_permissions(&home, fs::Permissions::from_mode(DIRECTORY_MODE))
+            .expect("设置 home 权限");
+        fs::write(&outside, b"outside").expect("创建外部锁文件");
+        symlink(&outside, home.join(HOME_LOCK_FILENAME)).expect("创建锁符号链接");
+
+        let error = acquire_home_lock(&home).expect_err("符号链接锁必须拒绝");
+        assert!(format!("{error:#}").contains("符号链接"));
     }
 }

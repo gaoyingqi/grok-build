@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use url::Url;
 
-use crate::app_port::{HostApp, LlmChannelConfig, LlmSecretSlot, SealedSecret, SecretGuard};
+use crate::app_port::{
+    ApprovedMcpSpecV1, HostApp, LlmChannelConfig, LlmSecretSlot, ScopeId, SealedSecret, SecretGuard,
+};
 use crate::config::{HostRuntimeConfig, L3bRuntimeConfig};
 use crate::llm_loopback::{L3bLoopback, embedded_ipv4_address};
 use crate::protocol::{KitError, LlmChannelKind, LlmChannelView};
@@ -291,6 +293,16 @@ impl LlmChannelManager {
             | LlmChannelConfig::Unconfigured
             | LlmChannelConfig::Relay { .. } => Err(LlmChannelError::Unconfigured),
         }
+    }
+
+    /// 从产品端口取得指定 scope 的已批准 MCP 规格；失败时不以空规格替代。
+    pub(crate) fn approved_mcp_for_scope(
+        &self,
+        scope: &str,
+    ) -> Result<ApprovedMcpSpecV1, LlmChannelError> {
+        self.app
+            .mcp_for_scope(&ScopeId(scope.to_owned()))
+            .map_err(|_| LlmChannelError::LifecycleFailed)
     }
 
     /// 认证成功后按绑定 revision 解封当前用户 Key；旧 token 必须在此之前已被拒绝。
@@ -835,23 +847,26 @@ impl LlmChannelService {
         &self,
         scope: impl AsRef<str>,
     ) -> Result<SidecarProcessInfo, LlmChannelError> {
+        let scope = scope.as_ref();
+        let approved_mcp = self.manager.approved_mcp_for_scope(scope)?;
         let _lifecycle = self
             .lifecycle_lock
             .lock()
             .map_err(|_| LlmChannelError::StateUnavailable)?;
         let loopback = self.ensure_loopback()?;
         self.supervisor
-            .launch_sidecar(scope.as_ref(), &loopback, &self.manager)
+            .launch_sidecar(scope, &loopback, &self.manager, &approved_mcp)
             .map_err(map_supervisor_error_to_lifecycle)
     }
 
     /// 启动 scope 并将 ACP stdio 交给唯一的 HostRuntime IO actor。
     ///
-    /// 这是 Task 7b 的内部接线入口；它严格复用 Task 7 的监听、token 注册、TOML
-    /// 写盘和 spawn 顺序，不允许 runtime 复制或绕开这些安全边界。
+    /// 这是 Task 7b 的内部接线入口；调用方必须传入同一次 scope 审核得到的 MCP 规格，
+    /// 该入口严格复用监听、token 注册、v1 TOML 写盘和 spawn 顺序。
     pub(crate) fn launch_scope_with_stdio(
         &self,
         scope: impl AsRef<str>,
+        approved_mcp: &ApprovedMcpSpecV1,
     ) -> Result<LaunchedScope, LlmChannelError> {
         let scope = scope.as_ref();
         let _lifecycle = self
@@ -865,7 +880,7 @@ impl LlmChannelService {
             .map_err(map_supervisor_error_to_lifecycle)?;
         let info = self
             .supervisor
-            .launch_sidecar(scope, &loopback, &self.manager)
+            .launch_sidecar(scope, &loopback, &self.manager, approved_mcp)
             .map_err(map_supervisor_error_to_lifecycle)?;
         let stdio = match self.supervisor.take_stdio(scope, info.generation) {
             Ok(stdio) => stdio,
@@ -962,7 +977,11 @@ impl LlmChannelService {
         let loopback = self.ensure_loopback()?;
         loopback.registry().invalidate_all();
         self.supervisor
-            .restart_live_scopes(&loopback, &self.manager)
+            .restart_live_scopes(&loopback, &self.manager, |scope| {
+                self.manager
+                    .approved_mcp_for_scope(scope)
+                    .map_err(|_| SupervisorError::McpSpecUnavailable)
+            })
             .map_err(|error| {
                 tracing::error!(error = %error, "sidecar 批量重启失败");
                 LlmChannelError::RestartFailed

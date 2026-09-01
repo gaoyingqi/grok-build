@@ -1,0 +1,4 @@
+{"timestamp":1,"method":"session/update","params":{"sessionId":"legacy-1","_meta":{"promptId":"prompt-corrupt"},"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"corrupt-line-secret"}}}}
+this is not valid json {corrupt-line-secret
+{"timestamp":3,"method":"session/update","params":{"sessionId":"legacy-1","_meta":{"promptId":"prompt-corrupt"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"corrupt assistant"}}}}
+{"timestamp":4,"method":"_x.ai/session/update","params":{"sessionId":"legacy-1","update":{"sessionUpdate":"turn_completed","prompt_id":"prompt-corrupt","stop_reason":"completed"}}}

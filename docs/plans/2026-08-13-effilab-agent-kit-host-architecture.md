@@ -1,15 +1,17 @@
-# Efflab Agent Kit 与 Host Runtime 通用架构
+# Efflab Agent Kit 与 Host Runtime 历史架构记录
 
 - **日期**：2026-08-13
-- **状态**：Draft — 2026-08-13 gpt-sol 终审后修订；不自我声明 production Go
-- **仓库角色**：本文是 **Kit / Host 的规范导读**。crate 落地后，**线协议机器真源**是 `crates/efflab/efflab-agent-host/src/protocol.rs`（导出 JSON Schema / golden fixture）。散文与 `protocol.rs` 冲突时以 `protocol.rs` + 测试为准，并回写本文。
-- **配套**
-  - sidecar ACP 契约：`docs/host-acp-contract.md`（方法面与本文一起冻）
-  - 实现计划：`docs/plans/2026-08-13-effilab-agent-kit-implementation-plan.md`
-  - sidecar POC：`docs/plans/2026-08-11-efflab-agent-sidecar-poc.md`
-  - UI 源：`/Volumes/work/documents/effilab-agent-web`
-  - LLM 中转：`/Volumes/work/documents/effilab_agent_server`
-  - 第一个产品 adapter：`ai_music_organizer_br`（PureLab）
+- **状态**：历史记录 / 不可执行（2026-09-01）；不自我声明 production Go
+- **当前入口（优先）**：Host ↔ sidecar 合同见 [`../host-acp-contract.md`](../host-acp-contract.md)，最小 runtime 设计真源见 [2026-08-28 minimal-runtime design](../../../ai_music_organizer_br/docs/superpowers/specs/2026-08-28-efflab-sidecar-minimal-runtime-design.md)。
+- **历史记录提示**：本文保留旧版 Kit / Host 架构、决策、目标、命令、步骤和验证记录；全文不可作为规范、当前待办或实施步骤，不得直接照抄。与当前入口或 on-disk 源码冲突时，以当前入口和源码为准。
+- **历史期间的协议约定**：本文曾把 `crates/efflab/efflab-agent-host/src/protocol.rs` 作为线协议机器真源；该表述只记录当时约定，不把本文重新提升为当前规范导读。
+- **配套历史记录**
+  - sidecar ACP 契约：`docs/host-acp-contract.md`（当前入口，不是本文的旧配套副本）
+  - 实现计划：`docs/plans/2026-08-13-effilab-agent-kit-implementation-plan.md`（历史记录，不可执行）
+  - sidecar POC：`docs/plans/2026-08-11-efflab-agent-sidecar-poc.md`（历史记录，不可执行）
+  - UI 源：`../../../effilab-agent-web`
+  - LLM 中转：`../../../effilab_agent_server`
+  - 第一个产品 adapter：[`ai_music_organizer_br` PureLab 设计](../../../ai_music_organizer_br/docs/plans/2026-08-13-effilab-agent-web-purelab-pilot-design.md)
 - **用户已定**
   - 前端继续在 agent-web 上开发，不对齐 grok TUI
   - Host Runtime **写在本仓库** `crates/efflab/`，不进各个 App
@@ -38,7 +40,7 @@
 ```
 effilab-agent                          # 本仓库：运行时真源
 ├── crates/efflab/efflab-agent-contract  # 新增：无 grok-shell 的校验 / DTO / 渲染
-├── crates/efflab/efflab-agent-sidecar   # 已有：隔离 ACP 进程（依赖 contract + grok-shell）
+├── crates/efflab/efflab-agent-sidecar   # 隔离 ACP 进程（最小 runtime；仅依赖 contract 与已验证的运行时组件）
 ├── crates/efflab/efflab-agent-host      # 新增：通用 Host Runtime（只依赖 contract）
 └── docs/
 
@@ -52,11 +54,11 @@ effilab_agent_server                   # Relay：OpenAI Chat Completions + 订�
 | crate | 依赖 | 禁止 |
 |---|---|---|
 | `efflab-agent-contract` | serde / json / toml / anyhow 等小依赖 | `xai-grok-*`、`agent-client-protocol` 运行时、tokio 进程 |
-| `efflab-agent-sidecar` | contract + `xai-grok-shell` 闭包（**仅此二进制**） | 被 host 或产品 `use` / 链进 App |
+| `efflab-agent-sidecar` | contract + 最小 ACP/HTTP/session runtime 依赖（**仅此二进制**） | 被 host 或产品 `use` / 链进 App；`xai-grok-shell` 完整闭包 |
 | `efflab-agent-host` | **只** contract + ACP 客户端类型（若需要，只引 schema crate）+ 进程监督 | `efflab-agent-sidecar` 库、`xai-grok-shell`、`xai-grok-tools` |
 | 产品 | host crate + sidecar **二进制** + `@efflab/agent-web` | `efflab-agent-sidecar` 库、`xai_grok_*`、ACP 类型 |
 
-contract 装：`validate_host_request`、`ApprovedMcpConfig`、`SidecarModelSpec`、`render_authoritative_config`、`ApprovedMcpConfig::write_toml`。**Host 是 `{GROK_HOME}/config.toml` 的唯一写盘 owner**：spawn 前由 Host 调 contract renderer 物化完整权威配置；sidecar 只校验文件已存在且符合合同，禁止再次覆盖 `[models]` / `[storage]` / `[session]`，缺文件或不合规时以退出码 2 拒绝启动。禁止 Host 与 sidecar 各写一份渲染逻辑。
+contract 装：`validate_host_request`、`ApprovedMcpConfig`、`RuntimeConfigV1`、`render_runtime_config_v1`、`load_runtime_config_v1` 与统一的 server/tool validator。**Host 是 `<home>/runtime-config.v1.toml` 的唯一写盘 owner**：spawn 前由 Host 调 contract renderer 原子物化完整 v1 配置，并以 `--runtime-config` 传给 sidecar；sidecar 只读校验，缺失、malformed 或不合规时以退出码 2 拒绝启动，绝不回退旧 `config.toml` 或自行补默认配置。禁止 Host 与 sidecar 各写一份渲染逻辑。sidecar `initialize` 返回的 `mcpCapabilities.http=false` / `sse=false` 只表示 ACP 不广告 transport；sidecar 仍消费 Host 审批的 loopback HTTP MCP，不能据此删除或绕过 `approved_mcp`。
 
 **grok-shell 不得编进产品进程。** 它只活在 sidecar **可执行文件**里。host / `rust_lib` / `src-tauri` 的 `cargo tree` 不得出现 `xai-grok-shell` / `xai-grok-tools`。产品 grep 门禁除 ACP 字符串外，还禁 `efflab_agent_sidecar::` / `xai_grok_`。sidecar 里的 Shell / 通用 FS / Git / Web **能力关闭**（`injectDefaultTools: false`），不是「编进来再用」。
 
@@ -190,7 +192,7 @@ Secret seam（M1）：产品实现 `seal_secret` / `unseal_secret` 即可；**�
 pub struct HostRuntimeConfig {
     pub home_root: PathBuf,      // 产品给 App Data **根**；Host 再拼 app_id
     pub sidecar_bin: PathBuf,    // 开发：CARGO 产物；打包：产品解析后注入。禁止 crate 内写死绝对 path
-    pub mcp_exec_root: PathBuf,  // 包内 Helpers 或 Host 物化到 home 下的只读目录
+    // 现行 v1 不提供 mcp_exec_root；MCP 只通过 RuntimeConfigV1 的 loopback HTTP 审批集传递。
     pub idle_after: Duration,    // 默认 15min；in-flight 禁止 idle-kill
 }
 
@@ -208,7 +210,7 @@ impl HostRuntime {
 `home_root` 由 Host **强制**拼 `app_id`：
 
 ```
-{cfg.home_root}/{sanitize(app_id)}/{sanitize(scope)}/home       → --grok-home
+{cfg.home_root}/{sanitize(app_id)}/{sanitize(scope)}/home       → --home
 {cfg.home_root}/{sanitize(app_id)}/{sanitize(scope)}/workspace  → --session-cwd
 ```
 
@@ -344,7 +346,7 @@ KitProductEvent
 - 线协议 `kind` 内标。未知 block kind 解码为 `Unknown { unknown_kind }`，再序列化固定为 `{"kind":"unknown","unknown_kind":"<原 kind>"}`。原始 payload 有意丢弃；UI 只画 Status 或跳过，禁止解释未知 payload，禁止整事件反序列化失败。Task 1 必须做双向 golden。
 - 事件 `error` 块 = 同一 `KitError` shape（`code/message/details?/request_id?/retryable/retry_after_ms?`）。
 - turn 级块（`user` / `assistant` / `thinking` / `tool` / turn 终态 `Status`）的 `turn_id` 与 `submission_id` 必填，且两者都等于 Kit `submission_id` / ACP `promptId`。
-- session/process 级 `Status`（`replay_complete` / `replay_skipped` / `mcp_failed` / 与具体 prompt 无关的 `skipped_update`）的 `turn_id` 与 `submission_id` 均为 `null`。Host **禁止**伪造 synthetic turn id。
+- session/process 级 `Status`（`replay_complete` / `mcp_failed` 等现行状态）的 `turn_id` 与 `submission_id` 均为 `null`。未知或禁用 update 只做内部计数和 debug 汇总，不产生 `replay_skipped` / `skipped_update` 可见事件；Host **禁止**伪造 synthetic turn id。
 - Host 合成事件的 `event_id = "{session_id}:host:{code}:{sequence}"`，`block_id = event_id`；sidecar 投影事件仍优先复用 `_meta.eventId`。
 - `Tool.status`：`pending | running | completed | failed | cancelled`。M1 无 Confirm，不要 `waiting` / Allow/Block。
 
@@ -357,7 +359,7 @@ KitProductEvent
 - Host 在 session `is_active` 期间必须留一份该 session 的事件缓冲（折后快照即可）。切栏卸挂会丢掉 React 状态；热 resume 靠这份缓冲补屏，**不要**为此再 `session/load`（会关 gateway，正在流的字会丢）。
 - 热 resume 时若仍在 Prompting：缓冲按 `streaming=false` 重放；`replay_complete` 后再发一条 live Assistant 快照（`streaming=true`），不要打断 in-flight prompt。
 - 已 attach 的 session 上再 `Resume` 同一 id = 热路径。Resume **另一个** session 时若当前 Prompting → `session_busy`（先 Stop）。
-- replay 期间未知/禁用 update **计数**，批次结束最多一条 `Status { code: "replay_skipped", message: "<n>" }`。live 未知可逐条 `skipped_update`。
+- replay/live 期间未知或禁用 update 仅内部计数并限频记录 debug 汇总；不分配 Kit 事件、不清空快照、不进入恢复缓冲。replay 批次只发 `replay_complete`。
 - 一轮结束：`Status { code: "turn_completed" | "cancelled" | "error" }`。该 `turn_id` 一旦终态，后续同 turn 的 `origin=live` **丢弃**（迟到包是新 `event_id`，去重不够）。
 - 用户气泡：面板可乐观插入，`block_id = submission_id`；sidecar user 回显用同一 `block_id` 去重。禁止两边各画一条。
 - 线协议 M1 **不发射** `todo` / `subagent` / `plan`。
@@ -505,7 +507,7 @@ Host 先取 app.mentions()，再调 HostAppMentions::resolve
 7. `_meta.isReplay` → `origin=replay`。`event_id` 复用 sidecar `eventId`。
 8. `submission_id` 写入 ACP `_meta.promptId`。
 9. 列会话只走标准 ACP `session/list`（`cwd` 强制等于该 scope 的 session_cwd；可选 `cursor`；**不传 `limit`**）。禁止扫盘。禁止 `_x.ai/session/list`。
-10. LLM Channel：渲染 `[models] default` + `[model.byok|relay]`，`api_backend=chat_completions`。sidecar `base_url` 指向 Host L3b。
+10. LLM Channel：Host 通过 contract renderer 写入 RuntimeConfigV1 的 `[model]`、`approved_mcp` 与 `expected_tools`，backend 固定为 `chat_completions`。sidecar `base_url` 指向 Host L3b；不恢复旧 `[models].default` 或 `api_backend` 配置表。
 11. capability：Windows sidecar fail-closed 仍报入口可见、不可用。`HostRuntimeConfig` / kill API 在 Windows **编译单元必须存在**，返回 `Unavailable`，禁止 `#[cfg(unix)]` 把类型摘掉。
 12. 不提供默认 `feature = "tauri"`。
 
@@ -541,18 +543,19 @@ fn reply_validated(&self, id: RequestId, reply: ValidatedReply, policy: &HostPol
 | 批准该批但 options 里没有 `allow-once` | `Cancelled`，禁止瞎选 `options[0]` |
 | 不在批准集 / 未知工具 | 找 `reject-once`；没有则 `Cancelled` |
 | 已 `cancel_requested` / 用户 Stop | 一律 `Cancelled` |
-| `x.ai/ask_user_question` / `x.ai/exit_plan_mode` | 拒绝/取消 + `Status { skipped_update }` |
+| `x.ai/ask_user_question` / `x.ai/exit_plan_mode` | 拒绝/取消；只增加内部 unsupported reverse-request 计数和 debug 日志，不生成可见 Status |
 | 其它带 `id` 的未知 request | 错误 result，禁止静默丢 |
 
 M1 不弹窗。自动批只读工具 ≠ `HostAppConfirm`，不把原始 ACP 甩给 web；可投影 `KitBlock::Tool`。reply 走 `reply_validated`。
 
 **禁止**放进 host crate：产品 schema / 写回 / 商店验签 / React / Music MCP 实现。
 
-权威 config 必须写出 `[storage] cleanup_ttl_days = 36500`（禁用上游默认 30 天；**禁止写 0**，上游 `days > 0` 才覆盖），并固定写出 `[session] load_envrc = false`。sidecar 启动校验最终解析值必须为 false；Host request / `_meta` 不得重新开启 envrc。
+RuntimeConfigV1 必须由 Host 通过 `render_runtime_config_v1` 原子写入 `<home>/runtime-config.v1.toml`，并由 sidecar 通过 `--runtime-config` 只读加载；缺失、malformed、未知字段或 revision 不匹配均拒绝启动。配置只允许固定的模型 loopback、Host 审批的 HTTP MCP 与 `expected_tools`，不包含用户凭据、command/args 或旧 shell 配置；stdio 条目统一返回 `stdio_mcp_unavailable`。
 
 ## 7. LLM Channel
 
-产品设置页配的是 **用户大模型**（或以后自家 Relay）。sidecar 磁盘上的 `config.toml` **不写那把 Key**。这是两套凭据，不要混。
+产品设置页配的是 **用户大模型**（或以后自家 Relay）。sidecar 磁盘上的
+`runtime-config.v1.toml` **不写那把 Key**。这是两套凭据，不要混。
 
 ```text
 设置页 / HostApp（用户看得见）
@@ -567,27 +570,27 @@ Host 进程（unseal）
         │  入站 Authorization = 绑定令牌
         │  出站 Authorization = 当前通道的用户 Key 或 Relay token
         ▼
-sidecar 权威 TOML（磁盘，无私密）
-  [model.byok]  base_url = 上面这个回环
-                env_key  = "EFFLAB_L3B_BIND"   ← 只指向绑定令牌，不是用户 Key
-                禁止 api_key / extra_headers 夹用户 Key
-  sidecar 环境  Task 7 完整 spawn 时只注入 EFFLAB_L3B_BIND；禁止 XAI_API_KEY
+sidecar RuntimeConfigV1（磁盘，无私密）
+  [model]       base_url = 上面这个回环
+                backend  = "chat_completions"
+                token_env = "EFFLAB_L3B_BIND"  ← 只指向绑定令牌，不是用户 Key
+  sidecar 环境  完整 spawn 时只注入 EFFLAB_L3B_BIND；禁止用户 Key
 ```
 
-- 两通道都强制 `chat_completions`。禁止默认 `grok-4.5` + `responses`。Host 是完整 TOML 的唯一写盘 owner；sidecar 缺文件或校验失败以退出码 2 拒绝，不得自补默认模型。
-- 权威 config **必须**写 `[models] default = "byok"`（或以后 `relay`）以及对应 `[model.*]`、`[storage] cleanup_ttl_days = 36500`、`[session] load_envrc = false`。
-- 空通道：不写 `[model.*]`，且 **不得 spawn 后允许 prompt**。
+- 两通道都强制 `chat_completions`。Host 是 `runtime-config.v1.toml` 的唯一写盘 owner；sidecar 缺文件或校验失败以退出码 2 拒绝，不得自补默认模型。
+- RuntimeConfigV1 的 `[model]`、`[approved_mcp]` 与 `expected_tools` 均为闭集字段；空 `expected_tools` 合法。Host 写入的 runtime config 不含用户 Key/Relay token，也不含 command/args。
+- 空通道：不写模型配置，且 **不得 spawn 后允许 prompt**。
 - 文档用词：**产品套餐** vs **Relay 额度**，不要都叫「订阅」。
 - 通道是**产品全局**，`SetLlmChannel` / `persist_llm_channel` 不带 `scope_id`。M1 启用 Byok；Relay **类型第一天进** `LlmChannel`，`enabled=false`。切到 Relay = 改 Channel + 使全部旧 binding token 失效 + drain/重启所有存活 scope；sidecar 仍打同一个 L3b，Host 换出站目标。web / ACP / HostApp 形状不变。
-- **用户 Key / Relay token 不写 TOML，也不进 sidecar 环境。** sidecar 只持短寿命绑定令牌，否则 grok-shell 的 MCP 子进程会继承到用户 Key。
+- **用户 Key / Relay token 不写 TOML，也不进 sidecar 环境。** sidecar 只持短寿命绑定令牌；Host L3b 在出站到用户配置的模型 endpoint 时才使用产品解封的凭据。绑定令牌只证明「我是这个 scope 的 sidecar」，**不是**设置页那把大模型 Key。
 
-**为什么 sidecar 还要有 `env_key`：** grok-shell 取钥顺序是 `api_key` → `env_key` → login → 全局 `XAI_API_KEY`（`11-custom-models.md`）。TOML 不写 `api_key` 且不注入 `XAI_API_KEY` 时，必须写 `env_key = "EFFLAB_L3B_BIND"`。Task 7 的完整 launch integration 在 L3b 已监听、binding token 已注册后，才把该令牌注入本代 sidecar；Task 5 的纯 Supervisor 交付不注入令牌。这把令牌只证明「我是这个 scope 的 sidecar」，**不是**设置页那把大模型 Key。
+RuntimeConfigV1 的 `model.token_env` 固定为 `EFFLAB_L3B_BIND`，仅用于 sidecar 读取 Host 注入的绑定令牌；这不是 ACP 能力广告，也不是用户凭据字段。sidecar `initialize` 的 `mcpCapabilities.http=false` / `sse=false` 只表示 ACP 不广告 transport；sidecar 仍消费 Host 审批的 loopback HTTP MCP。
 
 **L3b 本机回环（M1 必做）：**
 
 ```text
 sidecar base_url = http://127.0.0.1:<ephemeral>/v1
-sidecar 环境     = 完整 spawn integration 时仅 EFFLAB_L3B_BIND（MCP child 不得继承；M1 领域 MCP 优先 HTTP）
+sidecar 环境     = 完整 spawn integration 时仅 EFFLAB_L3B_BIND；领域 MCP 仅允许 Host 审批的 loopback HTTP，不创建 stdio 子进程
 Host 出口        = 只绑 127.0.0.1 / ::1，禁止 0.0.0.0
                  只转发 POST /v1/chat/completions；禁 CONNECT / 非 POST / 环境 HTTP(S)_PROXY
                  SSE/stream 逐块转发，禁止整包 buffer；下游断开或 Cancel 立即停止读上游
@@ -604,14 +607,14 @@ L3b 注册表固定为 `binding_token → scope slot → sidecar process generat
 
 切 BYOK↔Relay：改全局 Channel + 使全部旧 token 立即失效 + **drain/重启所有存活 scope 进程**。磁盘会话还在，UI 走 list/resume。sidecar 的 `base_url` / `env_key` 形状不变。
 
-launch 顺序：Host 先监听 L3b、注册本代 binding token、调用 contract 渲染并原子写 `{GROK_HOME}/config.toml`，再 spawn sidecar。sidecar CLI 不增加用户 Key 参数；端口与模型只存在于 Host 写出的 TOML `base_url` / `model`。sidecar 只校验，不覆盖 `[models]` / `[storage]` / `[session]`。
+launch 顺序：Host 先监听 L3b、注册本代 binding token、调用 contract 的 `render_runtime_config_v1` 原子写 `{home}/runtime-config.v1.toml`，再以 `--runtime-config` spawn sidecar。sidecar CLI 不增加用户 Key 参数；端口与模型只存在于 Host 写出的 RuntimeConfigV1 `model.base_url` / `model.model_id`。sidecar 只读校验，不回退旧 `config.toml`，也不启动 stdio MCP。
 
 ## 8. 安全边界
 
 - React / agent-web 不理解 ACP。`@efflab/agent-web` 的 `react` / `react-dom` 是覆盖 18/19 的 peerDependencies，library build externalize React；CSS 必须根作用域隔离，导入后不得全局 reset 宿主 button/textarea。
-- sidecar 默认 `injectDefaultTools: false`；**屏蔽** Shell / 通用 FS / Git / Web / 外部 MCP / Skills / Subagent / YOLO。不是编译进 App 再关 UI。权威 config 另以 `[session] load_envrc = false` 关闭 `.envrc` 执行面。
+- sidecar 最小 runtime 不编译 Shell / 通用 FS / Git / Web / 外部 MCP / Skills / Subagent / YOLO 能力；同时不读取旧 shell 配置或执行 workspace `.envrc`，而不是依靠运行时开关补救编译闭包。
 - MCP 只来自 `HostApp::mcp_for_scope`；client `mcpServers` 必须 `[]`。改 MCP = 重启该 scope 的 sidecar。
-- M1 只读 MCP，**可选**。产品可以不走 MCP（批准集空）；对话不依赖 MCP 起来。stdio MCP 只能经固定、版本化、身份可验证的 `env_clear` wrapper；禁止把任意 exec-root helper 当可信 wrapper。
+- M1 只读 MCP，**可选**。产品可以不走 MCP（批准集空）；对话不依赖 MCP 起来。现行 v1 仅允许 Host 审批的字面量 loopback HTTP MCP；stdio MCP spawn/wrapper 是旧历史方案，明确不可执行，RuntimeConfigV1 遇到 stdio 统一返回 `stdio_mcp_unavailable`。
 - PureLab 的 8 个运输 command 只允许冻结的主窗口 label `main` 调用；其它窗口 fail-closed，不 spawn、不 unseal。`agent-kit-event` 也只投递给有对应 scope 权限的受信主窗口。
 - PureLab Task 10 接线前必须关闭旧 `agent_test_provider` 旁路：删除前端调用与 Tauri 注册，或改为走 Host/L3b 同一 Endpoint/SSRF policy，并遵守“改 URL 必须带新 Key”。禁止 `api_key=null` + 任意 URL 解密已存 Key外送。设置页保存必须统一到 `agent_kit_set_llm_channel`，或与 Host 事务形成同一成功态。
 - `session/new` 后仍打 `_x.ai/mcp/list`（带 `sessionId`），只做观察。真实 response shape 是 `servers[].session.{status,tools[]}`；local `tools[].name` 可能已去掉 server 前缀，Host 必须用 `server.name + "__" + tool.name` 重建合格名。只比较 `status=ready` 且 tool `enabled=true` 的集合：
@@ -640,7 +643,7 @@ launch 顺序：Host 先监听 L3b、注册本代 binding token、调用 contrac
 
 ### M1 — BYOK 对话 + 续聊合同
 
-- Host 用 contract renderer 写出完整 `chat_completions` 配置，pin `[models].default` + TTL 36500 + `load_envrc=false`；sidecar 只校验
+- Host 用 contract renderer 写出完整 RuntimeConfigV1（`[model]`、`approved_mcp`、`expected_tools`），backend 固定为 `chat_completions`；sidecar 只校验，不读取旧 `[models].default` 或 shell 配置
 - `host_contract` 放行 prompt / cancel（通知）/ list；**不**放行 `session/set_model`；无顶层 `limit`
 - Host：supervisor + AcpRuntime（含反向 request）+ projector + **L3b** + Channel
 - **HostRuntime 闭环**（假 sidecar）：acquire → initialize → new/load → 读循环 → emit。没有这一环不得接产品
@@ -664,7 +667,7 @@ launch 顺序：Host 先监听 L3b、注册本代 binding token、调用 contrac
 |---|---|---|
 | C0 | `effilab-agent` | `efflab-agent-contract`：从 sidecar 挪出 host_contract / MCP DTO / render |
 | K1 | `effilab-agent` | host crate：`protocol` + `HostRuntime` + 端口 + submission；**不**依赖 sidecar 库 |
-| S1 | `effilab-agent` | `[models].default` + `[model.byok\|relay]` + `chat_completions` + TTL 36500 |
+| S1 | `effilab-agent` | RuntimeConfigV1 `[model]` + `[approved_mcp]` / `expected_tools` + `chat_completions`，由 contract renderer 统一生成 |
 | S2 | `effilab-agent` | `host_contract`：prompt / cancel 通知 / list；wire `_`；per-method `_meta`；文本语义门 |
 | K2 | `effilab-agent` | supervisor + AcpRuntime（含 reply）+ projector + **dispatch 闭环** |
 | K3 | `effilab-agent` | LLM Channel + L3b 回环出口 + secret seam |
@@ -710,26 +713,21 @@ launch 顺序：Host 先监听 L3b、注册本代 binding token、调用 contrac
 
 以后做安装版时抄产品现网嵌套 bin 合同，不要另发明：
 
-- macOS：`.app` + `Resources`/`Helpers` + 公证；`--mcp-exec-root` 在包内或 home 只读物化目录，禁止指向用户曲库
+- macOS：`.app` + `Resources`/`Helpers` + 公证；sidecar 只接收 `--runtime-config` 与隔离路径，旧 `--mcp-exec-root` 不属于 v1 合同
 - Windows：exe 旁路 / MSIX 资源映射；SmartScreen
 - Host **不**调用 `Command::new_sidecar`（无 tauri feature）。产品解析 `PathBuf` 交给 `HostRuntimeConfig.sidecar_bin`
 - Linux 产品不交付，Kit 不承诺 Linux host
 
 ## 14. 证据
 
-- sidecar 已是通用组件意图：`docs/plans/2026-08-11-efflab-agent-sidecar-poc.md` §1.2
-- Host 校验已在 sidecar crate：`crates/efflab/efflab-agent-sidecar/src/host_contract.rs`、`docs/host-acp-contract.md`
-- sidecar 默认依赖 grok-shell 闭包：`efflab-agent-sidecar/Cargo.toml`
-- 现行白名单尚无 prompt/list：`host_contract.rs` `validate_host_request` match
-- 标准 `session/list`：`xai-grok-shell` `handle_list_sessions`；`ListSessionsRequest` 无顶层 `limit`；`_x.ai/session/list` 更宽
-- agent-web 无真实协议客户端：`app/src/App.tsx`、`app/src/types.ts`
-- 原厂 Connect ≠ ACP：`effilab-agent-web/docs/01-architecture.md`
-- 自定义模型默认 Chat Completions：`crates/codegen/xai-grok-pager/docs/user-guide/11-custom-models.md`
-- 内置 grok-4.5 是 `responses`：`crates/codegen/xai-grok-models/default_models.json`
-- 会话按 cwd 分桶、TTL `days > 0`：`xai-grok-shell` persistence
-- grok-shell 回合键为 `_meta.promptId`；load 重放带 `isReplay`
-- 反向 request：`leader/server.rs` 将 `session/request_permission` / `x.ai/ask_user_question` / `x.ai/exit_plan_mode` 标为 blocking
-- grok-shell `@path` 读盘：`prompt_parser` / `attach_file.rs`；`capabilities.fs=false` 不管这条
-- MCP stdio 继承环境：`xai-grok-mcp` `Command::new` 不 `env_clear`
-- Relay 为 Chat Completions + 幂等：`effilab_agent_server` 对外 API §3、ADR-12
+以下路径用于定位当前实现与合同；本节不把旧 shell 方案、旧配置格式或 stdio wrapper 当作可执行依据：
+
+- Host 出站校验：`crates/efflab/efflab-agent-contract/src/host_contract.rs`、`docs/host-acp-contract.md`
+- RuntimeConfigV1 与 MCP server/tool 校验：`crates/efflab/efflab-agent-contract/src/model.rs`、`src/render.rs`、`src/mcp_config.rs`、`src/stdio_mcp.rs`
+- 最小 sidecar ACP/runtime：`crates/efflab/efflab-agent-sidecar/src/acp_agent.rs`、`src/runtime.rs`
+- 标准 `session/list`、v1 会话与回放：`crates/efflab/efflab-agent-sidecar/src/acp_agent.rs`、`src/session_store.rs`
+- L3b Chat Completions 回环：`crates/efflab/efflab-agent-host/src/llm_loopback.rs`
+- agent-web 只消费 Kit 协议：`../../../effilab-agent-web/app/src/hostTypes.ts`、`app/src/useAgentKit.ts`
+- 第一个产品 adapter：[`ai_music_organizer_br` PureLab 设计](../../../ai_music_organizer_br/docs/plans/2026-08-13-effilab-agent-web-purelab-pilot-design.md)
+- Relay 的 Chat Completions 与幂等：`../../../effilab_agent_server`
 - 2026-08-13 R1：分层对、协议未冻。R2：crate 依赖 / 反向 RPC / dispatch 闭环 / list schema / 引导与 replay 栅栏。gpt-sol 终审修订：L1 前向兼容、可空 turn、mentions 注入/指纹、全局 Channel、Host 写盘 launch contract、ValidatedReply、prompt gate、L3b/MCP/产品安全门。

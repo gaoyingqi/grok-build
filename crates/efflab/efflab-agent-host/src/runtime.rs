@@ -5,16 +5,21 @@
 //! 规定的回执时机，绝不在产品线程直接读取 sidecar stdout。
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use efflab_agent_contract::{HOST_ACP_PROTOCOL_VERSION, HostPolicy, validate_prompt_text};
+use efflab_agent_contract::{
+    HOST_ACP_PROTOCOL_VERSION, HostPolicy, is_prompt_id, is_qualified_tool_name, is_server_name,
+    validate_prompt_text,
+};
 use serde_json::{Value, json};
 
-use crate::acp_runtime::{AcpRuntime, Inbound, RequestId, RpcError, ValidatedReply};
+use crate::acp_runtime::{
+    AcpRuntime, Inbound, RequestId, RequestWriteFailure, RpcError, ValidatedReply,
+};
 use crate::app_port::{ApprovedMcpSpec, HostApp, ScopeId};
 use crate::event_sink::KitEventSink;
 use crate::llm_channel::{LaunchedScope, LlmChannelError, LlmChannelService, SetLlmChannelRequest};
@@ -22,8 +27,9 @@ use crate::projector::Projector;
 use crate::protocol::{
     Capability, CapabilityLimits, KIT_SCHEMA_VERSION, KitBlock, KitCommand, KitError,
     KitProductEvent, KitReply, LlmChannelKind, Origin, SessionSummary,
+    is_recoverable_product_event,
 };
-use crate::submission::{SubmissionDecision, SubmissionMap};
+use crate::submission::{SendTicket, SendTicketState, SubmissionDecision, SubmissionMap};
 use crate::supervisor::{SupervisorCapability, UnavailableReason, capability};
 use crate::{METHOD_NOT_FOUND, ValidatedKitEventSink};
 
@@ -33,10 +39,26 @@ const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(20);
 const DISPATCH_REPLY_TIMEOUT: Duration = Duration::from_secs(25);
 /// MCP catalog 必须在产品调用超时之前降级；超时不杀 sidecar。
 const MCP_CATALOG_TIMEOUT: Duration = Duration::from_secs(20);
+/// shutdown 回执已到达后只给 actor 极短宽限；未结束时保留 tombstone，不能无界 join。
+const ACTOR_JOIN_GRACE: Duration = Duration::from_millis(100);
+/// session/load 的单 flight deadline；迟到 response 必须被撤销并丢弃。
+const LOAD_TIMEOUT: Duration = Duration::from_secs(60);
+/// ACP 明确表示 session 不存在的错误码；其它 load error 不能伪装成 NotFound。
+const ACP_SESSION_NOT_FOUND: i64 = -32004;
 /// actor 空闲轮询间隔；stdout reader 独立运行，因此该值不影响 ACP 收包顺序。
 const ACTOR_TICK: Duration = Duration::from_millis(5);
+/// terminal sink 失败后的重试间隔；不让失败 sink 造成 actor 忙循环。
+const TERMINAL_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// 每轮最多处理的入站项目数；达到上限后让出机会给 Cancel/Shutdown 等控制命令。
+const MAX_INBOUND_DRAIN: usize = 8;
 /// ACP `session/new` / `session/load` 使用固定 Channel 槽名，不得泄漏供应商模型标识。
 const ACP_BYOK_MODEL_SLOT: &str = "byok";
+/// 最小 sidecar 握手声明的运行时实现标识；缺失或变形都必须拒绝。
+const EFFLAB_RUNTIME_ID: &str = "minimal-v1";
+/// 最小 sidecar 握手声明所使用的 Kit schema 版本。
+const EFFLAB_SCHEMA_VERSION: u64 = 1;
+/// 最小 sidecar 握手声明所使用的 session store 版本。
+const EFFLAB_SESSION_STORE_VERSION: u64 = 1;
 /// MCP catalog 中始终可安全自动许可的内置无副作用工具。
 const NOOP_TOOL: &str = "GrokBuild:efflab_noop";
 /// Kit capability 与实际写入 sidecar 的单次 prompt 统一字符上限。
@@ -52,12 +74,16 @@ pub struct HostRuntime {
     cfg: crate::HostRuntimeConfig,
     /// MCP catalog deadline；生产入口固定使用 20 秒，测试入口才可注入较短值。
     mcp_catalog_timeout: Duration,
+    /// session/load deadline；生产入口固定使用 60 秒，测试入口才可注入较短值。
+    load_timeout: Duration,
     /// Channel 服务构造也可能因历史配置不安全而失败；构造 API 不能 panic。
     channel: Result<Arc<LlmChannelService>, LlmChannelError>,
     /// 进程内 Send 幂等边界，跨 actor restart 保持。
     submissions: Mutex<SubmissionMap>,
     /// 每个 scope 一个唯一 IO actor；失败杀停的 actor 保留以 fail-closed 而非自动复活。
     actors: Mutex<BTreeMap<String, Arc<ActorHandle>>>,
+    /// actor 退出后的 terminal pending 仍由 runtime 持有，等待后续 cleanup 边界重试。
+    terminal_outbox: Arc<Mutex<TerminalOutbox>>,
     /// 全局换通道与新 actor launch 的互斥门，防止旧 revision 与新 revision 交错。
     channel_transition: Mutex<()>,
     /// 已提交配置下未能恢复的原 live scope；相同 Set 请求必须重试这些 scope。
@@ -71,7 +97,7 @@ impl HostRuntime {
         sink: impl KitEventSink + 'static,
         cfg: crate::HostRuntimeConfig,
     ) -> Self {
-        Self::new_with_mcp_catalog_timeout(app, sink, cfg, MCP_CATALOG_TIMEOUT)
+        Self::new_with_timeouts(app, sink, cfg, MCP_CATALOG_TIMEOUT, LOAD_TIMEOUT)
     }
 
     /// 仅供集成测试注入较短 catalog deadline；生产调用必须使用 [`Self::new`] 保持 20 秒合同。
@@ -82,15 +108,27 @@ impl HostRuntime {
         cfg: crate::HostRuntimeConfig,
         mcp_catalog_timeout: Duration,
     ) -> Self {
-        Self::new_with_mcp_catalog_timeout(app, sink, cfg, mcp_catalog_timeout)
+        Self::new_with_timeouts(app, sink, cfg, mcp_catalog_timeout, LOAD_TIMEOUT)
+    }
+
+    /// 仅供集成测试注入较短 load deadline；生产调用必须使用 [`Self::new`] 保持 60 秒合同。
+    #[doc(hidden)]
+    pub fn new_for_test_with_load_timeout(
+        app: impl HostApp + 'static,
+        sink: impl KitEventSink + 'static,
+        cfg: crate::HostRuntimeConfig,
+        load_timeout: Duration,
+    ) -> Self {
+        Self::new_with_timeouts(app, sink, cfg, MCP_CATALOG_TIMEOUT, load_timeout)
     }
 
     /// 统一构造路径，避免测试 deadline 改变生产 `new` 的冻结协议语义。
-    fn new_with_mcp_catalog_timeout(
+    fn new_with_timeouts(
         app: impl HostApp + 'static,
         sink: impl KitEventSink + 'static,
         cfg: crate::HostRuntimeConfig,
         mcp_catalog_timeout: Duration,
+        load_timeout: Duration,
     ) -> Self {
         let app = Arc::new(app);
         let channel = LlmChannelService::new(Arc::clone(&app), cfg.clone()).map(Arc::new);
@@ -102,9 +140,11 @@ impl HostRuntime {
             sink,
             cfg,
             mcp_catalog_timeout,
+            load_timeout,
             channel,
             submissions: Mutex::new(SubmissionMap::default()),
             actors: Mutex::new(BTreeMap::new()),
+            terminal_outbox: Arc::new(Mutex::new(TerminalOutbox::default())),
             channel_transition: Mutex::new(()),
             restart_retry_scopes: Mutex::new(BTreeSet::new()),
         }
@@ -267,11 +307,11 @@ impl HostRuntime {
                 "fingerprint_conflict",
                 "同一 submission_id 的提交内容不一致",
             )),
-            SubmissionDecision::Accepted { .. } => {
+            SubmissionDecision::Accepted { ticket, .. } => {
                 let actor = match self.actor_for_scope(&scope_id) {
                     Ok(actor) => actor,
                     Err(error) => {
-                        self.forget_submission(&scope_id, &session_id, &submission_id);
+                        self.forget_submission(&scope_id, &session_id, &submission_id, &ticket);
                         return Err(error);
                     }
                 };
@@ -280,15 +320,16 @@ impl HostRuntime {
                     session_id.clone(),
                     submission_id.clone(),
                     prompt_text,
+                    ticket.clone(),
                 ) {
                     Ok(reply) => Ok(reply),
                     Err(SendRequestError::BeforePrompt(error)) => {
-                        // actor 尚未取得写 prompt 所有权，撤销登记后原 submission 可安全重试。
-                        self.forget_submission(&scope_id, &session_id, &submission_id);
+                        // actor 已确认 prompt 未写入，按 ticket 身份撤销本次登记。
+                        self.forget_submission(&scope_id, &session_id, &submission_id, &ticket);
                         Err(error)
                     }
                     Err(SendRequestError::PromptMayHaveBeenWritten(error)) => {
-                        // timeout 与写入竞争时保留幂等登记，避免重试制造第二次 prompt。
+                        // timeout 或部分写入不确定时保留幂等登记，避免重试制造第二次 prompt。
                         Err(error)
                     }
                 }
@@ -340,6 +381,8 @@ impl HostRuntime {
             .channel_transition
             .lock()
             .map_err(|_| KitError::non_retryable("sidecar_unavailable", "通道事务不可用"))?;
+        // 先尝试交付此前 actor 退出后保留的终态，再决定是否允许本次换代继续。
+        self.retry_terminal_outbox()?;
         let service = self.channel_service()?;
         let change = service
             .commit_and_invalidate(request)
@@ -364,12 +407,15 @@ impl HostRuntime {
             .lock()
             .map_err(|_| KitError::non_retryable("sidecar_unavailable", "restart 重试状态不可用"))?
             .clone();
-        // 先从 map 取走旧 actor，确保旧 binding 已失效后没有任何 actor 能继续使用旧 stdin。
+        // 只复制旧 actor；cleanup 失败时原句柄仍留在 map 作为 tombstone，禁止新代并存。
         let previous = {
-            let mut actors = self.actors.lock().map_err(|_| {
+            let actors = self.actors.lock().map_err(|_| {
                 KitError::non_retryable("sidecar_unavailable", "scope actor 注册表不可用")
             })?;
-            std::mem::take(&mut *actors).into_iter().collect::<Vec<_>>()
+            actors
+                .iter()
+                .map(|(scope_id, actor)| (scope_id.clone(), Arc::clone(actor)))
+                .collect::<Vec<_>>()
         };
         for (scope_id, _) in &previous {
             if live_scopes.contains(scope_id) {
@@ -378,15 +424,33 @@ impl HostRuntime {
         }
 
         let mut restart_failed = BTreeSet::new();
+        let mut cleanup_failed = false;
         for (scope_id, actor) in previous {
-            // drain 无确认的 scope 仍尝试新代；若新代成功，下面会清除该失败标记。
-            if !actor.shutdown() && live_scopes.contains(&scope_id) {
-                restart_failed.insert(scope_id);
+            let cleanup = actor.shutdown();
+            if !cleanup.is_success() {
+                cleanup_failed = true;
+                // cleanup 未确认完成时保留 tombstone，禁止同 scope 立即拉起新代。
+                if live_scopes.contains(&scope_id) {
+                    restart_failed.insert(scope_id);
+                }
+                continue;
+            }
+            let mut actors = self.actors.lock().map_err(|_| {
+                KitError::non_retryable("sidecar_unavailable", "scope actor 注册表不可用")
+            })?;
+            if actors
+                .get(&scope_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &actor))
+            {
+                actors.remove(&scope_id);
             }
         }
 
         // 即使单个旧 actor drain/restart 失败，也继续尝试其余 scope；新 committed view 不回滚。
         for scope_id in scopes {
+            if restart_failed.contains(&scope_id) {
+                continue;
+            }
             match self.spawn_actor(&scope_id) {
                 Ok(actor) => match self.actors.lock() {
                     Ok(mut actors) => {
@@ -403,7 +467,7 @@ impl HostRuntime {
             }
         }
 
-        let has_restart_failure = !restart_failed.is_empty();
+        let has_restart_failure = cleanup_failed || !restart_failed.is_empty();
         *self.restart_retry_scopes.lock().map_err(|_| {
             KitError::non_retryable("sidecar_unavailable", "restart 重试状态不可用")
         })? = restart_failed;
@@ -428,20 +492,35 @@ impl HostRuntime {
 
         let mut remaining = BTreeSet::new();
         for scope_id in scopes {
-            let already_recovered = {
-                let mut actors = self.actors.lock().map_err(|_| {
+            let (already_recovered, previous) = {
+                let actors = self.actors.lock().map_err(|_| {
                     KitError::non_retryable("sidecar_unavailable", "scope actor 注册表不可用")
                 })?;
                 match actors.get(&scope_id) {
-                    Some(actor) if actor.accepting.load(Ordering::Acquire) => true,
-                    _ => {
-                        actors.remove(&scope_id);
-                        false
-                    }
+                    Some(actor) if actor.accepting.load(Ordering::Acquire) => (true, None),
+                    Some(actor) => (false, Some(Arc::clone(actor))),
+                    None => (false, None),
                 }
             };
             if already_recovered {
                 continue;
+            }
+            if let Some(actor) = previous {
+                let cleanup = actor.shutdown();
+                if !cleanup.is_success() {
+                    // cleanup 未完成时保留 tombstone，禁止同 scope 立即拉起新代。
+                    remaining.insert(scope_id);
+                    continue;
+                }
+                let mut actors = self.actors.lock().map_err(|_| {
+                    KitError::non_retryable("sidecar_unavailable", "scope actor 注册表不可用")
+                })?;
+                if actors
+                    .get(&scope_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &actor))
+                {
+                    actors.remove(&scope_id);
+                }
             }
 
             match self.spawn_actor(&scope_id) {
@@ -476,31 +555,65 @@ impl HostRuntime {
             .channel_transition
             .lock()
             .map_err(|_| KitError::non_retryable("sidecar_unavailable", "通道事务不可用"))?;
-        let mut actors = self.actors.lock().map_err(|_| {
-            KitError::non_retryable("sidecar_unavailable", "scope actor 注册表不可用")
-        })?;
-        if let Some(actor) = actors.get(scope_id)
-            && actor.accepting.load(Ordering::Acquire)
-        {
-            return Ok(Arc::clone(actor));
+        // 新命令触发旧 actor cleanup 时，先重试跨线程保留的 terminal event。
+        self.retry_terminal_outbox()?;
+        let previous = {
+            let actors = self.actors.lock().map_err(|_| {
+                KitError::non_retryable("sidecar_unavailable", "scope actor 注册表不可用")
+            })?;
+            if let Some(actor) = actors.get(scope_id) {
+                if actor.restart_blocked.load(Ordering::Acquire) {
+                    tracing::debug!(
+                        scope = %scope_id,
+                        "scope 因 MCP 安全违例保持 tombstone，拒绝自动复活"
+                    );
+                    return Err(sidecar_unavailable("scope 因 MCP 安全违例不可用"));
+                }
+                if actor.accepting.load(Ordering::Acquire) {
+                    return Ok(Arc::clone(actor));
+                }
+                // 非 accepting actor 先保留在 map；cleanup 失败时必须作为 tombstone 阻止新代。
+                Some(Arc::clone(actor))
+            } else {
+                None
+            }
+        };
+        if let Some(actor) = previous {
+            let cleanup = actor.shutdown();
+            if !cleanup.is_success() {
+                return Err(sidecar_unavailable("旧 scope cleanup 未完整完成"));
+            }
+            let mut actors = self.actors.lock().map_err(|_| {
+                KitError::non_retryable("sidecar_unavailable", "scope actor 注册表不可用")
+            })?;
+            if actors
+                .get(scope_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &actor))
+            {
+                actors.remove(scope_id);
+            }
         }
-        actors.remove(scope_id);
 
         let actor = self.spawn_actor(scope_id)?;
-        actors.insert(scope_id.to_string(), Arc::clone(&actor));
+        self.actors
+            .lock()
+            .map_err(|_| {
+                KitError::non_retryable("sidecar_unavailable", "scope actor 注册表不可用")
+            })?
+            .insert(scope_id.to_string(), Arc::clone(&actor));
         Ok(actor)
     }
 
     /// 构造并启动 actor；真实 sidecar spawn 顺序只能经 LlmChannelService 进入。
     fn spawn_actor(&self, scope_id: &str) -> Result<Arc<ActorHandle>, KitError> {
         let service = self.channel_service()?;
-        let expected_tools = self
+        let approved_mcp = self
             .app
             .mcp_for_scope(&ScopeId(scope_id.to_string()))
             .map_err(|_| KitError::non_retryable("sidecar_unavailable", "MCP 批准规格不可用"))?;
         tracing::debug!(scope = %scope_id, "正在启动 scope ACP IO actor");
         let launched = service
-            .launch_scope_with_stdio(scope_id)
+            .launch_scope_with_stdio(scope_id, &approved_mcp)
             .map_err(channel_error)?;
         tracing::debug!(
             scope = %scope_id,
@@ -512,31 +625,62 @@ impl HostRuntime {
             Ok(policy) => policy,
             Err(error) => {
                 // policy 失败时 stdio 即将关闭；同时让 Supervisor 立即回收已注册的 child/token。
-                let _ = service.stop_scope(scope_id);
+                if service.stop_scope(scope_id).is_err() {
+                    tracing::error!(
+                        scope = %scope_id,
+                        cleanup_failure = ?CleanupFailureKind::ScopeStop,
+                        "sidecar policy 失败后的 scope cleanup 未完成"
+                    );
+                }
                 return Err(error);
             }
         };
+        let generation = launched.info.generation;
         let acp = AcpRuntime::new(launched.stdio.stdin, launched.stdio.stdout);
         let (sender, receiver) = mpsc::channel();
         let accepting = Arc::new(AtomicBool::new(true));
-        let actor = ScopeActor::new(
+        let exit_intent = Arc::new(AtomicBool::new(false));
+        let submission_lock = Arc::new(Mutex::new(()));
+        let queued_commands = Arc::new(AtomicUsize::new(0));
+        let restart_blocked = Arc::new(AtomicBool::new(false));
+        let cleanup_result = Arc::new(Mutex::new(CleanupResult::default()));
+        let finished = Arc::new(AtomicBool::new(false));
+        let mut actor = ScopeActor::new(
             scope_id.to_string(),
             acp,
             policy,
-            service,
+            Arc::clone(&service),
             Arc::clone(&self.sink),
             receiver,
             Arc::clone(&accepting),
+            Arc::clone(&exit_intent),
+            Arc::clone(&submission_lock),
+            Arc::clone(&queued_commands),
+            Arc::clone(&restart_blocked),
+            Arc::clone(&cleanup_result),
+            Arc::clone(&self.terminal_outbox),
+            generation,
             self.cfg.idle_after,
             self.mcp_catalog_timeout,
-            expected_tools,
+            self.load_timeout,
+            approved_mcp,
         );
         let name = format!("efflab-acp-{}", scope_id);
-        let join = match thread::Builder::new().name(name).spawn(move || actor.run()) {
+        let actor_finished = Arc::clone(&finished);
+        let join = match thread::Builder::new().name(name).spawn(move || {
+            actor.run();
+            actor_finished.store(true, Ordering::Release);
+        }) {
             Ok(join) => join,
             Err(_) => {
                 // closure 被释放时 AcpRuntime 会关闭 stdin；再显式回收 child，不能遗留 token。
-                let _ = self.channel_service()?.stop_scope(scope_id);
+                if service.stop_scope(scope_id).is_err() {
+                    tracing::error!(
+                        scope = %scope_id,
+                        cleanup_failure = ?CleanupFailureKind::ScopeStop,
+                        "sidecar actor thread 启动失败后的 scope cleanup 未完成"
+                    );
+                }
                 return Err(KitError::non_retryable(
                     "sidecar_unavailable",
                     "无法启动 sidecar IO actor",
@@ -544,9 +688,18 @@ impl HostRuntime {
             }
         };
         Ok(Arc::new(ActorHandle {
+            scope_id: scope_id.to_string(),
             sender,
             accepting,
+            exit_intent,
+            submission_lock,
+            queued_commands,
+            restart_blocked,
+            shutdown_submitted: AtomicBool::new(false),
+            shutdown_attempt: Mutex::new(None),
+            cleanup_result,
             join: Mutex::new(Some(join)),
+            finished,
         }))
     }
 
@@ -567,11 +720,61 @@ impl HostRuntime {
         }
     }
 
-    /// 回滚未写入 sidecar 的首次 Send 登记，避免无效 duplicate 锁死重试。
-    fn forget_submission(&self, scope_id: &str, session_id: &str, submission_id: &str) {
+    /// 按 ticket 身份回滚未写入 sidecar 的首次 Send 登记，避免迟到错误删除新一代记录。
+    fn forget_submission(
+        &self,
+        scope_id: &str,
+        session_id: &str,
+        submission_id: &str,
+        ticket: &SendTicket,
+    ) {
         if let Ok(mut submissions) = self.submissions.lock() {
-            submissions.forget(scope_id, session_id, submission_id);
+            submissions.forget(scope_id, session_id, submission_id, ticket);
         }
+    }
+
+    /// 获取 terminal outbox 锁；poison 只表示持锁线程曾 panic，Map 本身仍可恢复。
+    fn lock_terminal_outbox(&self) -> std::sync::MutexGuard<'_, TerminalOutbox> {
+        match self.terminal_outbox.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!(
+                    cleanup_failure = ?CleanupFailureKind::TerminalEvent,
+                    "Host terminal outbox 锁曾异常中断，恢复内存 outbox 状态"
+                );
+                let guard = poisoned.into_inner();
+                self.terminal_outbox.clear_poison();
+                guard
+            }
+        }
+    }
+
+    /// 在 scope cleanup/restart 边界重试 actor 退出后遗留的 terminal outbox。
+    fn retry_terminal_outbox(&self) -> Result<(), KitError> {
+        let delivered_scopes = {
+            let mut outbox = self.lock_terminal_outbox();
+            outbox.retry_now(self.sink.as_ref())
+        };
+        if delivered_scopes.is_empty() {
+            return Ok(());
+        }
+
+        let pending_scopes = self.lock_terminal_outbox().pending_scopes();
+        let actors = self.actors.lock().map_err(|_| {
+            KitError::non_retryable("sidecar_unavailable", "scope actor 注册表不可用")
+        })?;
+        for scope_id in delivered_scopes {
+            if pending_scopes.contains(&scope_id) {
+                continue;
+            }
+            if let Some(actor) = actors.get(&scope_id) {
+                clear_cleanup_failure(&actor.cleanup_result, CleanupFailureKind::TerminalEvent);
+                if !actor.clear_shutdown_failure(CleanupFailureKind::TerminalEvent) {
+                    return Err(sidecar_unavailable("无法同步 terminal cleanup 结果"));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -581,39 +784,391 @@ impl Drop for HostRuntime {
         let actors = self
             .actors
             .get_mut()
-            .map(|actors| std::mem::take(actors))
+            .map(std::mem::take)
             .unwrap_or_default();
-        for (_, actor) in actors {
-            let _ = actor.shutdown();
+        for (scope_id, actor) in actors {
+            let cleanup = actor.shutdown();
+            if !cleanup.is_success() {
+                tracing::error!(scope = %scope_id, "runtime drop 的 sidecar cleanup 未完整完成");
+            }
+        }
+        if self.retry_terminal_outbox().is_err() {
+            tracing::error!("runtime drop 的 terminal outbox cleanup 未完成");
         }
     }
 }
 
 /// 一个 actor 的外部命令句柄；只有 actor thread 自己能持有 AcpRuntime。
 struct ActorHandle {
+    scope_id: String,
     sender: Sender<ActorCommand>,
     /// false 仅表示正常 idle/shutdown 退出，Host 下次命令可安全 spawn 新代。
     accepting: Arc<AtomicBool>,
+    /// actor 已决定退出；与 accepting 在同一提交门下发布，避免迟到 shutdown 入队。
+    exit_intent: Arc<AtomicBool>,
+    /// 将 accepting 检查与 command 入队绑定，避免 Shutdown 与迟到 command 乱序。
+    submission_lock: Arc<Mutex<()>>,
+    /// 与 ScopeActor 共享的已入队 command 计数，供 idle close 做完整判定。
+    queued_commands: Arc<AtomicUsize>,
+    /// MCP 安全违例后的永久 tombstone；普通命令不得自动创建新 generation。
+    restart_blocked: Arc<AtomicBool>,
+    /// 关闭命令只允许入队一次，重复 shutdown 复用同一 actor 生命周期。
+    shutdown_submitted: AtomicBool,
+    /// 当前 Shutdown attempt 的共享完成状态；调用方超时后仍可观察 actor 的最终结果。
+    shutdown_attempt: Mutex<Option<Arc<ShutdownAttempt>>>,
+    /// actor 内部资源 cleanup 结果与外部 join 结果共享给 restart 协调器。
+    cleanup_result: Arc<Mutex<CleanupResult>>,
     join: Mutex<Option<JoinHandle<()>>>,
+    /// actor thread 完成后置位，用于区分正常自然退出和 command 投递失败。
+    finished: Arc<AtomicBool>,
 }
 
 impl ActorHandle {
-    /// 协调 actor 的有序关闭；失败只表示上层应把全局 Channel restart 标为可重试。
-    fn shutdown(&self) -> bool {
-        let (reply, receiver) = mpsc::sync_channel(1);
-        let sent = self.sender.send(ActorCommand::Shutdown { reply }).is_ok();
-        let acknowledged = sent && receiver.recv_timeout(DISPATCH_REPLY_TIMEOUT).is_ok();
-        self.accepting.store(false, Ordering::Release);
-        if let Ok(mut join) = self.join.lock()
-            && let Some(join) = join.take()
-        {
-            let _ = join.join();
+    /// 在同一提交临界区检查 actor 状态并入队，拒绝已开始换代的 command。
+    fn submit(&self, command: ActorCommand) -> Result<(), ActorCommand> {
+        let _submission = match self.submission_lock.lock() {
+            Ok(guard) => guard,
+            Err(_) => return Err(command),
+        };
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(command);
         }
-        acknowledged
+        // 先登记再发送，确保 actor 即使立即取走 command 也不会看到计数下溢。
+        self.queued_commands.fetch_add(1, Ordering::AcqRel);
+        match self.sender.send(command) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.queued_commands.fetch_sub(1, Ordering::AcqRel);
+                Err(error.0)
+            }
+        }
+    }
+
+    /// 清除 Host outbox 已确认运输的 shutdown 暂时失败。
+    fn clear_shutdown_failure(&self, failure: CleanupFailureKind) -> bool {
+        let slot = match self.shutdown_attempt.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => {
+                tracing::error!(
+                    scope = %self.scope_id,
+                    cleanup_failure = ?CleanupFailureKind::ResultUnavailable,
+                    "Shutdown attempt 状态锁中毒，无法同步 terminal 运输结果"
+                );
+                let slot = poisoned.into_inner();
+                self.shutdown_attempt.clear_poison();
+                record_cleanup_failure(
+                    &self.cleanup_result,
+                    &self.scope_id,
+                    CleanupFailureKind::ResultUnavailable,
+                );
+                drop(slot);
+                return false;
+            }
+        };
+        if let Some(attempt) = slot.as_ref() {
+            attempt.clear_failure(failure);
+        }
+        true
+    }
+
+    /// 协调 actor 的有序关闭；结构化返回所有未完成的 cleanup 步骤。
+    fn shutdown(&self) -> CleanupResult {
+        self.shutdown_with_timeout(DISPATCH_REPLY_TIMEOUT)
+    }
+
+    /// 在调用方 deadline 内等待共享 Shutdown attempt；超时不取消 actor 的 cleanup。
+    fn shutdown_with_timeout(&self, timeout: Duration) -> CleanupResult {
+        let mut result = CleanupResult::default();
+        let attempt = match self.submission_lock.lock() {
+            Ok(_submission) => {
+                let mut slot = match self.shutdown_attempt.lock() {
+                    Ok(slot) => slot,
+                    Err(poisoned) => {
+                        tracing::error!(
+                            scope = %self.scope_id,
+                            cleanup_failure = ?CleanupFailureKind::ResultUnavailable,
+                            "Shutdown attempt 状态锁中毒，无法可靠协调 cleanup"
+                        );
+                        let mut result = CleanupResult::default();
+                        result.record(CleanupFailureKind::ResultUnavailable);
+                        record_cleanup_failure(
+                            &self.cleanup_result,
+                            &self.scope_id,
+                            CleanupFailureKind::ResultUnavailable,
+                        );
+                        drop(poisoned.into_inner());
+                        return result;
+                    }
+                };
+
+                // actor 尚未提交退出且上一个 attempt 已暴露可重试失败时，才创建下一代
+                // attempt，避免调用方超时期间重复投递 Shutdown。
+                if slot
+                    .as_ref()
+                    .and_then(|attempt| attempt.snapshot())
+                    .is_some_and(|cleanup| {
+                        cleanup.has_actor_retry_failure()
+                            && !self.finished.load(Ordering::Acquire)
+                            && !self.exit_intent.load(Ordering::Acquire)
+                    })
+                {
+                    *slot = None;
+                    self.shutdown_submitted.store(false, Ordering::Release);
+                }
+
+                if let Some(attempt) = slot.as_ref() {
+                    Arc::clone(attempt)
+                } else {
+                    let attempt = Arc::new(ShutdownAttempt::new());
+                    *slot = Some(Arc::clone(&attempt));
+                    self.shutdown_submitted.store(true, Ordering::Release);
+                    self.accepting.store(false, Ordering::Release);
+                    if self.finished.load(Ordering::Acquire)
+                        || self.exit_intent.load(Ordering::Acquire)
+                    {
+                        if self.exit_intent.load(Ordering::Acquire) {
+                            tracing::debug!(
+                                scope = %self.scope_id,
+                                cleanup_state = "exit_committed",
+                                "sidecar actor 已提交退出，拒绝迟到 shutdown 入队"
+                            );
+                        }
+                        attempt.complete(snapshot_cleanup_result(
+                            &self.cleanup_result,
+                            &self.scope_id,
+                        ));
+                    } else {
+                        // Shutdown 也占用同一队列计数，避免 actor 取出时错误下溢。
+                        self.queued_commands.fetch_add(1, Ordering::AcqRel);
+                        match self.sender.send(ActorCommand::Shutdown {
+                            attempt: Arc::clone(&attempt),
+                        }) {
+                            Ok(()) => {}
+                            Err(_) => {
+                                self.queued_commands.fetch_sub(1, Ordering::AcqRel);
+                                let mut command_result = CleanupResult::default();
+                                command_result.record(CleanupFailureKind::ShutdownCommand);
+                                record_cleanup_failure(
+                                    &self.cleanup_result,
+                                    &self.scope_id,
+                                    CleanupFailureKind::ShutdownCommand,
+                                );
+                                attempt.complete(command_result);
+                            }
+                        }
+                    }
+                    attempt
+                }
+            }
+            Err(_) => {
+                self.accepting.store(false, Ordering::Release);
+                record_cleanup_failure(
+                    &self.cleanup_result,
+                    &self.scope_id,
+                    CleanupFailureKind::SubmissionLock,
+                );
+                result.record(CleanupFailureKind::SubmissionLock);
+                return result;
+            }
+        };
+
+        let completed = attempt.wait_timeout(timeout);
+        if let Some(actor_result) = completed.as_ref() {
+            result.merge(actor_result);
+        } else {
+            // 仅让本次调用失败；不能写入共享 cleanup 结果，否则会把调用方超时
+            // 误当成 actor cleanup 失败并粘住后续重试。
+            result.record(CleanupFailureKind::ShutdownAcknowledgement);
+            tracing::debug!(
+                scope = %self.scope_id,
+                cleanup_failure = ?CleanupFailureKind::ShutdownAcknowledgement,
+                "等待 sidecar shutdown attempt 超时，保留共享 attempt 供后续观察"
+            );
+        }
+
+        // 只在 actor 已结束时取走 JoinHandle；运行中的旧代必须留在 tombstone 中，
+        // 由调用方下次 cleanup 再尝试回收，绝不能阻塞当前线程或允许新代并存。
+        self.join_if_finished(ACTOR_JOIN_GRACE, &mut result);
+
+        // actor 可能在本次等待超时后才完成资源 cleanup；完成后才允许下一次调用重试。
+        if let Some(cleanup) = attempt.snapshot()
+            && cleanup.has_resource_failure()
+            && !self.finished.load(Ordering::Acquire)
+            && !self.exit_intent.load(Ordering::Acquire)
+            && let Ok(_submission) = self.submission_lock.lock()
+            && let Ok(mut slot) = self.shutdown_attempt.lock()
+            && slot
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &attempt))
+        {
+            *slot = None;
+            self.shutdown_submitted.store(false, Ordering::Release);
+        }
+
+        let actor_result = snapshot_cleanup_result(&self.cleanup_result, &self.scope_id);
+        result.merge(&actor_result);
+        result
+    }
+
+    /// 在有限宽限内只回收已结束的 actor；未结束时保留 JoinHandle 供后续重试。
+    fn join_if_finished(&self, grace: Duration, result: &mut CleanupResult) {
+        let deadline = Instant::now() + grace;
+        let mut join = match self.join.lock() {
+            Ok(join) => join,
+            Err(_) => {
+                record_cleanup_failure(
+                    &self.cleanup_result,
+                    &self.scope_id,
+                    CleanupFailureKind::ActorJoin,
+                );
+                result.record(CleanupFailureKind::ActorJoin);
+                return;
+            }
+        };
+        loop {
+            let Some(handle) = join.as_ref() else {
+                return;
+            };
+            if handle.is_finished() {
+                let Some(handle) = join.take() else {
+                    return;
+                };
+                drop(join);
+                if handle.join().is_err() {
+                    record_cleanup_failure(
+                        &self.cleanup_result,
+                        &self.scope_id,
+                        CleanupFailureKind::ActorJoin,
+                    );
+                    result.record(CleanupFailureKind::ActorJoin);
+                } else {
+                    clear_cleanup_failure(&self.cleanup_result, CleanupFailureKind::ActorJoin);
+                    result.clear(CleanupFailureKind::ActorJoin);
+                }
+                return;
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            if remaining.is_zero() {
+                break;
+            }
+            thread::sleep(remaining.min(ACTOR_TICK));
+        }
+        record_cleanup_failure(
+            &self.cleanup_result,
+            &self.scope_id,
+            CleanupFailureKind::ActorJoin,
+        );
+        result.record(CleanupFailureKind::ActorJoin);
     }
 }
 
-/// actor 处理的内部命令；各同步 Kit 调用都有独立一次性 reply 通道。
+/// 一次 Shutdown 的共享完成状态；调用方超时不能取消 actor 的 cleanup 结果。
+struct ShutdownAttempt {
+    result: Mutex<Option<CleanupResult>>,
+    completed: Condvar,
+}
+
+impl ShutdownAttempt {
+    /// 创建尚未完成的 Shutdown attempt。
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            completed: Condvar::new(),
+        }
+    }
+
+    /// 发布一次 cleanup 结果，并唤醒所有等待同一 attempt 的调用方。
+    fn complete(&self, result: CleanupResult) {
+        let mut state = match self.result.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                tracing::error!(
+                    cleanup_failure = ?CleanupFailureKind::ResultUnavailable,
+                    "Shutdown attempt 状态锁中毒，恢复后继续发布 cleanup 结果"
+                );
+                let state = poisoned.into_inner();
+                self.result.clear_poison();
+                state
+            }
+        };
+        if state.is_none() {
+            *state = Some(result);
+            self.completed.notify_all();
+        }
+    }
+
+    /// 下游已确认 terminal 运输后，清除 attempt 中对应的暂时失败。
+    fn clear_failure(&self, failure: CleanupFailureKind) {
+        let mut state = match self.result.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                tracing::error!(
+                    cleanup_failure = ?CleanupFailureKind::ResultUnavailable,
+                    "Shutdown attempt 状态锁中毒，恢复后清除已确认的 cleanup 失败"
+                );
+                let state = poisoned.into_inner();
+                self.result.clear_poison();
+                state
+            }
+        };
+        if let Some(result) = state.as_mut() {
+            result.clear(failure);
+            self.completed.notify_all();
+        }
+    }
+
+    /// 无阻塞读取 attempt 是否已经完成。
+    fn snapshot(&self) -> Option<CleanupResult> {
+        match self.result.lock() {
+            Ok(state) => state.clone(),
+            Err(poisoned) => {
+                tracing::error!(
+                    cleanup_failure = ?CleanupFailureKind::ResultUnavailable,
+                    "Shutdown attempt 状态锁中毒，读取时恢复"
+                );
+                let state = poisoned.into_inner();
+                self.result.clear_poison();
+                state.clone()
+            }
+        }
+    }
+
+    /// 在调用方 deadline 内等待 attempt；超时只影响本次等待，不改变共享状态。
+    fn wait_timeout(&self, timeout: Duration) -> Option<CleanupResult> {
+        let state = match self.result.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                tracing::error!(
+                    cleanup_failure = ?CleanupFailureKind::ResultUnavailable,
+                    "Shutdown attempt 状态锁中毒，等待时恢复"
+                );
+                let state = poisoned.into_inner();
+                self.result.clear_poison();
+                state
+            }
+        };
+        if state.is_some() {
+            return state.clone();
+        }
+        let state = match self.completed.wait_timeout(state, timeout) {
+            Ok((state, _)) => state,
+            Err(poisoned) => {
+                tracing::error!(
+                    cleanup_failure = ?CleanupFailureKind::ResultUnavailable,
+                    "Shutdown attempt 条件变量锁中毒，恢复后读取结果"
+                );
+                let (state, _) = poisoned.into_inner();
+                self.result.clear_poison();
+                state
+            }
+        };
+        state.clone()
+    }
+}
+
+/// actor 处理的内部命令；同步关闭使用可广播的 Shutdown attempt。
 enum ActorCommand {
     NewSession {
         reply: ReplySender,
@@ -633,67 +1188,117 @@ enum ActorCommand {
         ticket: SendTicket,
         reply: ReplySender,
     },
-    /// 同步调用在写 prompt 前超时后的撤销通知；不产生 Kit 回复。
-    AbandonSend {
-        session_id: String,
-        submission_id: String,
-    },
     Cancel {
         session_id: String,
         reply: ReplySender,
     },
     Shutdown {
-        reply: SyncSender<()>,
+        attempt: Arc<ShutdownAttempt>,
     },
 }
 
 type ReplySender = SyncSender<Result<KitReply, KitError>>;
 
-/// Send 调用方与 actor 之间的写入所有权票据，防止已超时的 catalog waiter 迟到写 prompt。
-#[derive(Clone)]
-struct SendTicket {
-    state: Arc<AtomicU8>,
+/// cleanup 失败的稳定内部分类；不保存底层错误文本，避免将路径或 payload 带出。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CleanupFailureKind {
+    SubmissionLock,
+    ShutdownCommand,
+    TerminalEvent,
+    ShutdownAcknowledgement,
+    AcpShutdown,
+    CancelNotification,
+    ScopeStop,
+    ActorJoin,
+    ResultUnavailable,
 }
 
-impl SendTicket {
-    const WAITING: u8 = 0;
-    const CLAIMED: u8 = 1;
-    const ABANDONED: u8 = 2;
+/// 一次 actor cleanup 的结构化结果；调用方据此决定是否允许继续 restart。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CleanupResult {
+    failures: BTreeSet<CleanupFailureKind>,
+}
 
-    /// 新建仍可由调用方撤销的 Send 票据。
-    fn new() -> Self {
-        Self {
-            state: Arc::new(AtomicU8::new(Self::WAITING)),
+impl CleanupResult {
+    /// 只要任一资源或握手步骤失败，就禁止把该 scope 报告为成功恢复。
+    fn is_success(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    /// 仅资源 cleanup 失败时允许 actor 保持存活，等待下一次显式重试。
+    fn has_resource_failure(&self) -> bool {
+        self.failures.contains(&CleanupFailureKind::AcpShutdown)
+            || self.failures.contains(&CleanupFailureKind::ScopeStop)
+    }
+
+    /// actor 尚未提交退出时，terminal 运输失败也必须重新投递 shutdown attempt。
+    fn has_actor_retry_failure(&self) -> bool {
+        self.has_resource_failure() || self.failures.contains(&CleanupFailureKind::TerminalEvent)
+    }
+
+    /// 合并 actor 内部和外部 handle 观察到的 cleanup 失败分类。
+    fn merge(&mut self, other: &Self) {
+        self.failures.extend(other.failures.iter().copied());
+    }
+
+    /// 记录新失败；详细底层错误不进入结构化结果。
+    fn record(&mut self, failure: CleanupFailureKind) {
+        self.failures.insert(failure);
+    }
+
+    /// 清除已在后续 cleanup 中成功完成的临时失败。
+    fn clear(&mut self, failure: CleanupFailureKind) {
+        self.failures.remove(&failure);
+    }
+}
+
+/// 将 cleanup 失败写入共享结果并记录脱敏分类日志。
+fn clear_cleanup_failure(result: &Arc<Mutex<CleanupResult>>, failure: CleanupFailureKind) {
+    if let Ok(mut result) = result.lock() {
+        result.clear(failure);
+    }
+}
+
+/// 将 cleanup 失败写入共享结果并记录脱敏分类日志。
+fn record_cleanup_failure(
+    result: &Arc<Mutex<CleanupResult>>,
+    scope_id: &str,
+    failure: CleanupFailureKind,
+) {
+    match result.lock() {
+        Ok(mut result) => {
+            if result.failures.insert(failure) {
+                tracing::error!(
+                    scope = %scope_id,
+                    cleanup_failure = ?failure,
+                    "sidecar cleanup 失败"
+                );
+            }
+        }
+        Err(_) => {
+            tracing::error!(
+                scope = %scope_id,
+                cleanup_failure = ?CleanupFailureKind::ResultUnavailable,
+                "sidecar cleanup 结果不可用"
+            );
         }
     }
+}
 
-    /// actor 在实际写 prompt 前独占所有权；已撤销的调用绝不能再写入。
-    fn claim_for_prompt(&self) -> bool {
-        self.state
-            .compare_exchange(
-                Self::WAITING,
-                Self::CLAIMED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-
-    /// 调用方超时时尝试撤销；返回 false 表示 actor 已可能写入 prompt。
-    fn abandon(&self) -> bool {
-        self.state
-            .compare_exchange(
-                Self::WAITING,
-                Self::ABANDONED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-
-    /// 判断调用方是否已经赢得撤销竞争。
-    fn is_abandoned(&self) -> bool {
-        self.state.load(Ordering::Acquire) == Self::ABANDONED
+/// 读取共享 cleanup 结果；锁损坏时以失败关闭而不是假报成功。
+fn snapshot_cleanup_result(result: &Arc<Mutex<CleanupResult>>, scope_id: &str) -> CleanupResult {
+    match result.lock() {
+        Ok(result) => result.clone(),
+        Err(_) => {
+            tracing::error!(
+                scope = %scope_id,
+                cleanup_failure = ?CleanupFailureKind::ResultUnavailable,
+                "sidecar cleanup 结果不可用"
+            );
+            let mut result = CleanupResult::default();
+            result.record(CleanupFailureKind::ResultUnavailable);
+            result
+        }
     }
 }
 
@@ -707,7 +1312,8 @@ enum PendingRpc {
     },
     Load {
         session_id: String,
-        after_load: Option<PendingSend>,
+        replay_epoch: u64,
+        generation: u64,
     },
     Prompt {
         session_id: String,
@@ -716,6 +1322,41 @@ enum PendingRpc {
     McpCatalog {
         session_id: String,
     },
+}
+
+/// 一个 scope 的唯一 cold-load；所有状态都只能由该 scope actor 线程访问。
+struct LoadFlight {
+    session_id: String,
+    owner_request_id: RequestId,
+    replay_epoch: u64,
+    /// Resume 当前立即回执，因此此列表只保留未来需要延迟结算的扩展位。
+    waiters: Vec<ReplySender>,
+    /// 标记至少一个 cold resume 已受理，失败时必须发 session-level 终止事件。
+    accepted_resume: bool,
+    pending_send: Option<PendingSend>,
+    deadline: Instant,
+    generation: u64,
+    state: LoadFlightState,
+}
+
+/// cold-load 的有限状态；Terminal 只在结算期间存在，之后从 actor 槽位移除。
+enum LoadFlightState {
+    Created,
+    AcpWritten,
+    Terminal,
+}
+
+/// load 结算原因；只用于 actor 内部 exactly-once 防护和脱敏日志。
+#[derive(Clone, Copy, Debug)]
+enum LoadOutcome {
+    Success,
+    /// ACP 明确返回 session-not-found，其它错误不得落入此类。
+    SessionNotFound,
+    LoadError,
+    Timeout,
+    Cancelled,
+    TransportDeath,
+    ScopeDead,
 }
 
 /// 自动 cold-load 完成后才可写入的 Send；其 reply 必须留到真实 prompt 写成功。
@@ -730,6 +1371,81 @@ struct PendingSend {
 struct PendingCatalog {
     request_id: RequestId,
     deadline: Instant,
+}
+
+/// 尚未成功运输到产品层的 terminal event；重试必须复用原 event_id 与 sequence。
+struct PendingTerminalEvent {
+    event: KitProductEvent,
+    retain: bool,
+    next_attempt: Instant,
+}
+
+/// sequence 暂时无法分配时保留的 terminal 意图；成功分配后才生成稳定 event identity。
+struct PendingTerminalIntent {
+    code: String,
+    message: String,
+}
+
+/// actor 退出后仍需运输的 terminal event 的稳定幂等键。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TerminalOutboxKey {
+    scope_id: String,
+    session_id: String,
+    submission_id: String,
+}
+
+/// 进程内 terminal outbox；它只延长 actor 退出后的内存生命周期，不提供持久化保证。
+#[derive(Default)]
+struct TerminalOutbox {
+    pending: BTreeMap<TerminalOutboxKey, PendingTerminalEvent>,
+}
+
+impl TerminalOutbox {
+    /// 按 scope/session/submission 接管终态，重复键保留最早的稳定 event identity。
+    fn insert(&mut self, pending: PendingTerminalEvent) -> bool {
+        let Some(submission_id) = pending.event.submission_id.as_deref() else {
+            tracing::error!("无法为缺少 submission_id 的 terminal event 建立 outbox 键");
+            return false;
+        };
+        let key = TerminalOutboxKey {
+            scope_id: pending.event.scope_id.clone(),
+            session_id: pending.event.session_id.clone(),
+            submission_id: submission_id.to_string(),
+        };
+        self.pending.entry(key).or_insert(pending);
+        true
+    }
+
+    /// 在 cleanup/restart 边界立即尝试所有 outbox 项，失败项保留并等待下一次边界。
+    fn retry_now(&mut self, sink: &dyn KitEventSink) -> BTreeSet<String> {
+        let now = Instant::now();
+        for pending in self.pending.values_mut() {
+            pending.next_attempt = now;
+        }
+        let ready = self.pending.keys().cloned().collect::<Vec<_>>();
+        let mut delivered_scopes = BTreeSet::new();
+        for key in ready {
+            let Some(mut pending) = self.pending.remove(&key) else {
+                continue;
+            };
+            if sink.emit(pending.event.clone()).is_ok() {
+                delivered_scopes.insert(key.scope_id);
+            } else {
+                pending.next_attempt = Instant::now() + TERMINAL_RETRY_DELAY;
+                tracing::debug!(scope = %key.scope_id, "Host terminal outbox 运输失败，将在后续 cleanup 边界重试");
+                self.pending.insert(key, pending);
+            }
+        }
+        delivered_scopes
+    }
+
+    /// 返回仍有 pending event 的 scope，用于决定是否可以清除旧 actor 的 terminal 失败标记。
+    fn pending_scopes(&self) -> BTreeSet<String> {
+        self.pending
+            .keys()
+            .map(|key| key.scope_id.clone())
+            .collect()
+    }
 }
 
 /// 已写 prompt 的回合状态；cancel 不得抢先清掉它。
@@ -747,9 +1463,23 @@ struct ScopeActor {
     sink: Arc<dyn KitEventSink>,
     receiver: Receiver<ActorCommand>,
     accepting: Arc<AtomicBool>,
+    /// 与 ActorHandle 共用的退出意图；必须和 accepting 在同一提交门下发布。
+    exit_intent: Arc<AtomicBool>,
+    /// 与 ActorHandle 共用的提交门；退出意图必须和迟到 command 原子排序。
+    submission_lock: Arc<Mutex<()>>,
+    /// 已成功入队但尚未被 actor 取出的 command 数；idle 关闭也必须观察它。
+    queued_commands: Arc<AtomicUsize>,
+    /// MCP 安全违例后的永久 tombstone；普通命令不得自动创建新 generation。
+    restart_blocked: Arc<AtomicBool>,
+    /// 与 ActorHandle 共用的 cleanup 结果；restart 不能忽略 actor 内部失败。
+    cleanup_result: Arc<Mutex<CleanupResult>>,
+    /// Supervisor 为该 sidecar 分配的代次；load response 必须匹配该代次。
+    generation: u64,
     idle_after: Duration,
     /// 每个 actor 复制一份 catalog deadline，避免测试 seam 触碰生产全局常量。
     mcp_catalog_timeout: Duration,
+    /// 每个 actor 复制一份 load deadline，生产值固定为 60 秒。
+    load_timeout: Duration,
     expected_tools: BTreeSet<String>,
     projector: Projector,
     initialized: bool,
@@ -759,15 +1489,33 @@ struct ScopeActor {
     pending: BTreeMap<RequestId, PendingRpc>,
     active_sessions: BTreeSet<String>,
     current_session: Option<String>,
-    loading_sessions: BTreeSet<String>,
+    /// 同一 scope 同时最多一个 cold load；其 epoch 与 ACP owner 一起校验。
+    load_flight: Option<LoadFlight>,
+    next_replay_epoch: u64,
     in_flight: BTreeMap<String, InFlightTurn>,
     cancel_requested: BTreeSet<String>,
     catalog_pending: BTreeMap<String, PendingCatalog>,
-    catalog_waiting: BTreeMap<String, VecDeque<ActorCommand>>,
-    buffers: BTreeMap<String, Vec<KitProductEvent>>,
+    /// 终态运输失败时保留固定 event，直到成功或 cleanup fail-closed。
+    pending_terminal_events: BTreeMap<(String, String), PendingTerminalEvent>,
+    /// sequence 暂时耗尽时保留 terminal 意图，避免终态随一次分配失败丢失。
+    pending_terminal_intents: BTreeMap<(String, String), PendingTerminalIntent>,
+    /// actor 退出时接管未成功运输的终态，避免 actor-local pending 随线程一起丢失。
+    terminal_outbox: Arc<Mutex<TerminalOutbox>>,
+    /// 只保存可恢复 transcript；replay/control/fence 事件不进入此结构。
+    transcript: BTreeMap<String, Vec<KitProductEvent>>,
+    /// 当前 catalog 失败状态；hot resume 时按状态重建 mcp_failed。
+    mcp_failed_sessions: BTreeSet<String>,
     terminal_turns: BTreeSet<(String, String)>,
     last_activity: Instant,
     dead: bool,
+    /// 显式 shutdown 已完成；run loop 必须在回执后退出而不是继续消费命令。
+    exit_requested: bool,
+    /// AcpRuntime shutdown 步骤已成功完成；失败时后续 cleanup 必须重试。
+    acp_shutdown_done: bool,
+    /// Supervisor scope stop 步骤已成功完成；失败时后续 cleanup 必须重试。
+    scope_stop_done: bool,
+    /// 仅当所有资源 cleanup 步骤都成功后置位，避免重复关闭已完成步骤。
+    cleanup_done: bool,
 }
 
 impl ScopeActor {
@@ -781,8 +1529,16 @@ impl ScopeActor {
         sink: Arc<dyn KitEventSink>,
         receiver: Receiver<ActorCommand>,
         accepting: Arc<AtomicBool>,
+        exit_intent: Arc<AtomicBool>,
+        submission_lock: Arc<Mutex<()>>,
+        queued_commands: Arc<AtomicUsize>,
+        restart_blocked: Arc<AtomicBool>,
+        cleanup_result: Arc<Mutex<CleanupResult>>,
+        terminal_outbox: Arc<Mutex<TerminalOutbox>>,
+        generation: u64,
         idle_after: Duration,
         mcp_catalog_timeout: Duration,
+        load_timeout: Duration,
         approved: ApprovedMcpSpec,
     ) -> Self {
         Self {
@@ -794,8 +1550,16 @@ impl ScopeActor {
             sink,
             receiver,
             accepting,
+            exit_intent,
+            submission_lock,
+            queued_commands,
+            restart_blocked,
+            cleanup_result,
+            terminal_outbox,
+            generation,
             idle_after,
             mcp_catalog_timeout,
+            load_timeout,
             expected_tools: approved.expected_tools().clone(),
             initialized: false,
             initialize_id: None,
@@ -804,33 +1568,51 @@ impl ScopeActor {
             pending: BTreeMap::new(),
             active_sessions: BTreeSet::new(),
             current_session: None,
-            loading_sessions: BTreeSet::new(),
+            load_flight: None,
+            next_replay_epoch: 0,
             in_flight: BTreeMap::new(),
             cancel_requested: BTreeSet::new(),
             catalog_pending: BTreeMap::new(),
-            catalog_waiting: BTreeMap::new(),
-            buffers: BTreeMap::new(),
+            pending_terminal_events: BTreeMap::new(),
+            pending_terminal_intents: BTreeMap::new(),
+            transcript: BTreeMap::new(),
+            mcp_failed_sessions: BTreeSet::new(),
             terminal_turns: BTreeSet::new(),
             last_activity: Instant::now(),
             dead: false,
+            exit_requested: false,
+            acp_shutdown_done: false,
+            scope_stop_done: false,
+            cleanup_done: false,
         }
     }
 
     /// actor 主循环：优先消费 stdout，再以短 tick 接收 Kit 命令和 idle 截止。
-    fn run(mut self) {
+    fn run(&mut self) {
         if let Err(error) = self.begin_initialize() {
             self.enter_dead(error);
         }
 
         loop {
+            self.retry_pending_terminal_events();
+            if self.exit_requested {
+                return;
+            }
             if self.dead {
                 match self.receiver.recv_timeout(ACTOR_TICK) {
-                    Ok(ActorCommand::Shutdown { reply }) => {
-                        self.shutdown_and_exit();
-                        let _ = reply.send(());
-                        return;
+                    Ok(command) => {
+                        self.queued_commands.fetch_sub(1, Ordering::AcqRel);
+                        match command {
+                            ActorCommand::Shutdown { attempt } => {
+                                let cleanup = self.shutdown_and_exit();
+                                attempt.complete(cleanup);
+                                if self.exit_requested {
+                                    return;
+                                }
+                            }
+                            command => self.reject_dead_command(command),
+                        }
                     }
-                    Ok(command) => self.reject_dead_command(command),
                     Err(RecvTimeoutError::Timeout) => continue,
                     Err(RecvTimeoutError::Disconnected) => {
                         self.shutdown_and_exit();
@@ -847,24 +1629,36 @@ impl ScopeActor {
                 self.enter_dead(sidecar_unavailable("sidecar initialize 超时"));
                 continue;
             }
+            self.expire_load_flight();
+            if self.dead {
+                continue;
+            }
             self.expire_mcp_catalogs();
             if self.dead {
                 continue;
             }
-            if self.should_idle_stop() {
-                self.idle_stop_and_exit();
+            if self.try_idle_stop_and_exit() {
                 return;
             }
 
             match self.receiver.recv_timeout(ACTOR_TICK) {
-                Ok(ActorCommand::Shutdown { reply }) => {
-                    self.shutdown_and_exit();
-                    let _ = reply.send(());
-                    return;
-                }
                 Ok(command) => {
-                    self.last_activity = Instant::now();
-                    self.handle_command(command);
+                    self.queued_commands.fetch_sub(1, Ordering::AcqRel);
+                    match command {
+                        ActorCommand::Shutdown { attempt } => {
+                            let cleanup = self.shutdown_and_exit();
+                            attempt.complete(cleanup);
+                            if self.exit_requested {
+                                return;
+                            }
+                        }
+                        command => {
+                            self.last_activity = Instant::now();
+                            if self.handle_command(command) {
+                                return;
+                            }
+                        }
+                    }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
@@ -883,8 +1677,11 @@ impl ScopeActor {
                 "initialize",
                 json!({
                     "protocolVersion": HOST_ACP_PROTOCOL_VERSION,
-                    "client": { "name": "efflab-agent-host", "mcpServers": [] },
-                    "capabilities": { "terminal": false, "fs": false },
+                    "clientCapabilities": {
+                        "fs": { "readTextFile": false, "writeTextFile": false },
+                        "terminal": false,
+                    },
+                    "clientInfo": { "name": "efflab-agent-host", "version": env!("CARGO_PKG_VERSION") },
                 }),
                 &self.policy,
             )
@@ -893,11 +1690,29 @@ impl ScopeActor {
         Ok(())
     }
 
-    /// 清空已到达的 stdout 项；reader 本身独立运行，command 等待不会吞掉 notification。
+    /// 有界清空已到达的 stdout 项；达到预算后让出机会给 Cancel/Shutdown 命令。
     fn drain_inbound(&mut self) -> bool {
-        loop {
+        for _ in 0..MAX_INBOUND_DRAIN {
+            // 每次取队列前推进 deadline，过期后立即退休 transport，避免继续消费旧 replay。
+            self.expire_load_flight();
+            if self.dead {
+                return false;
+            }
+            self.expire_mcp_catalogs();
+            if self.dead {
+                return false;
+            }
             match self.acp.poll_inbound() {
                 Ok(Some(inbound)) => {
+                    // poll 与实际处理之间也可能跨过 deadline；此项防止 queued item 越界。
+                    self.expire_load_flight();
+                    if self.dead {
+                        return false;
+                    }
+                    self.expire_mcp_catalogs();
+                    if self.dead {
+                        return false;
+                    }
                     self.last_activity = Instant::now();
                     self.handle_inbound(inbound);
                     if self.dead {
@@ -906,15 +1721,24 @@ impl ScopeActor {
                 }
                 Ok(None) => return true,
                 Err(_) => {
+                    // transport 终止时统一结算 load、active turn 和其它 pending。
+                    self.finish_transport_death();
                     self.enter_dead(sidecar_unavailable("sidecar stdio 已终止"));
                     return false;
                 }
             }
         }
+        // 下一轮先经过 recv_timeout；命令通道与 stdout 队列相互独立，控制命令因此可达。
+        true
     }
 
     /// 路由 response、notification 和 reverse request，绝不把 ACP payload 直出产品层。
     fn handle_inbound(&mut self, inbound: Inbound) {
+        // 该边界同时覆盖未来新增的入站类型，避免调用方绕过 load deadline 门禁。
+        self.expire_load_flight();
+        if self.dead {
+            return;
+        }
         match inbound {
             Inbound::Response { id, result } => self.handle_response(id, result),
             Inbound::Notification { method, params } => self.handle_notification(&method, &params),
@@ -929,15 +1753,30 @@ impl ScopeActor {
         if self.initialize_id == Some(id) {
             self.initialize_id = None;
             match result {
-                Ok(_) => {
+                Ok(result) if validate_initialize_result(&result) => {
+                    tracing::debug!(
+                        scope = %self.scope_id,
+                        event = "sidecar_initialize_validated",
+                        "sidecar initialize handshake 已通过最小 ACP 闭集校验"
+                    );
                     self.initialized = true;
                     // 初始化完成后按原顺序执行调用方已经提交的命令。
                     while let Some(command) = self.deferred.pop_front() {
-                        self.handle_command(command);
+                        if self.handle_command(command) {
+                            return;
+                        }
                         if self.dead {
                             return;
                         }
                     }
+                }
+                Ok(_) => {
+                    tracing::debug!(
+                        scope = %self.scope_id,
+                        event = "sidecar_initialize_rejected",
+                        "sidecar initialize result 不符合 ACP 能力、认证或 Efflab metadata 闭集"
+                    );
+                    self.enter_dead(sidecar_unavailable("sidecar initialize 握手不受支持"));
                 }
                 Err(_) => self.enter_dead(sidecar_unavailable("sidecar initialize 被拒绝")),
             }
@@ -953,8 +1792,9 @@ impl ScopeActor {
             PendingRpc::ListSessions { reply } => self.finish_list_sessions(reply, result),
             PendingRpc::Load {
                 session_id,
-                after_load,
-            } => self.finish_load(session_id, after_load, result),
+                replay_epoch,
+                generation,
+            } => self.finish_load(id, session_id, replay_epoch, generation, result),
             PendingRpc::Prompt {
                 session_id,
                 submission_id,
@@ -963,8 +1803,35 @@ impl ScopeActor {
         }
     }
 
-    /// 投影标准 session/update；坏的单条 update 只记为不可用事件，不中断 stdio。
+    /// 投影标准 session/update；live 按 sessionId 归属，replay 只接受当前 load flight，未知控制事件不进入产品层。
     fn handle_notification(&mut self, method: &str, params: &Value) {
+        // notification 也必须在投影前推进 deadline，避免排队 replay 越过 load 边界。
+        self.expire_load_flight();
+        if self.dead {
+            return;
+        }
+        let is_replay = params
+            .get("_meta")
+            .and_then(Value::as_object)
+            .and_then(|meta| meta.get("isReplay"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        let session_id = params.get("sessionId").and_then(Value::as_str);
+        if is_replay
+            && !session_id.is_some_and(|session_id| {
+                self.load_flight.as_ref().is_some_and(|flight| {
+                    flight.session_id == session_id
+                        && matches!(
+                            flight.state,
+                            LoadFlightState::Created | LoadFlightState::AcpWritten
+                        )
+                })
+            })
+        {
+            // 没有当前 load flight 的 replay 是超时、旧 generation 或已完成 load 的迟到包。
+            tracing::debug!(scope = %self.scope_id, "已丢弃不属于当前 load epoch 的 replay notification");
+            return;
+        }
         match self.projector.apply_acp_notification(method, params) {
             Ok(events) => {
                 for event in events {
@@ -977,7 +1844,16 @@ impl ScopeActor {
                     {
                         continue;
                     }
-                    self.emit_event(event, true);
+                    // Projector 可能兼容旧诊断，但 Host 的产品输出只允许 transcript 白名单。
+                    if !is_recoverable_product_event(&event)
+                        && !matches!(&event.block, KitBlock::Status { code, .. } if code == "mcp_failed")
+                    {
+                        tracing::debug!(scope = %self.scope_id, "已内部化不支持的 ACP product event");
+                        continue;
+                    }
+                    // 冷 replay 只投影到当前事件流；仅 live 事件进入可供 hot resume 的 transcript。
+                    let retain = event.origin == Origin::Live;
+                    self.emit_event(event, retain);
                 }
             }
             Err(_) => {
@@ -1033,16 +1909,27 @@ impl ScopeActor {
                 .or(self.current_session.as_deref())
                 .unwrap_or("sidecar-session")
                 .to_string();
-            let _ = self.acp.reply_validated(
-                id,
-                ValidatedReply::Result(json!({ "outcome": { "outcome": "cancelled" } })),
-                &self.policy,
-            );
-            self.emit_session_status(
-                &session_id,
-                "skipped_update",
-                "已拒绝不支持的 sidecar 反向请求",
-                Origin::Live,
+            if self
+                .acp
+                .reply_validated(
+                    id,
+                    ValidatedReply::Result(json!({ "outcome": { "outcome": "cancelled" } })),
+                    &self.policy,
+                )
+                .is_err()
+            {
+                tracing::debug!(
+                    scope = %self.scope_id,
+                    session = %session_id,
+                    "无法回复不支持的 sidecar 反向请求"
+                );
+                self.enter_dead(sidecar_unavailable("无法回复不支持的 sidecar 反向请求"));
+                return;
+            }
+            tracing::debug!(
+                scope = %self.scope_id,
+                session = %session_id,
+                "已拒绝不支持的 sidecar 反向请求"
             );
             return;
         }
@@ -1063,25 +1950,31 @@ impl ScopeActor {
         }
     }
 
-    /// 命令在 initialize 前排队，初始化成功后按到达顺序恢复。
-    fn handle_command(&mut self, command: ActorCommand) {
+    /// 命令在 initialize 前排队，初始化成功后按到达顺序恢复；返回 true 表示 actor 应退出。
+    fn handle_command(&mut self, command: ActorCommand) -> bool {
         match command {
-            ActorCommand::AbandonSend {
-                session_id,
-                submission_id,
-            } => self.abandon_catalog_waiter(&session_id, &submission_id),
+            ActorCommand::Shutdown { attempt } => {
+                let cleanup = self.shutdown_and_exit();
+                attempt.complete(cleanup);
+                self.exit_requested
+            }
             command => {
                 if !self.initialized {
                     self.deferred.push_back(command);
-                    return;
+                    return false;
                 }
                 match command {
-                    ActorCommand::NewSession { reply } => self.start_new_session(reply),
+                    ActorCommand::NewSession { reply } => {
+                        self.start_new_session(reply);
+                        false
+                    }
                     ActorCommand::ListSessions { cursor, reply } => {
-                        self.start_list_sessions(cursor, reply)
+                        self.start_list_sessions(cursor, reply);
+                        false
                     }
                     ActorCommand::ResumeSession { session_id, reply } => {
-                        self.resume_session(session_id, reply)
+                        self.resume_session(session_id, reply);
+                        false
                     }
                     ActorCommand::Send {
                         session_id,
@@ -1089,14 +1982,18 @@ impl ScopeActor {
                         text,
                         ticket,
                         reply,
-                    } => self.send_prompt(session_id, submission_id, text, ticket, reply),
-                    ActorCommand::AbandonSend { .. } => {}
-                    ActorCommand::Cancel { session_id, reply } => {
-                        self.cancel_session(session_id, reply)
+                    } => {
+                        self.send_prompt(session_id, submission_id, text, ticket, reply);
+                        false
                     }
-                    ActorCommand::Shutdown { reply } => {
-                        self.shutdown_and_exit();
-                        let _ = reply.send(());
+                    ActorCommand::Cancel { session_id, reply } => {
+                        self.cancel_session(session_id, reply);
+                        false
+                    }
+                    ActorCommand::Shutdown { attempt } => {
+                        let cleanup = self.shutdown_and_exit();
+                        attempt.complete(cleanup);
+                        self.exit_requested
                     }
                 }
             }
@@ -1155,8 +2052,25 @@ impl ScopeActor {
         }
     }
 
-    /// 热 resume 重放内存；冷 resume 写 load 后立刻 accepted，结果走事件栅栏。
+    /// 热 resume 重放 transcript；冷 resume 复用 actor 唯一 LoadFlight 并立即 accepted。
     fn resume_session(&mut self, session_id: String, reply: ReplySender) {
+        if let Some(flight) = self.load_flight.as_ref() {
+            if flight.session_id != session_id {
+                let _ = reply.send(Err(KitError::non_retryable(
+                    "session_busy",
+                    "当前 scope 正在恢复其它会话",
+                )));
+                return;
+            }
+            if matches!(
+                flight.state,
+                LoadFlightState::Created | LoadFlightState::AcpWritten
+            ) {
+                // waiter 只在 actor 内短暂保存，随后立即排空，保持 resume 不等待 load result。
+                self.accept_load_resume(&session_id, reply);
+                return;
+            }
+        }
         if !self.in_flight.is_empty() {
             // Prompting 时仅允许恢复同一 active session；其它 active 或冷会话均不得绕过 busy 门。
             if self.in_flight.contains_key(&session_id)
@@ -1186,16 +2100,28 @@ impl ScopeActor {
             return;
         }
         match self.start_load(&session_id, None) {
-            Ok(()) => {
-                let _ = reply.send(Ok(KitReply::ResumeSession {
-                    accepted: true,
-                    session_id,
-                }));
-            }
+            Ok(()) => self.accept_load_resume(&session_id, reply),
             Err(error) => {
                 let _ = reply.send(Err(error.clone()));
                 self.enter_dead(error);
             }
+        }
+    }
+
+    /// 将 resume waiter 立即排空为 accepted；不把同步回执绑定到 load result。
+    fn accept_load_resume(&mut self, session_id: &str, reply: ReplySender) {
+        let Some(flight) = self.load_flight.as_mut() else {
+            let _ = reply.send(Err(sidecar_unavailable("会话恢复状态已结束")));
+            return;
+        };
+        flight.accepted_resume = true;
+        flight.waiters.push(reply);
+        let waiters = std::mem::take(&mut flight.waiters);
+        for waiter in waiters {
+            let _ = waiter.send(Ok(KitReply::ResumeSession {
+                accepted: true,
+                session_id: session_id.to_string(),
+            }));
         }
     }
 
@@ -1212,7 +2138,8 @@ impl ScopeActor {
         if ticket.is_abandoned() {
             return;
         }
-        if self.in_flight.contains_key(&session_id) || self.loading_sessions.contains(&session_id) {
+        if self.in_flight.contains_key(&session_id) || self.load_flight.is_some() {
+            ticket.mark_not_written();
             let _ = reply.send(Err(KitError::non_retryable(
                 "turn_in_progress",
                 "该会话已有正在处理的回合",
@@ -1222,6 +2149,7 @@ impl ScopeActor {
         if !self.active_sessions.contains(&session_id) {
             // start_load 失败前不会接管外部 reply，因此保留一份 sender 立即回绝调用方。
             let error_reply = reply.clone();
+            let pending_ticket = ticket.clone();
             let pending = PendingSend {
                 submission_id,
                 text,
@@ -1230,24 +2158,13 @@ impl ScopeActor {
             };
             if let Err(error) = self.start_load(&session_id, Some(pending)) {
                 // start_load 尚未写 prompt，调用方可安全将 SubmissionMap 回滚。
+                pending_ticket.mark_not_written();
                 let _ = error_reply.send(Err(error.clone()));
                 self.enter_dead(error);
             }
             return;
         }
-        if self.catalog_pending.contains_key(&session_id) {
-            self.catalog_waiting
-                .entry(session_id.clone())
-                .or_default()
-                .push_back(ActorCommand::Send {
-                    session_id: session_id.clone(),
-                    submission_id,
-                    text,
-                    ticket,
-                    reply,
-                });
-            return;
-        }
+        // MCP catalog 只是能力探测；无论探测是否完成，基本聊天都必须继续可用。
         self.write_prompt(session_id, submission_id, text, ticket, reply);
     }
 
@@ -1262,9 +2179,14 @@ impl ScopeActor {
     ) {
         // 与调用方 timeout 竞争时，只有抢到票据的 actor 可以进入 prompt 写入路径。
         if !ticket.claim_for_prompt() {
+            if !ticket.is_abandoned() {
+                ticket.mark_not_written();
+                let _ = reply.send(Err(sidecar_unavailable("Send 写入权已失效")));
+            }
             return;
         }
         if self.cancel_requested.remove(&session_id) {
+            ticket.mark_not_written();
             self.emit_turn_status(&session_id, &submission_id, "cancelled", "回合已取消");
             let _ = reply.send(Ok(send_reply(&session_id, &submission_id, false)));
             return;
@@ -1276,9 +2198,10 @@ impl ScopeActor {
         });
         match self
             .acp
-            .request_validated("session/prompt", params, &self.policy)
+            .request_validated_with_outcome("session/prompt", params, &self.policy)
         {
             Ok(id) => {
+                ticket.mark_written();
                 self.in_flight.insert(
                     session_id.clone(),
                     InFlightTurn {
@@ -1296,14 +2219,30 @@ impl ScopeActor {
                 // Send 只等 stdin 写入；绝不等 session/prompt JSON-RPC result。
                 let _ = reply.send(Ok(send_reply(&session_id, &submission_id, false)));
             }
-            Err(_) => {
+            Err(RequestWriteFailure::NotWritten(_)) => {
+                ticket.mark_not_written();
+                tracing::debug!(
+                    scope = %self.scope_id,
+                    session = %session_id,
+                    "session/prompt 在写入前失败"
+                );
                 let _ = reply.send(Err(sidecar_unavailable("无法写入 session/prompt")));
+                self.enter_dead(sidecar_unavailable("sidecar stdin 不可用"));
+            }
+            Err(RequestWriteFailure::MayHaveBeenWritten(_)) => {
+                ticket.mark_may_have_been_written();
+                tracing::debug!(
+                    scope = %self.scope_id,
+                    session = %session_id,
+                    "session/prompt 写入结局无法确认"
+                );
+                let _ = reply.send(Err(sidecar_unavailable("无法确认 session/prompt 是否写入")));
                 self.enter_dead(sidecar_unavailable("sidecar stdin 不可用"));
             }
         }
     }
 
-    /// cancel 始终写无 id notification；无 in-flight 时记录一次 pre-cancel 供下一 Send 消费。
+    /// cancel 始终写无 id notification；cold load 时直接终结绑定的 LoadFlight。
     fn cancel_session(&mut self, session_id: String, reply: ReplySender) {
         match self.acp.notify_validated(
             "session/cancel",
@@ -1311,16 +2250,52 @@ impl ScopeActor {
             &self.policy,
         ) {
             Ok(()) => {
-                // 只有通知已经写入 sidecar，才向本地状态和产品事件声明该回合已取消。
-                self.cancel_requested.insert(session_id.clone());
-                let cancelled_submission = self.in_flight.get_mut(&session_id).map(|in_flight| {
-                    in_flight.cancelled = true;
-                    in_flight.submission_id.clone()
+                let load_identity = self.load_flight.as_ref().and_then(|flight| {
+                    (flight.session_id == session_id
+                        && matches!(
+                            flight.state,
+                            LoadFlightState::Created | LoadFlightState::AcpWritten
+                        ))
+                    .then_some((
+                        flight.owner_request_id,
+                        flight.session_id.clone(),
+                        flight.replay_epoch,
+                        flight.generation,
+                    ))
                 });
                 // 先解除产品调用，再让同步 sink 投影取消状态，避免回执被事件运输阻塞。
                 let _ = reply.send(Ok(KitReply::Cancel { accepted: true }));
+                if let Some((owner_request_id, load_session_id, replay_epoch, generation)) =
+                    load_identity
+                {
+                    // 取消通知成功后立即结算同一 flight；旧 load response/replay 不能再污染后续 Send。
+                    let _ = self.finish_load_flight(
+                        owner_request_id,
+                        load_session_id,
+                        replay_epoch,
+                        generation,
+                        LoadOutcome::Cancelled,
+                    );
+                    self.enter_dead(sidecar_unavailable("sidecar load 已取消"));
+                    return;
+                }
+
+                // 只有通知已经写入 sidecar，才向本地状态和产品事件声明该回合已取消。
+                let cancelled_submission =
+                    self.in_flight.get_mut(&session_id).and_then(|in_flight| {
+                        if in_flight.cancelled {
+                            None
+                        } else {
+                            in_flight.cancelled = true;
+                            Some(in_flight.submission_id.clone())
+                        }
+                    });
                 if let Some(submission_id) = cancelled_submission {
+                    self.cancel_requested.insert(session_id.clone());
                     self.emit_turn_status(&session_id, &submission_id, "cancelled", "回合已取消");
+                } else if !self.in_flight.contains_key(&session_id) {
+                    // 无 active turn 的 Cancel 仍保留一次性 pre-cancel 合同；BTreeSet 去重 marker。
+                    self.cancel_requested.insert(session_id.clone());
                 }
             }
             Err(_) => {
@@ -1330,14 +2305,24 @@ impl ScopeActor {
         }
     }
 
-    /// 冷 load 在写入前建立 replay epoch；sidecar result 到达时才发 replay_complete。
+    /// 冷 load 只创建一个 scope-private flight，并在写入前建立新的 replay epoch。
     fn start_load(
         &mut self,
         session_id: &str,
-        after_load: Option<PendingSend>,
+        pending_send: Option<PendingSend>,
     ) -> Result<(), KitError> {
+        if self.load_flight.is_some() {
+            return Err(KitError::non_retryable(
+                "session_busy",
+                "当前 scope 已有正在进行的会话恢复",
+            ));
+        }
+        self.next_replay_epoch = self
+            .next_replay_epoch
+            .checked_add(1)
+            .ok_or_else(|| sidecar_unavailable("replay epoch 已耗尽"))?;
+        let replay_epoch = self.next_replay_epoch;
         self.current_session = Some(session_id.to_string());
-        self.loading_sessions.insert(session_id.to_string());
         self.projector.begin_replay(session_id);
         let params = json!({
             "sessionId": session_id,
@@ -1345,25 +2330,32 @@ impl ScopeActor {
             "mcpServers": [],
             "_meta": { "modelId": ACP_BYOK_MODEL_SLOT },
         });
-        match self
+        let id = self
             .acp
             .request_validated("session/load", params, &self.policy)
-        {
-            Ok(id) => {
-                self.pending.insert(
-                    id,
-                    PendingRpc::Load {
-                        session_id: session_id.to_string(),
-                        after_load,
-                    },
-                );
-                Ok(())
-            }
-            Err(_) => {
-                self.loading_sessions.remove(session_id);
-                Err(sidecar_unavailable("无法写入 session/load"))
-            }
-        }
+            .map_err(|_| sidecar_unavailable("无法写入 session/load"))?;
+        let mut flight = LoadFlight {
+            session_id: session_id.to_string(),
+            owner_request_id: id,
+            replay_epoch,
+            waiters: Vec::new(),
+            accepted_resume: false,
+            pending_send,
+            deadline: Instant::now() + self.load_timeout,
+            generation: self.generation,
+            state: LoadFlightState::Created,
+        };
+        self.pending.insert(
+            id,
+            PendingRpc::Load {
+                session_id: session_id.to_string(),
+                replay_epoch,
+                generation: self.generation,
+            },
+        );
+        flight.state = LoadFlightState::AcpWritten;
+        self.load_flight = Some(flight);
+        Ok(())
     }
 
     /// 解析 session/new response，随后启动 MCP catalog 观察但不把它变成对话硬阻塞。
@@ -1382,7 +2374,7 @@ impl ScopeActor {
         };
         self.active_sessions.insert(session_id.clone());
         self.current_session = Some(session_id.clone());
-        self.buffers.entry(session_id.clone()).or_default();
+        self.transcript.entry(session_id.clone()).or_default();
         self.start_mcp_catalog(&session_id);
         let _ = reply.send(Ok(KitReply::NewSession { session_id }));
     }
@@ -1429,37 +2421,221 @@ impl ScopeActor {
         }));
     }
 
-    /// load result 成功后先结束 replay 栅栏，再按需要继续自动 prompt。
+    /// 按当前 actor 的唯一 owner 结算 load；取走 flight 后后续 response 只能被丢弃。
+    fn finish_current_load(&mut self, outcome: LoadOutcome) -> bool {
+        let Some((owner_request_id, session_id, replay_epoch, generation)) =
+            self.load_flight.as_ref().map(|flight| {
+                (
+                    flight.owner_request_id,
+                    flight.session_id.clone(),
+                    flight.replay_epoch,
+                    flight.generation,
+                )
+            })
+        else {
+            return false;
+        };
+        self.finish_load_flight(
+            owner_request_id,
+            session_id,
+            replay_epoch,
+            generation,
+            outcome,
+        )
+    }
+
+    /// transport 终止时只结算当前 flight 一次，避免将 load 错误混同为普通 scope cleanup。
+    fn finish_transport_death(&mut self) {
+        let _ = self.finish_current_load(LoadOutcome::TransportDeath);
+    }
+
+    /// load response 只结算匹配的 owner/epoch/generation，并保证 flight exactly-once。
     fn finish_load(
         &mut self,
+        owner_request_id: RequestId,
         session_id: String,
-        after_load: Option<PendingSend>,
+        replay_epoch: u64,
+        generation: u64,
         result: Result<Value, RpcError>,
     ) {
-        self.loading_sessions.remove(&session_id);
-        if result.is_err() {
-            self.current_session = None;
-            if let Some(pending) = after_load {
-                let _ = pending.reply.send(Err(KitError::non_retryable(
-                    "session_not_found",
-                    "sidecar 无法加载指定会话",
-                )));
+        let timed_out = self.load_flight.as_ref().is_some_and(|flight| {
+            Self::load_flight_matches(
+                flight,
+                owner_request_id,
+                &session_id,
+                replay_epoch,
+                generation,
+            ) && flight.deadline <= Instant::now()
+        });
+        let outcome = if timed_out {
+            LoadOutcome::Timeout
+        } else {
+            match result {
+                Ok(_) => LoadOutcome::Success,
+                Err(error) if is_session_not_found(&error) => LoadOutcome::SessionNotFound,
+                Err(_) => LoadOutcome::LoadError,
             }
+        };
+        if self.finish_load_flight(
+            owner_request_id,
+            session_id,
+            replay_epoch,
+            generation,
+            outcome,
+        ) && should_retire_after_load(outcome)
+        {
+            // 失败 load 的 transport 不再承载同 session 新 flight，隔离没有 generation 的旧 replay。
+            self.enter_dead(sidecar_unavailable("sidecar load 失败，transport 已退休"));
+        }
+    }
+
+    /// 判断输入的 load metadata 是否仍对应当前 active flight。
+    fn load_flight_matches(
+        flight: &LoadFlight,
+        owner_request_id: RequestId,
+        session_id: &str,
+        replay_epoch: u64,
+        generation: u64,
+    ) -> bool {
+        flight.owner_request_id == owner_request_id
+            && flight.session_id == session_id
+            && flight.replay_epoch == replay_epoch
+            && flight.generation == generation
+            && matches!(
+                flight.state,
+                LoadFlightState::Created | LoadFlightState::AcpWritten
+            )
+    }
+
+    /// 超时、正常 response 和 transport 失败共用同一条 load 结算路径。
+    fn finish_load_flight(
+        &mut self,
+        owner_request_id: RequestId,
+        session_id: String,
+        replay_epoch: u64,
+        generation: u64,
+        outcome: LoadOutcome,
+    ) -> bool {
+        let matches_current = self.load_flight.as_ref().is_some_and(|flight| {
+            Self::load_flight_matches(
+                flight,
+                owner_request_id,
+                &session_id,
+                replay_epoch,
+                generation,
+            )
+        });
+        if !matches_current {
+            // 旧 epoch 或已进入 Terminal 的 response 不得再次改写当前会话状态。
+            tracing::debug!(
+                scope = %self.scope_id,
+                session = %session_id,
+                epoch = replay_epoch,
+                generation,
+                "已丢弃不匹配的 session/load 结算"
+            );
+            return false;
+        }
+        let Some(mut flight) = self.load_flight.take() else {
+            return false;
+        };
+        flight.state = LoadFlightState::Terminal;
+        self.pending.retain(|_, pending| {
+            !matches!(
+                pending,
+                PendingRpc::Load {
+                    session_id: pending_session,
+                    replay_epoch: pending_epoch,
+                    generation: pending_generation,
+                } if pending_session == &session_id
+                    && *pending_epoch == replay_epoch
+                    && *pending_generation == generation
+            )
+        });
+        tracing::debug!(
+            scope = %self.scope_id,
+            session = %session_id,
+            epoch = replay_epoch,
+            generation,
+            outcome = ?outcome,
+            accepted_resume = flight.accepted_resume,
+            "session/load flight 已结算"
+        );
+        match outcome {
+            LoadOutcome::Success => {
+                self.active_sessions.insert(session_id.clone());
+                self.current_session = Some(session_id.clone());
+                self.transcript.entry(session_id.clone()).or_default();
+                // Projector 的旧跳过计数只用于结束内部 replay 栅栏，不转成产品事件。
+                let _ = self.projector.take_replay_skipped_count(&session_id);
+                self.finish_replay(&session_id);
+                self.start_mcp_catalog(&session_id);
+                if let Some(pending) = flight.pending_send {
+                    self.send_prompt(
+                        session_id,
+                        pending.submission_id,
+                        pending.text,
+                        pending.ticket,
+                        pending.reply,
+                    );
+                }
+            }
+            LoadOutcome::SessionNotFound
+            | LoadOutcome::LoadError
+            | LoadOutcome::Timeout
+            | LoadOutcome::Cancelled
+            | LoadOutcome::TransportDeath
+            | LoadOutcome::ScopeDead => {
+                self.current_session = None;
+                // 失败 flight 的取消意图只属于本次 flight，不能污染后续独立 Send。
+                self.cancel_requested.remove(&session_id);
+                let error = load_outcome_error(outcome);
+                if flight.accepted_resume {
+                    // Resume 已经 accepted，后续必须给产品一次可观察的 session-level 终止事件。
+                    self.emit_session_error(&session_id, error.clone());
+                }
+                for waiter in flight.waiters {
+                    let _ = waiter.send(Err(error.clone()));
+                }
+                if let Some(pending) = flight.pending_send {
+                    // load 失败发生在 prompt 写入前，保留 Abandoned 终态，否则标记可安全重试。
+                    pending.ticket.mark_not_written();
+                    let _ = pending.reply.send(Err(error));
+                }
+            }
+        }
+        true
+    }
+
+    /// load deadline 到期时撤销 ACP owner 与 actor pending，确保迟到 response 只能被丢弃。
+    fn expire_load_flight(&mut self) {
+        let Some(flight) = self.load_flight.as_ref() else {
+            return;
+        };
+        if !matches!(
+            flight.state,
+            LoadFlightState::Created | LoadFlightState::AcpWritten
+        ) || flight.deadline > Instant::now()
+        {
             return;
         }
-        self.active_sessions.insert(session_id.clone());
-        self.current_session = Some(session_id.clone());
-        self.buffers.entry(session_id.clone()).or_default();
-        self.finish_replay(&session_id);
-        self.start_mcp_catalog(&session_id);
-        if let Some(pending) = after_load {
-            self.send_prompt(
-                session_id,
-                pending.submission_id,
-                pending.text,
-                pending.ticket,
-                pending.reply,
-            );
+        let request_id = flight.owner_request_id;
+        let session_id = flight.session_id.clone();
+        let replay_epoch = flight.replay_epoch;
+        let generation = flight.generation;
+        if self.acp.revoke_outbound_request(request_id).is_err() {
+            self.enter_dead(sidecar_unavailable("无法撤销超时 session/load 请求"));
+            return;
+        }
+        if self.finish_load_flight(
+            request_id,
+            session_id,
+            replay_epoch,
+            generation,
+            LoadOutcome::Timeout,
+        ) {
+            // deadline 到期后退休整个 actor，避免没有 generation 的旧 replay 进入新 flight。
+            self.enter_dead(sidecar_unavailable("session/load 已超时，transport 已退休"));
         }
     }
 
@@ -1470,10 +2646,12 @@ impl ScopeActor {
         submission_id: String,
         result: Result<Value, RpcError>,
     ) {
-        let in_flight = self.in_flight.remove(&session_id);
+        let Some(in_flight) = self.in_flight.remove(&session_id) else {
+            // transport cleanup 已经移除该 turn 时，迟到 response 不能制造第二个终态。
+            return;
+        };
         self.cancel_requested.remove(&session_id);
-        let cancelled = in_flight.is_some_and(|turn| turn.cancelled);
-        if cancelled {
+        if in_flight.cancelled {
             return;
         }
         match result {
@@ -1500,31 +2678,43 @@ impl ScopeActor {
             Ok(tools) => {
                 if tools.iter().any(|tool| !self.is_approved_tool(tool)) {
                     tracing::debug!(scope = %self.scope_id, "MCP catalog 包含未批准工具，已终止 sidecar");
+                    // 安全违例不是普通 transport dead；在显式 Channel 换代前永久保留 tombstone。
+                    self.restart_blocked.store(true, Ordering::Release);
                     self.enter_dead(sidecar_unavailable("MCP catalog 包含未批准工具"));
                     return;
                 }
                 if !self.expected_tools.is_empty() && !self.expected_tools.is_subset(&tools) {
+                    self.mcp_failed_sessions.insert(session_id.clone());
                     self.emit_session_status(
                         &session_id,
                         "mcp_failed",
                         "部分已批准 MCP 工具未就绪",
                         Origin::Live,
                     );
+                } else {
+                    self.mcp_failed_sessions.remove(&session_id);
                 }
             }
-            Err(_) if !self.expected_tools.is_empty() => self.emit_session_status(
-                &session_id,
-                "mcp_failed",
-                "无法确认已批准 MCP 工具状态",
-                Origin::Live,
-            ),
-            Err(_) => {}
+            Err(_) if !self.expected_tools.is_empty() => {
+                self.mcp_failed_sessions.insert(session_id.clone());
+                self.emit_session_status(
+                    &session_id,
+                    "mcp_failed",
+                    "无法确认已批准 MCP 工具状态",
+                    Origin::Live,
+                );
+            }
+            Err(_) => {
+                self.mcp_failed_sessions.remove(&session_id);
+            }
         }
-        self.release_catalog_waiters(&session_id);
     }
 
-    /// 请求每个新/冷恢复会话的 catalog；空批准集的失败只是观察失败而非聊天阻塞。
+    /// 请求每个新/冷恢复会话的 catalog；空批准集不启动可选能力探测。
     fn start_mcp_catalog(&mut self, session_id: &str) {
+        if self.expected_tools.is_empty() {
+            return;
+        }
         let params = json!({ "sessionId": session_id });
         match self
             .acp
@@ -1589,43 +2779,9 @@ impl ScopeActor {
         }
     }
 
-    /// catalog 完成后恢复被 gate 的 Send；每条仍重新检查 turn/cancel 状态。
-    fn release_catalog_waiters(&mut self, session_id: &str) {
-        let mut waiting = self.catalog_waiting.remove(session_id).unwrap_or_default();
-        while let Some(command) = waiting.pop_front() {
-            self.handle_command(command);
-            if self.dead {
-                return;
-            }
-        }
-    }
-
-    /// caller timeout 后移除 catalog gate 中尚未获得 prompt 写入所有权的 Send。
-    fn abandon_catalog_waiter(&mut self, session_id: &str, submission_id: &str) {
-        let empty = match self.catalog_waiting.get_mut(session_id) {
-            Some(waiting) => {
-                waiting.retain(|command| {
-                    !matches!(
-                        command,
-                        ActorCommand::Send {
-                            session_id: queued_session,
-                            submission_id: queued_submission,
-                            ..
-                        } if queued_session == session_id && queued_submission == submission_id
-                    )
-                });
-                waiting.is_empty()
-            }
-            None => false,
-        };
-        if empty {
-            self.catalog_waiting.remove(session_id);
-        }
-    }
-
-    /// 热恢复不触碰 ACP；将内存快照转为 replay，流式助手块明确冻结。
+    /// 热恢复不触碰 ACP；只重放 transcript，并为每次调用新生成 replay fence。
     fn hot_resume(&mut self, session_id: &str) {
-        let snapshot = self.buffers.get(session_id).cloned().unwrap_or_default();
+        let snapshot = self.transcript.get(session_id).cloned().unwrap_or_default();
         let mut live_assistant = None;
         for mut event in snapshot {
             event.origin = Origin::Replay;
@@ -1641,6 +2797,15 @@ impl ScopeActor {
             "历史重放完成",
             Origin::Replay,
         );
+        if self.mcp_failed_sessions.contains(session_id) {
+            // mcp_failed 是当前状态，不从 transcript 重放；每次热恢复按状态重建一条 live 事件。
+            self.emit_session_status(
+                session_id,
+                "mcp_failed",
+                "已批准 MCP 工具仍未就绪",
+                Origin::Live,
+            );
+        }
         // Prompting 热恢复后补一张 live 快照，避免 UI 在 replay fence 后永久显示非流式。
         if self.in_flight.contains_key(session_id)
             && let Some(mut event) = live_assistant
@@ -1653,17 +2818,8 @@ impl ScopeActor {
         }
     }
 
-    /// 冷恢复的 replay fence：未知 update 只汇总一条 session 级状态。
+    /// 冷恢复的 replay fence；旧跳过诊断不再发送，fence 每次由当前调用新生成。
     fn finish_replay(&mut self, session_id: &str) {
-        let skipped = self.projector.take_replay_skipped_count(session_id);
-        if skipped > 0 {
-            self.emit_session_status(
-                session_id,
-                "replay_skipped",
-                &format!("已跳过 {skipped} 条不支持的历史更新"),
-                Origin::Replay,
-            );
-        }
         self.emit_session_status(
             session_id,
             "replay_complete",
@@ -1698,6 +2854,29 @@ impl ScopeActor {
         );
     }
 
+    /// 发送 session 级错误；它不伪造 turn 标识，也不进入可恢复 transcript。
+    fn emit_session_error(&mut self, session_id: &str, error: KitError) {
+        let Ok(sequence) = self.projector.next_host_sequence(session_id) else {
+            return;
+        };
+        let event_id = format!("{session_id}:host:{}:{sequence}", error.code);
+        self.emit_event(
+            KitProductEvent {
+                schema_version: KIT_SCHEMA_VERSION,
+                scope_id: self.scope_id.clone(),
+                session_id: session_id.to_string(),
+                turn_id: None,
+                submission_id: None,
+                event_id: event_id.clone(),
+                sequence,
+                origin: Origin::Live,
+                block_id: event_id,
+                block: KitBlock::Error(error),
+            },
+            false,
+        );
+    }
+
     /// 发送回合级终态；它必须携带真实 prompt/submission id，不能伪造 synthetic id。
     fn emit_turn_status(
         &mut self,
@@ -1706,51 +2885,230 @@ impl ScopeActor {
         code: &str,
         message: &str,
     ) {
-        let Ok(sequence) = self.projector.next_host_sequence(session_id) else {
+        let key = (session_id.to_string(), submission_id.to_string());
+        // Cancel、transport cleanup 与迟到 prompt response 共享此门，终态只能投影一次。
+        // 先检查而不提交 marker，避免 sequence 耗尽时把未生成的 terminal 永久吞掉。
+        if self.terminal_turns.contains(&key)
+            || self.pending_terminal_events.contains_key(&key)
+            || self.pending_terminal_intents.contains_key(&key)
+        {
             return;
+        }
+        let sequence = match self.projector.next_host_sequence(session_id) {
+            Ok(sequence) => sequence,
+            Err(_) => {
+                self.pending_terminal_intents.insert(
+                    key,
+                    PendingTerminalIntent {
+                        code: code.to_string(),
+                        message: message.to_string(),
+                    },
+                );
+                record_cleanup_failure(
+                    &self.cleanup_result,
+                    &self.scope_id,
+                    CleanupFailureKind::TerminalEvent,
+                );
+                return;
+            }
         };
+        self.terminal_turns.insert(key.clone());
         let event_id = format!("{session_id}:host:{code}:{sequence}");
-        self.terminal_turns
-            .insert((session_id.to_string(), submission_id.to_string()));
-        self.emit_event(
-            KitProductEvent {
-                schema_version: KIT_SCHEMA_VERSION,
-                scope_id: self.scope_id.clone(),
-                session_id: session_id.to_string(),
-                turn_id: Some(submission_id.to_string()),
-                submission_id: Some(submission_id.to_string()),
-                event_id: event_id.clone(),
-                sequence,
-                origin: Origin::Live,
-                block_id: event_id,
-                block: KitBlock::Status {
-                    code: code.to_string(),
-                    message: message.to_string(),
+        self.pending_terminal_events.insert(
+            key,
+            PendingTerminalEvent {
+                event: KitProductEvent {
+                    schema_version: KIT_SCHEMA_VERSION,
+                    scope_id: self.scope_id.clone(),
+                    session_id: session_id.to_string(),
+                    turn_id: Some(submission_id.to_string()),
+                    submission_id: Some(submission_id.to_string()),
+                    event_id: event_id.clone(),
+                    sequence,
+                    origin: Origin::Live,
+                    block_id: event_id,
+                    block: KitBlock::Status {
+                        code: code.to_string(),
+                        message: message.to_string(),
+                    },
                 },
+                retain: true,
+                next_attempt: Instant::now(),
             },
-            true,
+        );
+        self.retry_pending_terminal_events();
+    }
+
+    /// 将 sequence 暂时耗尽的 terminal 意图物化为稳定 event；失败时意图继续保留。
+    fn materialize_pending_terminal_intents(&mut self) {
+        let keys = self
+            .pending_terminal_intents
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            let Some(intent) = self.pending_terminal_intents.remove(&key) else {
+                continue;
+            };
+            if self.terminal_turns.contains(&key) || self.pending_terminal_events.contains_key(&key)
+            {
+                continue;
+            }
+            let session_id = key.0.clone();
+            let submission_id = key.1.clone();
+            let sequence = match self.projector.next_host_sequence(&session_id) {
+                Ok(sequence) => sequence,
+                Err(_) => {
+                    self.pending_terminal_intents.insert(key, intent);
+                    record_cleanup_failure(
+                        &self.cleanup_result,
+                        &self.scope_id,
+                        CleanupFailureKind::TerminalEvent,
+                    );
+                    continue;
+                }
+            };
+            let event_id = format!("{session_id}:host:{}:{sequence}", intent.code);
+            self.terminal_turns.insert(key.clone());
+            self.pending_terminal_events.insert(
+                key,
+                PendingTerminalEvent {
+                    event: KitProductEvent {
+                        schema_version: KIT_SCHEMA_VERSION,
+                        scope_id: self.scope_id.clone(),
+                        session_id: session_id.clone(),
+                        turn_id: Some(submission_id.clone()),
+                        submission_id: Some(submission_id.clone()),
+                        event_id: event_id.clone(),
+                        sequence,
+                        origin: Origin::Live,
+                        block_id: event_id,
+                        block: KitBlock::Status {
+                            code: intent.code,
+                            message: intent.message,
+                        },
+                    },
+                    retain: true,
+                    next_attempt: Instant::now(),
+                },
+            );
+        }
+    }
+
+    /// 在关闭路径立即重试失败的回合终态，不受原定时器延迟影响。
+    fn retry_pending_terminal_events_now(&mut self) {
+        self.materialize_pending_terminal_intents();
+        let now = Instant::now();
+        for pending in self.pending_terminal_events.values_mut() {
+            pending.next_attempt = now;
+        }
+        self.retry_pending_terminal_events();
+    }
+
+    /// 重试失败的回合终态；每次重试复用同一 event_id，兼容下游幂等去重。
+    fn retry_pending_terminal_events(&mut self) {
+        self.materialize_pending_terminal_intents();
+        let now = Instant::now();
+        let ready = self
+            .pending_terminal_events
+            .iter()
+            .filter(|(_, pending)| pending.next_attempt <= now)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in ready {
+            let Some(mut pending) = self.pending_terminal_events.remove(&key) else {
+                continue;
+            };
+            if self.sink.emit(pending.event.clone()).is_ok() {
+                self.retain_event(pending.event, pending.retain);
+                if self.pending_terminal_events.is_empty()
+                    && self.pending_terminal_intents.is_empty()
+                {
+                    clear_cleanup_failure(&self.cleanup_result, CleanupFailureKind::TerminalEvent);
+                }
+            } else {
+                pending.next_attempt = Instant::now() + TERMINAL_RETRY_DELAY;
+                self.pending_terminal_events.insert(key, pending);
+                tracing::debug!(scope = %self.scope_id, "Kit 回合终态运输失败，将重试");
+            }
+        }
+    }
+
+    /// actor 退出前把仍未送达的终态转交 Host outbox，保留稳定 event_id/sequence。
+    fn handoff_pending_terminal_events(&mut self) {
+        if self.pending_terminal_events.is_empty() {
+            return;
+        }
+        // 先取得 outbox guard，再从 actor 移交所有权；即使锁曾 poison，也不能在 actor
+        // 退出时让 pending event 随栈帧丢失。TerminalOutbox 只含可恢复的内存 Map。
+        let mut outbox = match self.terminal_outbox.lock() {
+            Ok(outbox) => outbox,
+            Err(poisoned) => {
+                tracing::error!(
+                    scope = %self.scope_id,
+                    cleanup_failure = ?CleanupFailureKind::TerminalEvent,
+                    "terminal outbox 锁曾异常中断，恢复后继续接管终态"
+                );
+                let outbox = poisoned.into_inner();
+                self.terminal_outbox.clear_poison();
+                outbox
+            }
+        };
+        let pending = std::mem::take(&mut self.pending_terminal_events);
+        let pending_count = pending.len();
+        let mut handed_off = 0usize;
+        for (_, event) in pending {
+            if outbox.insert(event) {
+                handed_off += 1;
+            } else {
+                record_cleanup_failure(
+                    &self.cleanup_result,
+                    &self.scope_id,
+                    CleanupFailureKind::TerminalEvent,
+                );
+            }
+        }
+        tracing::debug!(
+            scope = %self.scope_id,
+            pending_count,
+            handed_off,
+            "actor 退出前已转交 terminal outbox"
         );
     }
 
-    /// 输出前再次走验证 sink；成功事件才记入热恢复内存，防止坏事件污染下一次 replay。
+    /// 输出前再次走验证 sink；仅白名单事件写入 transcript，control/fence 单独运输。
     fn emit_event(&mut self, event: KitProductEvent, retain: bool) {
-        let session_id = event.session_id.clone();
         if self.sink.emit(event.clone()).is_err() {
             tracing::debug!(scope = %self.scope_id, "Kit 事件运输失败");
             return;
         }
+        self.retain_event(event, retain);
+    }
+
+    /// 在 sink 成功后保存可恢复事件；失败或重试期间绝不提前污染 transcript。
+    fn retain_event(&mut self, event: KitProductEvent, retain: bool) {
+        let session_id = event.session_id.clone();
         if retain
+            && is_recoverable_product_event(&event)
             && (self.active_sessions.contains(&session_id)
-                || self.loading_sessions.contains(&session_id))
+                || self
+                    .load_flight
+                    .as_ref()
+                    .is_some_and(|flight| flight.session_id == session_id))
         {
-            // cold-load 的 replay 通知在 response 前先到，仍要留给后续热恢复使用。
-            self.buffers.entry(session_id).or_default().push(event);
+            self.transcript.entry(session_id).or_default().push(event);
         }
     }
 
-    /// 是否处于用户已取消或批准 MCP 集合中的工具。
+    /// 是否处于用户已取消或批准 MCP 集合中的安全工具。
     fn is_approved_tool(&self, tool_name: &str) -> bool {
-        tool_name == NOOP_TOOL || self.expected_tools.contains(tool_name)
+        tool_name == NOOP_TOOL
+            || (is_qualified_tool_name(tool_name) && self.expected_tools.contains(tool_name))
+    }
+
+    /// 判断 actor 是否仍持有尚未成功物化或运输的 terminal。
+    fn has_pending_terminal_events(&self) -> bool {
+        !self.pending_terminal_events.is_empty() || !self.pending_terminal_intents.is_empty()
     }
 
     /// 不在 prompt/load/catalog 中且超过 idle 阈值时，才能关闭该 scope 私有进程。
@@ -1758,58 +3116,252 @@ impl ScopeActor {
         self.initialized
             && self.pending.is_empty()
             && self.in_flight.is_empty()
-            && self.loading_sessions.is_empty()
+            && self.load_flight.is_none()
             && self.catalog_pending.is_empty()
+            && !self.has_pending_terminal_events()
             && self.deferred.is_empty()
             && self.last_activity.elapsed() >= self.idle_after
     }
 
-    /// 异常 sidecar 不自动重拉，保留 dead actor 使随后 Send 明确返回 sidecar_unavailable。
+    /// 与 ActorHandle 共用提交门；自然退出不能和迟到 command 逆序。
+    fn stop_accepting(&self) {
+        match self.submission_lock.lock() {
+            Ok(_submission) => self.accepting.store(false, Ordering::Release),
+            Err(_) => {
+                self.accepting.store(false, Ordering::Release);
+                record_cleanup_failure(
+                    &self.cleanup_result,
+                    &self.scope_id,
+                    CleanupFailureKind::SubmissionLock,
+                );
+            }
+        }
+    }
+
+    /// 结束所有仍登记的 prompt，并撤销对应 PendingRpc，保证每个回合只有一个终态。
+    fn finish_in_flight_turns(&mut self, code: &str, message: &str) {
+        let turns = std::mem::take(&mut self.in_flight);
+        self.pending.retain(|_, pending| {
+            !matches!(
+                pending,
+                PendingRpc::Prompt {
+                    session_id,
+                    submission_id,
+                } if turns.get(session_id).is_some_and(|turn| turn.submission_id == *submission_id)
+            )
+        });
+        for (session_id, turn) in turns {
+            self.cancel_requested.remove(&session_id);
+            self.emit_turn_status(&session_id, &turn.submission_id, code, message);
+        }
+    }
+
+    /// 执行一次 actor 资源清理；每个失败步骤既记录分类又参与 restart 成功判定。
+    fn cleanup_resources(&mut self) -> CleanupResult {
+        if self.cleanup_done {
+            return snapshot_cleanup_result(&self.cleanup_result, &self.scope_id);
+        }
+        let mut result = CleanupResult::default();
+        if !self.acp_shutdown_done {
+            if self.acp.shutdown().is_err() {
+                record_cleanup_failure(
+                    &self.cleanup_result,
+                    &self.scope_id,
+                    CleanupFailureKind::AcpShutdown,
+                );
+                result.record(CleanupFailureKind::AcpShutdown);
+            } else {
+                self.acp_shutdown_done = true;
+                clear_cleanup_failure(&self.cleanup_result, CleanupFailureKind::AcpShutdown);
+                tracing::debug!(
+                    scope = %self.scope_id,
+                    cleanup_step = "acp_shutdown",
+                    "sidecar ACP runtime cleanup 已完成"
+                );
+            }
+        }
+        if !self.scope_stop_done {
+            if self.service.stop_scope(&self.scope_id).is_err() {
+                record_cleanup_failure(
+                    &self.cleanup_result,
+                    &self.scope_id,
+                    CleanupFailureKind::ScopeStop,
+                );
+                result.record(CleanupFailureKind::ScopeStop);
+            } else {
+                self.scope_stop_done = true;
+                clear_cleanup_failure(&self.cleanup_result, CleanupFailureKind::ScopeStop);
+                tracing::debug!(
+                    scope = %self.scope_id,
+                    cleanup_step = "scope_stop",
+                    "sidecar Supervisor scope cleanup 已完成"
+                );
+            }
+        }
+        if self.acp_shutdown_done && self.scope_stop_done {
+            self.cleanup_done = true;
+        }
+        result.merge(&snapshot_cleanup_result(
+            &self.cleanup_result,
+            &self.scope_id,
+        ));
+        result
+    }
+
+    /// 异常 sidecar 不自动重拉；先退休代次并结算 cold load/active turn，再拒绝其它命令。
     fn enter_dead(&mut self, error: KitError) {
         if self.dead {
             return;
         }
+        self.stop_accepting();
         self.dead = true;
-        let _ = self.acp.shutdown();
-        let _ = self.service.stop_scope(&self.scope_id);
+        // ScopeDead 结算必须发生在 ACP shutdown 前，确保 accepted resume 有终止事件。
+        self.finish_current_load(LoadOutcome::ScopeDead);
+        self.finish_in_flight_turns("error", "sidecar 回合失败");
+        // 给 transient sink failure 一次额外机会；若仍失败则由 dead actor 后续有限重试。
+        self.retry_pending_terminal_events();
+        self.cleanup_resources();
         self.reject_pending(error);
     }
 
     /// 正常 idle 退出允许 Host 在下一条命令按旧 session cold-load 新起一代。
-    fn idle_stop_and_exit(&mut self) {
-        self.accepting.store(false, Ordering::Release);
-        let _ = self.acp.shutdown();
-        let _ = self.service.stop_scope(&self.scope_id);
-        tracing::debug!(scope = %self.scope_id, "scope actor 已按 idle 策略停止");
-    }
+    fn try_idle_stop_and_exit(&mut self) -> bool {
+        // idle 判定和 accepting=false 必须与外部 submit 共用同一临界区，避免命令
+        // 在判定之后、actor 退出之前被错误接受而无人回复。
+        let submission_lock = Arc::clone(&self.submission_lock);
+        let _submission = match submission_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                // submission lock 只保护本 actor 的提交临界区，没有可恢复的业务数据；
+                // 恢复 guard 后继续做 idle cleanup，不能因锁中毒直接丢弃 sidecar 资源。
+                tracing::error!(
+                    scope = %self.scope_id,
+                    cleanup_failure = ?CleanupFailureKind::SubmissionLock,
+                    "submission lock 已中毒，恢复后继续 idle cleanup"
+                );
+                submission_lock.clear_poison();
+                poisoned.into_inner()
+            }
+        };
+        if !self.accepting.load(Ordering::Acquire)
+            || !self.should_idle_stop()
+            || self.queued_commands.load(Ordering::Acquire) != 0
+        {
+            return false;
+        }
 
-    /// 在关闭 stdin 前尽力取消正在运行的回合，避免侧车继续执行已被 Host 放弃的 prompt。
-    fn cancel_in_flight_before_shutdown(&mut self) {
-        let sessions = self.in_flight.keys().cloned().collect::<Vec<_>>();
-        for session_id in sessions {
-            // shutdown 路径不能因单个通知失败而跳过后续资源回收。
-            let _ = self.acp.notify_validated(
-                "session/cancel",
-                json!({ "sessionId": session_id }),
-                &self.policy,
-            );
+        self.accepting.store(false, Ordering::Release);
+        let cleanup = self.cleanup_resources();
+        if cleanup.is_success() {
+            // 只有 cleanup 全部成功后才提交自然退出；失败时不设置该意图，
+            // 让外部 shutdown 在释放提交门后仍能把重试命令送到 actor。
+            self.exit_intent.store(true, Ordering::Release);
+            self.exit_requested = true;
+            tracing::debug!(scope = %self.scope_id, "scope actor 已按 idle 策略停止");
+            true
+        } else {
+            tracing::error!(scope = %self.scope_id, "scope actor idle cleanup 未完整完成");
+            false
         }
     }
 
-    /// 显式 shutdown 用于 Channel 全局换代和 Runtime Drop。
-    fn shutdown_and_exit(&mut self) {
-        self.accepting.store(false, Ordering::Release);
-        self.cancel_in_flight_before_shutdown();
-        let _ = self.acp.shutdown();
-        let _ = self.service.stop_scope(&self.scope_id);
+    /// 在关闭 stdin 前尽力取消正在运行的回合，避免侧车继续执行已被 Host 放弃的 prompt。
+    fn cancel_in_flight_before_shutdown(&mut self) -> CleanupResult {
+        let sessions = self
+            .in_flight
+            .iter()
+            .filter(|(_, turn)| !turn.cancelled)
+            .map(|(session_id, _)| session_id.clone())
+            .collect::<Vec<_>>();
+        let mut result = CleanupResult::default();
+        for session_id in sessions {
+            // shutdown 路径不能因单个通知失败而跳过后续资源回收。
+            if self
+                .acp
+                .notify_validated(
+                    "session/cancel",
+                    json!({ "sessionId": session_id }),
+                    &self.policy,
+                )
+                .is_err()
+            {
+                record_cleanup_failure(
+                    &self.cleanup_result,
+                    &self.scope_id,
+                    CleanupFailureKind::CancelNotification,
+                );
+                result.record(CleanupFailureKind::CancelNotification);
+            }
+        }
+        result
+    }
+
+    /// 显式 shutdown 用于 Channel 全局换代和 Runtime Drop，并返回结构化 cleanup 结果。
+    fn shutdown_and_exit(&mut self) -> CleanupResult {
+        self.stop_accepting();
+        if !self.cleanup_done {
+            // 主动关闭也属于 ScopeDead；不要让已 accepted 的 cold resume 静默悬挂。
+            self.finish_current_load(LoadOutcome::ScopeDead);
+            let cancel_result = self.cancel_in_flight_before_shutdown();
+            self.finish_in_flight_turns("cancelled", "回合已取消");
+            // shutdown 不能等待原定时器；已失败的 terminal event 必须立即再试一次。
+            self.retry_pending_terminal_events_now();
+            let mut cleanup = self.cleanup_resources();
+            let resources_cleaned = self.cleanup_done;
+            if self.has_pending_terminal_events() {
+                record_cleanup_failure(
+                    &self.cleanup_result,
+                    &self.scope_id,
+                    CleanupFailureKind::TerminalEvent,
+                );
+                cleanup.record(CleanupFailureKind::TerminalEvent);
+            }
+            cleanup.merge(&cancel_result);
+            self.reject_pending(sidecar_unavailable("sidecar 已关闭"));
+            let terminal_intent_pending = !self.pending_terminal_intents.is_empty();
+            self.handoff_pending_terminal_events();
+            if resources_cleaned && !terminal_intent_pending {
+                self.exit_intent.store(true, Ordering::Release);
+                self.exit_requested = true;
+            } else {
+                tracing::error!(
+                    scope = %self.scope_id,
+                    "sidecar shutdown cleanup 未完成，保留 actor 等待后续重试"
+                );
+            }
+            return cleanup;
+        }
+        // dead actor 的 cleanup 可能已完成；退出前仍必须给 pending terminal event 一次机会。
+        self.retry_pending_terminal_events_now();
+        let mut cleanup = self.cleanup_resources();
+        if self.has_pending_terminal_events() {
+            record_cleanup_failure(
+                &self.cleanup_result,
+                &self.scope_id,
+                CleanupFailureKind::TerminalEvent,
+            );
+            cleanup.record(CleanupFailureKind::TerminalEvent);
+        }
+        let terminal_intent_pending = !self.pending_terminal_intents.is_empty();
+        self.handoff_pending_terminal_events();
+        if !terminal_intent_pending {
+            self.exit_intent.store(true, Ordering::Release);
+            self.exit_requested = true;
+        } else {
+            tracing::error!(
+                scope = %self.scope_id,
+                "terminal sequence 尚未分配，保留 actor 等待后续重试"
+            );
+        }
+        cleanup
     }
 
     /// 死 actor 仍接收命令以 fail-closed；只有全局换代能创建同 scope 新代。
     fn reject_dead_command(&mut self, command: ActorCommand) {
         match command {
-            ActorCommand::Shutdown { reply } => {
-                self.shutdown_and_exit();
-                let _ = reply.send(());
+            ActorCommand::Shutdown { attempt } => {
+                let cleanup = self.shutdown_and_exit();
+                attempt.complete(cleanup);
             }
             command => send_command_error(command, sidecar_unavailable("sidecar 不可用")),
         }
@@ -1820,27 +3372,18 @@ impl ScopeActor {
         while let Some(command) = self.deferred.pop_front() {
             send_command_error(command, error.clone());
         }
-        for (_, mut waiting) in std::mem::take(&mut self.catalog_waiting) {
-            while let Some(command) = waiting.pop_front() {
-                send_command_error(command, error.clone());
-            }
-        }
         for (_, pending) in std::mem::take(&mut self.pending) {
             match pending {
                 PendingRpc::NewSession { reply } | PendingRpc::ListSessions { reply } => {
                     let _ = reply.send(Err(error.clone()));
                 }
-                PendingRpc::Load {
-                    after_load: Some(pending),
-                    ..
+                PendingRpc::Load { .. } | PendingRpc::McpCatalog { .. } => {}
+                PendingRpc::Prompt {
+                    session_id,
+                    submission_id,
                 } => {
-                    let _ = pending.reply.send(Err(error.clone()));
+                    self.emit_turn_status(&session_id, &submission_id, "error", "sidecar 回合失败")
                 }
-                PendingRpc::Load {
-                    after_load: None, ..
-                }
-                | PendingRpc::Prompt { .. }
-                | PendingRpc::McpCatalog { .. } => {}
             }
         }
     }
@@ -1853,8 +3396,7 @@ fn request_actor(
 ) -> Result<KitReply, KitError> {
     let (reply, receiver) = mpsc::sync_channel(1);
     actor
-        .sender
-        .send(make(reply))
+        .submit(make(reply))
         .map_err(|_| sidecar_unavailable("scope actor 已退出"))?;
     receiver
         .recv_timeout(DISPATCH_REPLY_TIMEOUT)
@@ -1873,36 +3415,65 @@ fn request_send_actor(
     session_id: String,
     submission_id: String,
     text: String,
+    ticket: SendTicket,
+) -> Result<KitReply, SendRequestError> {
+    request_send_actor_with_timeout(
+        actor,
+        session_id,
+        submission_id,
+        text,
+        ticket,
+        DISPATCH_REPLY_TIMEOUT,
+    )
+}
+
+/// 测试可注入回执等待上限；生产调用仍使用固定 dispatch 合同。
+fn request_send_actor_with_timeout(
+    actor: &ActorHandle,
+    session_id: String,
+    submission_id: String,
+    text: String,
+    ticket: SendTicket,
+    reply_timeout: Duration,
 ) -> Result<KitReply, SendRequestError> {
     let (reply, receiver) = mpsc::sync_channel(1);
-    let ticket = SendTicket::new();
     actor
-        .sender
-        .send(ActorCommand::Send {
-            session_id: session_id.clone(),
-            submission_id: submission_id.clone(),
+        .submit(ActorCommand::Send {
+            session_id,
+            submission_id,
             text,
             ticket: ticket.clone(),
             reply,
         })
-        .map_err(|_| SendRequestError::BeforePrompt(sidecar_unavailable("scope actor 已退出")))?;
+        .map_err(|_| {
+            ticket.mark_not_written();
+            SendRequestError::BeforePrompt(sidecar_unavailable("scope actor 已退出"))
+        })?;
 
-    match receiver.recv_timeout(DISPATCH_REPLY_TIMEOUT) {
+    match receiver.recv_timeout(reply_timeout) {
         Ok(Ok(reply)) => Ok(reply),
-        Ok(Err(error)) => Err(SendRequestError::BeforePrompt(error)),
+        Ok(Err(error)) => Err(classify_send_error(&ticket, error)),
         Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {
             let error = sidecar_unavailable("等待 sidecar 回执超时");
             if ticket.abandon() {
-                // 票据先获撤销，再投递队列清理；即使后者稍晚到达也不能产生幽灵 prompt。
-                let _ = actor.sender.send(ActorCommand::AbandonSend {
-                    session_id,
-                    submission_id,
-                });
+                // 票据先获撤销；迟到的 Send command 即使被 actor 取出也不能写 prompt。
                 Err(SendRequestError::BeforePrompt(error))
             } else {
-                Err(SendRequestError::PromptMayHaveBeenWritten(error))
+                Err(classify_send_error(&ticket, error))
             }
         }
+    }
+}
+
+/// 只有 prompt 尚未写入时才允许调用方回滚 submission；其它状态必须保留幂等记录。
+fn classify_send_error(ticket: &SendTicket, error: KitError) -> SendRequestError {
+    match ticket.state() {
+        SendTicketState::Waiting | SendTicketState::NotWritten | SendTicketState::Abandoned => {
+            SendRequestError::BeforePrompt(error)
+        }
+        SendTicketState::Claimed
+        | SendTicketState::Written
+        | SendTicketState::MayHaveBeenWritten => SendRequestError::PromptMayHaveBeenWritten(error),
     }
 }
 
@@ -1912,13 +3483,18 @@ fn send_command_error(command: ActorCommand, error: KitError) {
         ActorCommand::NewSession { reply }
         | ActorCommand::ListSessions { reply, .. }
         | ActorCommand::ResumeSession { reply, .. }
-        | ActorCommand::Send { reply, .. }
         | ActorCommand::Cancel { reply, .. } => {
             let _ = reply.send(Err(error));
         }
-        ActorCommand::AbandonSend { .. } => {}
-        ActorCommand::Shutdown { reply } => {
-            let _ = reply.send(());
+        ActorCommand::Send { ticket, reply, .. } => {
+            // command 尚未进入 prompt 写入，调用方可安全回滚该 submission。
+            ticket.mark_not_written();
+            let _ = reply.send(Err(error));
+        }
+        ActorCommand::Shutdown { attempt } => {
+            let mut result = CleanupResult::default();
+            result.record(CleanupFailureKind::ShutdownCommand);
+            attempt.complete(result);
         }
     }
 }
@@ -2000,7 +3576,8 @@ fn validate_send_input(
 ) -> Result<(), KitError> {
     if crate::supervisor::sanitize(scope_id).is_err()
         || session_id.is_empty()
-        || submission_id.is_empty()
+        // Kit submission_id 与 sidecar promptId 共用 contract 的 fail-closed 边界。
+        || !is_prompt_id(submission_id)
         || text.is_empty()
         || !prompt_text_within_limit(text)
         || validate_prompt_text(text).is_err()
@@ -2028,6 +3605,32 @@ fn sidecar_unavailable(message: &str) -> KitError {
         retryable: true,
         retry_after_ms: None,
     }
+}
+
+/// 只把明确的 ACP NotFound 错误码映射为 session_not_found。
+fn is_session_not_found(error: &RpcError) -> bool {
+    error.code == ACP_SESSION_NOT_FOUND
+}
+
+/// 失败 load 必须保持可观察且不泄漏 sidecar 原始错误内容。
+fn load_outcome_error(outcome: LoadOutcome) -> KitError {
+    match outcome {
+        LoadOutcome::SessionNotFound => {
+            KitError::non_retryable("session_not_found", "sidecar 未找到指定会话")
+        }
+        LoadOutcome::LoadError => sidecar_unavailable("sidecar 加载会话失败，可重试"),
+        LoadOutcome::Timeout => sidecar_unavailable("session/load 超时，可重试"),
+        LoadOutcome::Cancelled => KitError::non_retryable("cancelled", "会话恢复已取消"),
+        LoadOutcome::TransportDeath | LoadOutcome::ScopeDead => {
+            sidecar_unavailable("sidecar 不可用，可重试")
+        }
+        LoadOutcome::Success => sidecar_unavailable("session/load 状态无效"),
+    }
+}
+
+/// 任何未成功的 load 都退休当前 transport，隔离无法携带 generation 的旧 replay。
+fn should_retire_after_load(outcome: LoadOutcome) -> bool {
+    !matches!(outcome, LoadOutcome::Success)
 }
 
 /// supervisor 不可用原因的稳定 wire 文本；仅平台分支可以进入该值。
@@ -2059,9 +3662,31 @@ fn parse_catalog(result: &Value) -> Option<BTreeSet<String>> {
         .get("result")
         .and_then(|result| result.get("servers"))
         .and_then(Value::as_array)?;
-    let mut tools = BTreeSet::new();
+
+    // 先扫描所有 server 的原始 tool name，再应用 status/enabled 过滤；否则不可信
+    // server 可用 non-ready、disabled 或异常 enabled 值伪造 Host-owned noop。
+    for server in servers {
+        let Some(session) = server.get("session").and_then(Value::as_object) else {
+            continue;
+        };
+        let Some(server_tools) = session.get("tools").and_then(Value::as_array) else {
+            continue;
+        };
+        if server_tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some(NOOP_TOOL))
+        {
+            return None;
+        }
+    }
+
+    // 该内置工具的 provenance 由 Host 本地固定策略提供，不来自任何 server 响应。
+    let mut tools = BTreeSet::from([NOOP_TOOL.to_owned()]);
     for server in servers {
         let server_name = server.get("name").and_then(Value::as_str)?;
+        if !is_server_name(server_name) {
+            return None;
+        }
         let session = server.get("session")?.as_object()?;
         if session.get("status").and_then(Value::as_str) != Some("ready") {
             continue;
@@ -2074,15 +3699,146 @@ fn parse_catalog(result: &Value) -> Option<BTreeSet<String>> {
                 continue;
             }
             let name = tool.get("name").and_then(Value::as_str)?;
-            // 无副作用 noop 是 sidecar 内置全局工具名，不能错误加上 server 前缀。
-            if name == NOOP_TOOL {
-                tools.insert(name.to_string());
-            } else {
-                tools.insert(format!("{server_name}__{name}"));
+            let qualified = format!("{server_name}__{name}");
+            if !is_qualified_tool_name(&qualified) {
+                return None;
             }
+            tools.insert(qualified);
         }
     }
     Some(tools)
+}
+
+/// 严格检查 JSON 对象只含指定字段，防止 ACP 可选字段扩大 Host 信任边界。
+fn has_exact_json_keys(object: &serde_json::Map<String, Value>, expected: &[&str]) -> bool {
+    object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
+}
+
+/// 严格校验 sidecar 真实 initialize result 的 ACP 能力、认证与 metadata 最小闭集。
+fn validate_initialize_result(result: &Value) -> bool {
+    let Some(result) = result.as_object() else {
+        return false;
+    };
+
+    // 顶层只接受真实 sidecar response 的四个字段，agentInfo 等可选字段也不进入本 profile。
+    if !has_exact_json_keys(
+        result,
+        &[
+            "protocolVersion",
+            "agentCapabilities",
+            "authMethods",
+            "_meta",
+        ],
+    ) {
+        return false;
+    }
+    // response 协议版本必须与 Host 发出的固定 ACP 版本一致。
+    if result.get("protocolVersion").and_then(Value::as_u64) != Some(HOST_ACP_PROTOCOL_VERSION) {
+        return false;
+    }
+
+    // runtime metadata 是固定握手身份，且不允许夹带未知键。
+    let Some(meta) = result.get("_meta").and_then(Value::as_object) else {
+        return false;
+    };
+    if !has_exact_json_keys(
+        meta,
+        &[
+            "efflabRuntime",
+            "efflabSchemaVersion",
+            "efflabSessionStoreVersion",
+        ],
+    ) || meta.get("efflabRuntime").and_then(Value::as_str) != Some(EFFLAB_RUNTIME_ID)
+        || meta.get("efflabSchemaVersion").and_then(Value::as_u64) != Some(EFFLAB_SCHEMA_VERSION)
+        || meta
+            .get("efflabSessionStoreVersion")
+            .and_then(Value::as_u64)
+            != Some(EFFLAB_SESSION_STORE_VERSION)
+    {
+        return false;
+    }
+
+    // 只接受 sidecar 实际广告的能力字段；fs、terminal、logout 和未知字段均被排除。
+    let Some(agent_capabilities) = result.get("agentCapabilities").and_then(Value::as_object)
+    else {
+        return false;
+    };
+    if !has_exact_json_keys(
+        agent_capabilities,
+        &[
+            "loadSession",
+            "promptCapabilities",
+            "mcpCapabilities",
+            "sessionCapabilities",
+            "auth",
+        ],
+    ) || agent_capabilities
+        .get("loadSession")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return false;
+    }
+
+    // sidecar 不接收图片、音频或 embedded context，三个字段必须显式为 false。
+    let Some(prompt_capabilities) = agent_capabilities
+        .get("promptCapabilities")
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    if !has_exact_json_keys(prompt_capabilities, &["image", "audio", "embeddedContext"])
+        || prompt_capabilities.get("image").and_then(Value::as_bool) != Some(false)
+        || prompt_capabilities.get("audio").and_then(Value::as_bool) != Some(false)
+        || prompt_capabilities
+            .get("embeddedContext")
+            .and_then(Value::as_bool)
+            != Some(false)
+    {
+        return false;
+    }
+
+    // sidecar 不提供 HTTP/SSE MCP transport，不能接受其它 mcp capability 字段。
+    let Some(mcp_capabilities) = agent_capabilities
+        .get("mcpCapabilities")
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    if !has_exact_json_keys(mcp_capabilities, &["http", "sse"])
+        || mcp_capabilities.get("http").and_then(Value::as_bool) != Some(false)
+        || mcp_capabilities.get("sse").and_then(Value::as_bool) != Some(false)
+    {
+        return false;
+    }
+
+    // session/list 能力只以空对象表示，不能借能力字段开放其它 session 方法。
+    let Some(session_capabilities) = agent_capabilities
+        .get("sessionCapabilities")
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let Some(session_list) = session_capabilities.get("list").and_then(Value::as_object) else {
+        return false;
+    };
+    if !has_exact_json_keys(session_capabilities, &["list"]) || !session_list.is_empty() {
+        return false;
+    }
+
+    // unstable auth 容器可由 schema 序列化为空对象，但绝不能广告 logout 或其它字段。
+    let Some(auth_capabilities) = agent_capabilities.get("auth").and_then(Value::as_object) else {
+        return false;
+    };
+    if !auth_capabilities.is_empty() {
+        return false;
+    }
+
+    // 当前 sidecar 不提供认证入口；非空、缺失或非数组都必须拒绝。
+    result
+        .get("authMethods")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
 }
 
 /// 标准立即 Send 回执，turn_id 与 submission_id 按 L1 协议恒等。
@@ -2093,5 +3849,1874 @@ fn send_reply(session_id: &str, submission_id: &str, duplicate: bool) -> KitRepl
         session_id: session_id.to_string(),
         turn_id: submission_id.to_string(),
         submission_id: submission_id.to_string(),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::sync::mpsc;
+
+    use anyhow::Result;
+
+    use super::*;
+    use crate::app_port::{
+        ApprovedMcpSpec, HostApp, LlmChannelConfig, LlmSecretSlot, SealedSecret, SecretGuard,
+    };
+    use crate::config::L3bRuntimeConfig;
+    use crate::event_sink::KitEventSink;
+
+    struct LifecycleTestApp;
+
+    impl HostApp for LifecycleTestApp {
+        fn app_id(&self) -> &str {
+            "runtime-lifecycle-test"
+        }
+
+        fn persist_llm_channel(&self, _config: &LlmChannelConfig) -> Result<()> {
+            Ok(())
+        }
+
+        fn load_llm_channel(&self) -> Result<LlmChannelConfig> {
+            Ok(LlmChannelConfig::Byok {
+                base_url: "https://8.8.8.8/v1".to_string(),
+                model_id: "runtime-lifecycle-test-model".to_string(),
+                api_key: SealedSecret::new(b"test-key".to_vec()),
+            })
+        }
+
+        fn seal_secret(&self, plain: &[u8]) -> Result<SealedSecret> {
+            Ok(SealedSecret::new(plain.to_vec()))
+        }
+
+        fn unseal_secret(&self, sealed: &SealedSecret) -> Result<SecretGuard> {
+            Ok(SecretGuard::new(sealed.as_bytes().to_vec()))
+        }
+
+        fn seal_llm_secret(&self, _slot: LlmSecretSlot, plain: &[u8]) -> Result<SealedSecret> {
+            self.seal_secret(plain)
+        }
+
+        fn unseal_llm_secret(
+            &self,
+            _slot: LlmSecretSlot,
+            sealed: &SealedSecret,
+        ) -> Result<SecretGuard> {
+            self.unseal_secret(sealed)
+        }
+
+        fn mcp_for_scope(&self, _scope: &ScopeId) -> Result<ApprovedMcpSpec> {
+            Ok(ApprovedMcpSpec::default())
+        }
+    }
+
+    struct NoopSink;
+
+    impl KitEventSink for NoopSink {
+        fn emit(&self, _event: KitProductEvent) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn parse_catalog_rejects_invalid_qualified_tool_names() {
+        for (server_name, tool_name) in [
+            ("bad__server", "search"),
+            ("server", "bad.name"),
+            ("server", "bad name"),
+            ("server", "1search"),
+        ] {
+            let result = serde_json::json!({
+                "result": {
+                    "servers": [{
+                        "name": server_name,
+                        "session": {
+                            "status": "ready",
+                            "tools": [{"name": tool_name, "enabled": true}]
+                        }
+                    }]
+                }
+            });
+            assert!(
+                parse_catalog(&result).is_none(),
+                "非法 catalog qualified tool name 必须 fail-closed: {server_name}__{tool_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_catalog_adds_host_owned_noop_and_rejects_server_owned_copy() {
+        let empty_catalog = serde_json::json!({
+            "result": {"servers": []}
+        });
+        assert_eq!(
+            parse_catalog(&empty_catalog),
+            Some(BTreeSet::from([NOOP_TOOL.to_owned()])),
+            "固定 noop 必须由 Host 解析器注入，而不是来自 server catalog"
+        );
+
+        let server_owned_noop = serde_json::json!({
+            "result": {
+                "servers": [{
+                    "name": "builtin",
+                    "session": {
+                        "status": "ready",
+                        "tools": [{"name": NOOP_TOOL, "enabled": true}]
+                    }
+                }]
+            }
+        });
+        assert_eq!(
+            parse_catalog(&server_owned_noop),
+            None,
+            "任意 server 携带 bare noop 都不得取得内置工具 provenance"
+        );
+    }
+
+    #[test]
+    fn parse_catalog_rejects_server_owned_noop_before_status_and_enabled_filters() {
+        let cases = [
+            (
+                "non-ready server",
+                serde_json::json!({
+                    "status": "starting",
+                    "tools": [{"name": NOOP_TOOL, "enabled": true}]
+                }),
+            ),
+            (
+                "disabled tool",
+                serde_json::json!({
+                    "status": "ready",
+                    "tools": [{"name": NOOP_TOOL, "enabled": false}]
+                }),
+            ),
+            (
+                "missing enabled",
+                serde_json::json!({
+                    "status": "ready",
+                    "tools": [{"name": NOOP_TOOL}]
+                }),
+            ),
+            (
+                "non-boolean enabled",
+                serde_json::json!({
+                    "status": "ready",
+                    "tools": [{"name": NOOP_TOOL, "enabled": "true"}]
+                }),
+            ),
+            (
+                "valid tool before noop",
+                serde_json::json!({
+                    "status": "ready",
+                    "tools": [
+                        {"name": "before", "enabled": true},
+                        {"name": NOOP_TOOL, "enabled": true}
+                    ]
+                }),
+            ),
+            (
+                "valid tool after noop",
+                serde_json::json!({
+                    "status": "ready",
+                    "tools": [
+                        {"name": NOOP_TOOL, "enabled": true},
+                        {"name": "after", "enabled": true}
+                    ]
+                }),
+            ),
+        ];
+
+        for (case_name, session) in cases {
+            let catalog = serde_json::json!({
+                "result": {
+                    "servers": [{"name": "untrusted", "session": session}]
+                }
+            });
+            assert_eq!(
+                parse_catalog(&catalog),
+                None,
+                "{case_name} 中的 server-owned noop 必须 fail-closed"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_catalog_injects_host_noop_and_filters_other_tools() {
+        let catalog = serde_json::json!({
+            "result": {
+                "servers": [
+                    {
+                        "name": "starting-server",
+                        "session": {
+                            "status": "starting",
+                            "tools": [{"name": "ignored", "enabled": true}]
+                        }
+                    },
+                    {
+                        "name": "mcp",
+                        "session": {
+                            "status": "ready",
+                            "tools": [
+                                {"name": "disabled", "enabled": false},
+                                {"name": "missing_enabled"},
+                                {"name": "non_boolean", "enabled": "true"},
+                                {"name": "before", "enabled": true},
+                                {"name": "after", "enabled": true}
+                            ]
+                        }
+                    }
+                ]
+            }
+        });
+
+        assert_eq!(
+            parse_catalog(&catalog),
+            Some(BTreeSet::from([
+                NOOP_TOOL.to_owned(),
+                "mcp__after".to_owned(),
+                "mcp__before".to_owned(),
+            ])),
+            "Host noop 必须本地注入，且仅保留 ready 且 enabled=true 的合法工具"
+        );
+    }
+
+    /// 创建只响应 initialize 的 fake sidecar，使测试只观察 Host actor 的替换顺序。
+    fn write_fake_sidecar(path: &Path) {
+        let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+        fs::write(path, script).expect("必须能写入 lifecycle fake sidecar");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .expect("lifecycle fake sidecar 必须可执行");
+    }
+
+    /// 已成功入队的 command 必须阻止 idle close，并最终只交付一次回执。
+    #[test]
+    fn queued_command_prevents_idle_close_and_gets_one_reply() {
+        let temporary = tempfile::tempdir().expect("必须能创建 idle race 测试目录");
+        let config = crate::HostRuntimeConfig {
+            home_root: temporary.path().join("app-data"),
+            sidecar_bin: temporary.path().join("unused-sidecar"),
+            sidecar_log_path: temporary.path().join("sidecar.log"),
+            mcp_exec_root: temporary.path().join("mcp"),
+            idle_after: Duration::from_millis(1),
+            l3b: L3bRuntimeConfig::default(),
+        };
+        let runtime = HostRuntime::new(LifecycleTestApp, NoopSink, config);
+        let service = runtime
+            .channel_service()
+            .expect("测试 actor 必须取得 Channel service");
+        let (_stdout_peer, stdout) =
+            std::os::unix::net::UnixStream::pair().expect("idle race 测试必须创建 stdout pipe");
+        let acp = AcpRuntime::new(std::io::sink(), stdout);
+        let (sender, receiver) = mpsc::channel();
+        let accepting = Arc::new(AtomicBool::new(true));
+        let exit_intent = Arc::new(AtomicBool::new(false));
+        let submission_lock = Arc::new(Mutex::new(()));
+        let queued_commands = Arc::new(AtomicUsize::new(0));
+        let restart_blocked = Arc::new(AtomicBool::new(false));
+        let cleanup_result = Arc::new(Mutex::new(CleanupResult::default()));
+        let mut actor = ScopeActor::new(
+            "scope-a".to_string(),
+            acp,
+            HostPolicy::new(temporary.path()),
+            service,
+            Arc::new(NoopSink),
+            receiver,
+            Arc::clone(&accepting),
+            Arc::clone(&exit_intent),
+            Arc::clone(&submission_lock),
+            Arc::clone(&queued_commands),
+            Arc::clone(&restart_blocked),
+            Arc::clone(&cleanup_result),
+            Arc::clone(&runtime.terminal_outbox),
+            1,
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            ApprovedMcpSpec::default(),
+        );
+        actor.initialized = true;
+        actor.last_activity = Instant::now() - Duration::from_secs(1);
+
+        let handle = ActorHandle {
+            scope_id: "scope-a".to_string(),
+            sender,
+            accepting: Arc::clone(&accepting),
+            exit_intent: Arc::clone(&exit_intent),
+            submission_lock,
+            queued_commands: Arc::clone(&queued_commands),
+            restart_blocked: Arc::clone(&restart_blocked),
+            shutdown_submitted: AtomicBool::new(false),
+            shutdown_attempt: Mutex::new(None),
+            cleanup_result,
+            join: Mutex::new(None),
+            finished: Arc::new(AtomicBool::new(false)),
+        };
+        let (reply, reply_receiver) = mpsc::sync_channel(1);
+        assert!(
+            handle
+                .submit(ActorCommand::Cancel {
+                    session_id: "session-a".to_string(),
+                    reply,
+                })
+                .is_ok(),
+            "临界区内成功入队的 command 不得被拒绝"
+        );
+
+        assert!(
+            !actor.try_idle_stop_and_exit(),
+            "idle close 不得丢弃已成功入队的 command"
+        );
+        assert!(accepting.load(Ordering::Acquire));
+
+        let command = actor
+            .receiver
+            .try_recv()
+            .expect("已接受 command 必须仍可由 actor 消费");
+        assert!(!actor.handle_command(command));
+        assert_eq!(
+            reply_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("已接受 command 必须交付回执")
+                .expect("Cancel 回执必须成功"),
+            KitReply::Cancel { accepted: true }
+        );
+        assert!(
+            reply_receiver.try_recv().is_err(),
+            "同一 command 不得交付第二次回执"
+        );
+    }
+
+    /// 旧 actor 必须在 replacement actor 返回前完成 join，避免其迟到 cleanup 触碰新 generation。
+    #[test]
+    fn actor_replacement_joins_removed_actor_before_spawn_returns() {
+        let temporary = tempfile::tempdir().expect("必须能创建 lifecycle 测试目录");
+        let sidecar = temporary.path().join("fake-sidecar.sh");
+        write_fake_sidecar(&sidecar);
+        let runtime = HostRuntime::new(
+            LifecycleTestApp,
+            NoopSink,
+            crate::HostRuntimeConfig {
+                home_root: temporary.path().join("app-data"),
+                sidecar_bin: sidecar,
+                sidecar_log_path: temporary.path().join("sidecar.log"),
+                mcp_exec_root: temporary.path().join("mcp"),
+                idle_after: Duration::from_secs(60),
+                l3b: L3bRuntimeConfig::default(),
+            },
+        );
+
+        let (sender, receiver) = mpsc::channel();
+        let (cleanup_seen, cleanup_observed) = mpsc::sync_channel(1);
+        let old_actor_thread = thread::spawn(move || match receiver.recv() {
+            Ok(ActorCommand::Shutdown { attempt }) => {
+                cleanup_seen
+                    .send("shutdown")
+                    .expect("测试必须观察到旧 actor shutdown");
+                attempt.complete(CleanupResult::default());
+            }
+            Err(_) => {
+                cleanup_seen
+                    .send("disconnect")
+                    .expect("测试必须观察到旧 actor disconnect cleanup");
+            }
+            Ok(_) => panic!("旧 actor 测试线程只接受 shutdown"),
+        });
+        let held_sender = sender.clone();
+        let old_handle = Arc::new(ActorHandle {
+            scope_id: "scope-a".to_string(),
+            sender,
+            accepting: Arc::new(AtomicBool::new(false)),
+            exit_intent: Arc::new(AtomicBool::new(false)),
+            submission_lock: Arc::new(Mutex::new(())),
+            queued_commands: Arc::new(AtomicUsize::new(0)),
+            restart_blocked: Arc::new(AtomicBool::new(false)),
+            shutdown_submitted: AtomicBool::new(false),
+            shutdown_attempt: Mutex::new(None),
+            cleanup_result: Arc::new(Mutex::new(CleanupResult::default())),
+            join: Mutex::new(Some(old_actor_thread)),
+            finished: Arc::new(AtomicBool::new(false)),
+        });
+        runtime
+            .actors
+            .lock()
+            .expect("测试 actor map 锁必须可用")
+            .insert("scope-a".to_string(), old_handle);
+
+        let replacement = runtime
+            .actor_for_scope("scope-a")
+            .expect("replacement actor 必须可启动");
+        assert_eq!(
+            cleanup_observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("旧 actor cleanup 必须先于 replacement 返回被观察到"),
+            "shutdown",
+            "被移除的旧 actor 必须通过 shutdown 路径结束，而不是等 sender 断开"
+        );
+        drop(held_sender);
+        replacement.shutdown();
+    }
+
+    /// shutdown 取得提交门后，迟到 command 不得排在 Shutdown 之后进入无人消费队列。
+    #[test]
+    fn actor_shutdown_rejects_late_command_submission() {
+        let (sender, receiver) = mpsc::channel();
+        let (shutdown_seen, shutdown_observed) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let actor_thread = thread::spawn(move || match receiver.recv() {
+            Ok(ActorCommand::Shutdown { attempt }) => {
+                attempt.complete(CleanupResult::default());
+                shutdown_seen
+                    .send(())
+                    .expect("测试必须观察到 shutdown 已提交");
+                release_receiver.recv().expect("测试必须释放 actor thread");
+            }
+            Ok(_) => panic!("测试 actor 只接受 shutdown"),
+            Err(_) => panic!("测试 actor 不应先收到 sender 断开"),
+        });
+        let handle = Arc::new(ActorHandle {
+            scope_id: "scope-a".to_string(),
+            sender,
+            accepting: Arc::new(AtomicBool::new(true)),
+            exit_intent: Arc::new(AtomicBool::new(false)),
+            submission_lock: Arc::new(Mutex::new(())),
+            queued_commands: Arc::new(AtomicUsize::new(0)),
+            restart_blocked: Arc::new(AtomicBool::new(false)),
+            shutdown_submitted: AtomicBool::new(false),
+            shutdown_attempt: Mutex::new(None),
+            cleanup_result: Arc::new(Mutex::new(CleanupResult::default())),
+            join: Mutex::new(Some(actor_thread)),
+            finished: Arc::new(AtomicBool::new(false)),
+        });
+        let shutdown_handle = Arc::clone(&handle);
+        let (shutdown_done, shutdown_result) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            shutdown_done
+                .send(shutdown_handle.shutdown())
+                .expect("测试必须交付 shutdown 结果");
+        });
+
+        shutdown_observed
+            .recv_timeout(Duration::from_secs(1))
+            .expect("测试必须先观察到 shutdown 已进入 actor");
+        let (reply, _reply_receiver) = mpsc::sync_channel(1);
+        assert!(
+            handle.submit(ActorCommand::NewSession { reply }).is_err(),
+            "Shutdown 后的迟到 command 不得成功提交"
+        );
+        release_sender
+            .send(())
+            .expect("测试必须释放等待中的 shutdown actor");
+        let cleanup = shutdown_result
+            .recv_timeout(Duration::from_secs(1))
+            .expect("测试 shutdown 必须完成");
+        assert!(cleanup.is_success());
+    }
+
+    /// idle actor 已返回但尚未发布 finished 时，外部 shutdown 不得遗留无人消费的队列计数。
+    #[test]
+    fn idle_exit_and_shutdown_interleave_does_not_leak_shutdown_command() {
+        let temporary = tempfile::tempdir().expect("必须能创建 idle shutdown 交错测试目录");
+        let config = crate::HostRuntimeConfig {
+            home_root: temporary.path().join("app-data"),
+            sidecar_bin: temporary.path().join("unused-sidecar"),
+            sidecar_log_path: temporary.path().join("sidecar.log"),
+            mcp_exec_root: temporary.path().join("mcp"),
+            idle_after: Duration::from_millis(1),
+            l3b: L3bRuntimeConfig::default(),
+        };
+        let runtime = HostRuntime::new(LifecycleTestApp, NoopSink, config);
+        let service = runtime
+            .channel_service()
+            .expect("测试 actor 必须取得 Channel service");
+        let (_stdout_peer, stdout) =
+            std::os::unix::net::UnixStream::pair().expect("idle shutdown 测试必须创建 stdout pipe");
+        let acp = AcpRuntime::new(std::io::sink(), stdout);
+        let (sender, receiver) = mpsc::channel();
+        let accepting = Arc::new(AtomicBool::new(true));
+        let exit_intent = Arc::new(AtomicBool::new(false));
+        let submission_lock = Arc::new(Mutex::new(()));
+        let queued_commands = Arc::new(AtomicUsize::new(0));
+        let restart_blocked = Arc::new(AtomicBool::new(false));
+        let cleanup_result = Arc::new(Mutex::new(CleanupResult::default()));
+        let finished = Arc::new(AtomicBool::new(false));
+        let mut actor = ScopeActor::new(
+            "scope-a".to_string(),
+            acp,
+            HostPolicy::new(temporary.path()),
+            service,
+            Arc::new(NoopSink),
+            receiver,
+            Arc::clone(&accepting),
+            Arc::clone(&exit_intent),
+            Arc::clone(&submission_lock),
+            Arc::clone(&queued_commands),
+            Arc::clone(&restart_blocked),
+            Arc::clone(&cleanup_result),
+            Arc::clone(&runtime.terminal_outbox),
+            1,
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            ApprovedMcpSpec::default(),
+        );
+        actor.initialized = true;
+        actor.last_activity = Instant::now() - Duration::from_secs(1);
+
+        let idle_returned = Arc::new(std::sync::Barrier::new(2));
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let actor_finished = Arc::clone(&finished);
+        let actor_idle_returned = Arc::clone(&idle_returned);
+        let actor_thread = thread::spawn(move || {
+            actor.run();
+            // 故意延迟 finished 发布，固定复现自然退出与外部 shutdown 的交错窗口。
+            actor_idle_returned.wait();
+            release_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("测试必须释放已自然退出的 actor");
+            // 旧实现会把 Shutdown 发到已返回的 actor；这里只取走该消息以唤醒
+            // shutdown waiter，但不执行 actor 的队列计数扣减，模拟无人消费的遗留项。
+            if let Ok(ActorCommand::Shutdown { attempt }) =
+                actor.receiver.recv_timeout(Duration::from_millis(500))
+            {
+                attempt.complete(CleanupResult::default());
+            }
+            actor_finished.store(true, Ordering::Release);
+        });
+
+        idle_returned.wait();
+        assert!(!accepting.load(Ordering::Acquire));
+        let handle = Arc::new(ActorHandle {
+            scope_id: "scope-a".to_string(),
+            sender,
+            accepting: Arc::clone(&accepting),
+            exit_intent: Arc::clone(&exit_intent),
+            submission_lock: Arc::clone(&submission_lock),
+            queued_commands: Arc::clone(&queued_commands),
+            restart_blocked: Arc::clone(&restart_blocked),
+            shutdown_submitted: AtomicBool::new(false),
+            shutdown_attempt: Mutex::new(None),
+            cleanup_result,
+            join: Mutex::new(None),
+            finished,
+        });
+
+        // 让 shutdown 先等待提交门，再以 barrier 释放 actor，确保交错顺序稳定。
+        let submission_guard = handle.submission_lock.lock().expect("测试提交门必须可用");
+        let shutdown_handle = Arc::clone(&handle);
+        let (shutdown_done, shutdown_result) = mpsc::sync_channel(1);
+        let shutdown_thread = thread::spawn(move || {
+            let result = shutdown_handle.shutdown();
+            shutdown_done
+                .send(result)
+                .expect("测试必须交付 shutdown 结果");
+        });
+        drop(submission_guard);
+        for _ in 0..1000 {
+            if handle.shutdown_submitted.load(Ordering::Acquire) {
+                break;
+            }
+            thread::yield_now();
+        }
+        assert!(
+            handle.shutdown_submitted.load(Ordering::Acquire),
+            "测试必须观察到 shutdown 已完成原子状态转换"
+        );
+        release_sender.send(()).expect("测试必须释放自然退出 actor");
+        let _cleanup = shutdown_result
+            .recv_timeout(Duration::from_secs(1))
+            .expect("shutdown 必须在交错测试中完成");
+        shutdown_thread
+            .join()
+            .expect("测试 shutdown 线程必须正常退出");
+        actor_thread
+            .join()
+            .expect("测试自然退出 actor 线程必须正常退出");
+        assert_eq!(
+            queued_commands.load(Ordering::Acquire),
+            0,
+            "自然退出后的 shutdown 不得留下无人消费的 queued command"
+        );
+    }
+
+    /// submission lock 中毒时，idle 退出仍必须执行资源 cleanup，不能直接丢弃 actor。
+    #[test]
+    fn poisoned_submission_lock_does_not_skip_idle_cleanup() {
+        let temporary = tempfile::tempdir().expect("必须能创建 submission lock 测试目录");
+        let config = crate::HostRuntimeConfig {
+            home_root: temporary.path().join("app-data"),
+            sidecar_bin: temporary.path().join("unused-sidecar"),
+            sidecar_log_path: temporary.path().join("sidecar.log"),
+            mcp_exec_root: temporary.path().join("mcp"),
+            idle_after: Duration::from_millis(1),
+            l3b: L3bRuntimeConfig::default(),
+        };
+        let runtime = HostRuntime::new(LifecycleTestApp, NoopSink, config);
+        let service = runtime
+            .channel_service()
+            .expect("测试 actor 必须取得 Channel service");
+        let (_stdout_peer, stdout) = std::os::unix::net::UnixStream::pair()
+            .expect("submission lock 测试必须创建 stdout pipe");
+        let acp = AcpRuntime::new(std::io::sink(), stdout);
+        let (_sender, receiver) = mpsc::channel();
+        let accepting = Arc::new(AtomicBool::new(true));
+        let exit_intent = Arc::new(AtomicBool::new(false));
+        let submission_lock = Arc::new(Mutex::new(()));
+        let poison_lock = Arc::clone(&submission_lock);
+        thread::spawn(move || {
+            let _guard = poison_lock.lock().expect("测试必须先取得 submission lock");
+            panic!("测试故意让 submission lock 中毒");
+        })
+        .join()
+        .expect_err("测试必须制造 poisoned submission lock");
+        let queued_commands = Arc::new(AtomicUsize::new(0));
+        let restart_blocked = Arc::new(AtomicBool::new(false));
+        let cleanup_result = Arc::new(Mutex::new(CleanupResult::default()));
+        let mut actor = ScopeActor::new(
+            "scope-a".to_string(),
+            acp,
+            HostPolicy::new(temporary.path()),
+            service,
+            Arc::new(NoopSink),
+            receiver,
+            Arc::clone(&accepting),
+            Arc::clone(&exit_intent),
+            submission_lock,
+            Arc::clone(&queued_commands),
+            Arc::clone(&restart_blocked),
+            cleanup_result,
+            Arc::new(Mutex::new(TerminalOutbox::default())),
+            1,
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            ApprovedMcpSpec::default(),
+        );
+        actor.initialized = true;
+        actor.last_activity = Instant::now() - Duration::from_secs(1);
+
+        assert!(actor.try_idle_stop_and_exit());
+        assert!(actor.cleanup_done, "poisoned lock 不得跳过 idle cleanup");
+        assert!(actor.acp_shutdown_done, "idle cleanup 必须关闭 ACP runtime");
+        assert!(
+            actor.scope_stop_done,
+            "idle cleanup 必须停止 Supervisor scope"
+        );
+        assert!(exit_intent.load(Ordering::Acquire));
+        assert_eq!(queued_commands.load(Ordering::Acquire), 0);
+    }
+
+    /// unsupported reverse request 的回复写入失败时，actor 必须进入 dead 并执行 cleanup，而不能吞掉错误。
+    #[test]
+    fn unsupported_reverse_reply_write_failure_marks_actor_dead() {
+        struct FailingWriter;
+
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "测试故意让 reverse reply 写入失败",
+                ))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let temporary = tempfile::tempdir().expect("必须能创建 reverse reply 测试目录");
+        let config = crate::HostRuntimeConfig {
+            home_root: temporary.path().join("app-data"),
+            sidecar_bin: temporary.path().join("unused-sidecar"),
+            sidecar_log_path: temporary.path().join("sidecar.log"),
+            mcp_exec_root: temporary.path().join("mcp"),
+            idle_after: Duration::from_secs(60),
+            l3b: L3bRuntimeConfig::default(),
+        };
+        let runtime = HostRuntime::new(LifecycleTestApp, NoopSink, config);
+        let service = runtime
+            .channel_service()
+            .expect("测试 actor 必须取得 Channel service");
+        let (mut stdout_peer, stdout) =
+            std::os::unix::net::UnixStream::pair().expect("reverse reply 测试必须创建 stdout pipe");
+        let acp = AcpRuntime::new(FailingWriter, stdout);
+        let (_sender, receiver) = mpsc::channel();
+        let accepting = Arc::new(AtomicBool::new(true));
+        let exit_intent = Arc::new(AtomicBool::new(false));
+        let submission_lock = Arc::new(Mutex::new(()));
+        let queued_commands = Arc::new(AtomicUsize::new(0));
+        let restart_blocked = Arc::new(AtomicBool::new(false));
+        let cleanup_result = Arc::new(Mutex::new(CleanupResult::default()));
+        let mut actor = ScopeActor::new(
+            "scope-a".to_string(),
+            acp,
+            HostPolicy::new(temporary.path()),
+            service,
+            Arc::new(NoopSink),
+            receiver,
+            Arc::clone(&accepting),
+            Arc::clone(&exit_intent),
+            Arc::clone(&submission_lock),
+            Arc::clone(&queued_commands),
+            Arc::clone(&restart_blocked),
+            cleanup_result,
+            Arc::new(Mutex::new(TerminalOutbox::default())),
+            1,
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            ApprovedMcpSpec::default(),
+        );
+
+        std::io::Write::write_all(
+            &mut stdout_peer,
+            br#"{"jsonrpc":"2.0","id":7,"method":"_x.ai/ask_user_question","params":{"sessionId":"session-a"}}"#,
+        )
+        .and_then(|_| std::io::Write::write_all(&mut stdout_peer, b"\n"))
+        .expect("测试必须能注入 unsupported reverse request");
+        let (request_id, method, params) = loop {
+            match actor
+                .acp
+                .poll_inbound()
+                .expect("测试 reverse request 读取必须成功")
+            {
+                Some(Inbound::Request { id, method, params }) => break (id, method, params),
+                Some(_) | None => thread::sleep(Duration::from_millis(1)),
+            }
+        };
+
+        actor.handle_reverse_request(request_id, &method, &params);
+        assert!(
+            actor.dead,
+            "unsupported reverse reply 写入失败必须杀停 actor"
+        );
+        assert!(
+            !accepting.load(Ordering::Acquire),
+            "reply 写入失败后不得继续接受新的 scope command"
+        );
+        assert!(actor.cleanup_done, "reply 写入失败后必须完成 scope cleanup");
+        assert!(
+            actor.acp_shutdown_done,
+            "reply 写入失败后必须关闭 ACP runtime"
+        );
+        assert!(
+            actor.scope_stop_done,
+            "reply 写入失败后必须停止 Supervisor scope"
+        );
+        drop(stdout_peer);
+    }
+
+    /// catalog 请求写失败时 scope 必须 fail-closed；已成功创建的 session 回执仍保持真实结果。
+    #[test]
+    fn mcp_catalog_write_failure_stops_scope_without_lying_about_new_session() {
+        struct FailingWriter;
+
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "测试故意让 MCP catalog 写入失败",
+                ))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let temporary = tempfile::tempdir().expect("必须能创建 MCP 写失败测试目录");
+        let config = crate::HostRuntimeConfig {
+            home_root: temporary.path().join("app-data"),
+            sidecar_bin: temporary.path().join("unused-sidecar"),
+            sidecar_log_path: temporary.path().join("sidecar.log"),
+            mcp_exec_root: temporary.path().join("mcp"),
+            idle_after: Duration::from_secs(60),
+            l3b: L3bRuntimeConfig::default(),
+        };
+        let runtime = HostRuntime::new(LifecycleTestApp, NoopSink, config);
+        let service = runtime
+            .channel_service()
+            .expect("测试 actor 必须取得 Channel service");
+        let (_stdout_peer, stdout) =
+            std::os::unix::net::UnixStream::pair().expect("MCP 写失败测试必须创建 stdout pipe");
+        let acp = AcpRuntime::new(FailingWriter, stdout);
+        let (_sender, receiver) = mpsc::channel();
+        let accepting = Arc::new(AtomicBool::new(true));
+        let exit_intent = Arc::new(AtomicBool::new(false));
+        let submission_lock = Arc::new(Mutex::new(()));
+        let queued_commands = Arc::new(AtomicUsize::new(0));
+        let restart_blocked = Arc::new(AtomicBool::new(false));
+        let cleanup_result = Arc::new(Mutex::new(CleanupResult::default()));
+        let mut actor = ScopeActor::new(
+            "scope-a".to_string(),
+            acp,
+            HostPolicy::new(temporary.path()),
+            service,
+            Arc::new(NoopSink),
+            receiver,
+            Arc::clone(&accepting),
+            Arc::clone(&exit_intent),
+            Arc::clone(&submission_lock),
+            Arc::clone(&queued_commands),
+            Arc::clone(&restart_blocked),
+            cleanup_result,
+            Arc::new(Mutex::new(TerminalOutbox::default())),
+            1,
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            ApprovedMcpSpec::with_expected_tools(["purelab__search_tracks".to_string()]),
+        );
+        actor.initialized = true;
+        let (reply, reply_receiver) = mpsc::sync_channel(1);
+
+        actor.finish_new_session(reply, Ok(json!({ "sessionId": "session-a" })));
+
+        assert_eq!(
+            reply_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("session/new 成功结果必须仍交付给调用方")
+                .expect("session/new 已成功创建的结果不得被 MCP 可选探测改写"),
+            KitReply::NewSession {
+                session_id: "session-a".to_string()
+            }
+        );
+        assert!(actor.dead, "MCP catalog 写失败必须终止不可信 scope");
+        assert!(
+            !accepting.load(Ordering::Acquire),
+            "MCP catalog 写失败后不得继续接受 scope command"
+        );
+        assert!(
+            actor.pending.is_empty(),
+            "写失败 cleanup 不得遗留 ACP pending"
+        );
+        assert!(
+            actor.catalog_pending.is_empty(),
+            "MCP catalog 写失败不得登记未发送成功的 pending"
+        );
+    }
+
+    /// 构造只用于 request_send_actor 单元测试的外部 actor 句柄。
+    fn test_actor_handle(sender: Sender<ActorCommand>) -> ActorHandle {
+        ActorHandle {
+            scope_id: "scope-a".to_string(),
+            sender,
+            accepting: Arc::new(AtomicBool::new(true)),
+            exit_intent: Arc::new(AtomicBool::new(false)),
+            submission_lock: Arc::new(Mutex::new(())),
+            queued_commands: Arc::new(AtomicUsize::new(0)),
+            restart_blocked: Arc::new(AtomicBool::new(false)),
+            shutdown_submitted: AtomicBool::new(false),
+            shutdown_attempt: Mutex::new(None),
+            cleanup_result: Arc::new(Mutex::new(CleanupResult::default())),
+            join: Mutex::new(None),
+            finished: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// 调用方先超时且 actor 尚未 claim 时，submission 必须可安全回滚并再次登记。
+    #[test]
+    fn send_timeout_before_actor_claim_allows_submission_retry() {
+        let (sender, receiver) = mpsc::channel();
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let worker_gate = Arc::clone(&gate);
+        let worker = thread::spawn(move || {
+            worker_gate.wait();
+            let command = receiver
+                .recv()
+                .expect("测试 actor 必须收到已提交 Send command");
+            if let ActorCommand::Send { ticket, .. } = command {
+                assert_eq!(ticket.state(), SendTicketState::Abandoned);
+                assert!(
+                    !ticket.claim_for_prompt(),
+                    "调用方已 abandon 的 Send 不得再取得 prompt 写入权"
+                );
+            } else {
+                panic!("测试 actor 只接受 Send command");
+            }
+        });
+        let handle = test_actor_handle(sender);
+        let mut submissions = SubmissionMap::default();
+        let ticket = match submissions.record("scope-a", "session-a", "submission-a", "hello", &[])
+        {
+            SubmissionDecision::Accepted { ticket, .. } => ticket,
+            other => panic!("首次 submission 必须被接受，实际为 {other:?}"),
+        };
+
+        let result = request_send_actor_with_timeout(
+            &handle,
+            "session-a".to_string(),
+            "submission-a".to_string(),
+            "hello".to_string(),
+            ticket.clone(),
+            Duration::from_millis(10),
+        );
+        assert!(matches!(result, Err(SendRequestError::BeforePrompt(_))));
+        assert_eq!(ticket.state(), SendTicketState::Abandoned);
+        submissions.forget("scope-a", "session-a", "submission-a", &ticket);
+        assert!(matches!(
+            submissions.record("scope-a", "session-a", "submission-a", "hello", &[]),
+            SubmissionDecision::Accepted { .. }
+        ));
+
+        gate.wait();
+        worker.join().expect("测试 actor 线程必须正常退出");
+    }
+
+    /// 调用方超时但 actor 已完整写出 prompt 时，submission 必须保留重复抑制。
+    #[test]
+    fn send_timeout_after_prompt_write_keeps_duplicate_guard() {
+        let (sender, receiver) = mpsc::channel();
+        let (claimed_sender, claimed_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let command = receiver
+                .recv()
+                .expect("测试 actor 必须收到已提交 Send command");
+            if let ActorCommand::Send { ticket, .. } = command {
+                assert!(ticket.claim_for_prompt());
+                assert!(ticket.mark_written());
+                claimed_sender
+                    .send(())
+                    .expect("测试必须观察到 prompt 已写入");
+                release_receiver.recv().expect("测试必须释放已写入 actor");
+            } else {
+                panic!("测试 actor 只接受 Send command");
+            }
+        });
+        let handle = test_actor_handle(sender);
+        let mut submissions = SubmissionMap::default();
+        let ticket = match submissions.record("scope-a", "session-a", "submission-a", "hello", &[])
+        {
+            SubmissionDecision::Accepted { ticket, .. } => ticket,
+            other => panic!("首次 submission 必须被接受，实际为 {other:?}"),
+        };
+
+        let result = request_send_actor_with_timeout(
+            &handle,
+            "session-a".to_string(),
+            "submission-a".to_string(),
+            "hello".to_string(),
+            ticket.clone(),
+            Duration::from_millis(10),
+        );
+        claimed_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("测试 actor 必须先取得 prompt 写入权");
+        let result = result.expect_err("调用方应在 actor 回执前超时");
+        assert!(matches!(
+            result,
+            SendRequestError::PromptMayHaveBeenWritten(error)
+                if error.code == "sidecar_unavailable"
+        ));
+        assert_eq!(ticket.state(), SendTicketState::Written);
+        assert!(matches!(
+            submissions.record("scope-a", "session-a", "submission-a", "hello", &[]),
+            SubmissionDecision::Duplicate { .. }
+        ));
+
+        release_sender.send(()).expect("测试必须释放已写入 actor");
+        worker.join().expect("测试 actor 线程必须正常退出");
+    }
+
+    /// prompt 写阶段失败时只能报告可能已写入，不能把 submission 回滚为可重试。
+    #[test]
+    fn prompt_write_failure_marks_ticket_may_have_been_written() {
+        struct FailingWriter;
+
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "测试故意让 prompt 写入失败",
+                ))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let temporary = tempfile::tempdir().expect("必须能创建 prompt 写失败测试目录");
+        let (_stdout_peer, stdout) =
+            std::os::unix::net::UnixStream::pair().expect("prompt 写失败测试必须创建 stdout pipe");
+        let acp = AcpRuntime::new(FailingWriter, stdout);
+        let (_sender, receiver) = mpsc::channel();
+        let accepting = Arc::new(AtomicBool::new(true));
+        let exit_intent = Arc::new(AtomicBool::new(false));
+        let submission_lock = Arc::new(Mutex::new(()));
+        let queued_commands = Arc::new(AtomicUsize::new(0));
+        let restart_blocked = Arc::new(AtomicBool::new(false));
+        let cleanup_result = Arc::new(Mutex::new(CleanupResult::default()));
+        let mut actor = ScopeActor::new(
+            "scope-a".to_string(),
+            acp,
+            HostPolicy::new(temporary.path()).with_meta_key_for("session/prompt", "promptId"),
+            HostRuntime::new(
+                LifecycleTestApp,
+                NoopSink,
+                crate::HostRuntimeConfig {
+                    home_root: temporary.path().join("app-data"),
+                    sidecar_bin: temporary.path().join("unused-sidecar"),
+                    sidecar_log_path: temporary.path().join("sidecar.log"),
+                    mcp_exec_root: temporary.path().join("mcp"),
+                    idle_after: Duration::from_secs(60),
+                    l3b: L3bRuntimeConfig::default(),
+                },
+            )
+            .channel_service()
+            .expect("测试 actor 必须取得 Channel service"),
+            Arc::new(NoopSink),
+            receiver,
+            Arc::clone(&accepting),
+            Arc::clone(&exit_intent),
+            Arc::clone(&submission_lock),
+            Arc::clone(&queued_commands),
+            Arc::clone(&restart_blocked),
+            Arc::clone(&cleanup_result),
+            Arc::new(Mutex::new(TerminalOutbox::default())),
+            1,
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            ApprovedMcpSpec::default(),
+        );
+        actor.initialized = true;
+        let ticket = SendTicket::new();
+        let (reply, reply_receiver) = mpsc::sync_channel(1);
+        actor.write_prompt(
+            "session-a".to_string(),
+            "submission-a".to_string(),
+            "hello".to_string(),
+            ticket.clone(),
+            reply,
+        );
+        assert_eq!(ticket.state(), SendTicketState::MayHaveBeenWritten);
+        assert!(matches!(
+            reply_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("prompt 写失败必须回复调用方"),
+            Err(error) if error.code == "sidecar_unavailable"
+        ));
+    }
+
+    /// prompt 请求在真正触碰 stdin 前失败时，票据必须标记为明确未写入。
+    #[test]
+    fn prompt_validation_failure_marks_ticket_not_written() {
+        let temporary = tempfile::tempdir().expect("必须能创建 prompt 校验失败测试目录");
+        let (_stdout_peer, stdout) = std::os::unix::net::UnixStream::pair()
+            .expect("prompt 校验失败测试必须创建 stdout pipe");
+        let acp = AcpRuntime::new(std::io::sink(), stdout);
+        let (_sender, receiver) = mpsc::channel();
+        let accepting = Arc::new(AtomicBool::new(true));
+        let exit_intent = Arc::new(AtomicBool::new(false));
+        let submission_lock = Arc::new(Mutex::new(()));
+        let queued_commands = Arc::new(AtomicUsize::new(0));
+        let restart_blocked = Arc::new(AtomicBool::new(false));
+        let cleanup_result = Arc::new(Mutex::new(CleanupResult::default()));
+        let mut actor = ScopeActor::new(
+            "scope-a".to_string(),
+            acp,
+            HostPolicy::new(temporary.path()).with_meta_key_for("session/prompt", "promptId"),
+            HostRuntime::new(
+                LifecycleTestApp,
+                NoopSink,
+                crate::HostRuntimeConfig {
+                    home_root: temporary.path().join("app-data"),
+                    sidecar_bin: temporary.path().join("unused-sidecar"),
+                    sidecar_log_path: temporary.path().join("sidecar.log"),
+                    mcp_exec_root: temporary.path().join("mcp"),
+                    idle_after: Duration::from_secs(60),
+                    l3b: L3bRuntimeConfig::default(),
+                },
+            )
+            .channel_service()
+            .expect("测试 actor 必须取得 Channel service"),
+            Arc::new(NoopSink),
+            receiver,
+            Arc::clone(&accepting),
+            Arc::clone(&exit_intent),
+            Arc::clone(&submission_lock),
+            Arc::clone(&queued_commands),
+            Arc::clone(&restart_blocked),
+            Arc::clone(&cleanup_result),
+            Arc::new(Mutex::new(TerminalOutbox::default())),
+            1,
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            ApprovedMcpSpec::default(),
+        );
+        actor.initialized = true;
+        let ticket = SendTicket::new();
+        let (reply, reply_receiver) = mpsc::sync_channel(1);
+        actor.write_prompt(
+            String::new(),
+            "submission-a".to_string(),
+            "hello".to_string(),
+            ticket.clone(),
+            reply,
+        );
+        assert_eq!(ticket.state(), SendTicketState::NotWritten);
+        assert!(matches!(
+            reply_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("prompt 校验失败必须回复调用方"),
+            Err(error) if error.code == "sidecar_unavailable"
+        ));
+    }
+
+    /// 显式 shutdown 的资源 cleanup 失败后，actor 必须保留到下一次可控重试。
+    #[test]
+    fn explicit_shutdown_retries_failed_resource_cleanup_before_exit() {
+        struct PanicReader {
+            stream: std::os::unix::net::UnixStream,
+            read_started: Arc<AtomicBool>,
+        }
+
+        impl std::io::Read for PanicReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.read_started.store(true, Ordering::Release);
+                panic!("测试故意让 ACP reader worker 异常退出");
+            }
+        }
+
+        impl std::os::unix::io::AsRawFd for PanicReader {
+            fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+                self.stream.as_raw_fd()
+            }
+        }
+
+        let temporary = tempfile::tempdir().expect("必须能创建 shutdown cleanup 重试测试目录");
+        let config = crate::HostRuntimeConfig {
+            home_root: temporary.path().join("app-data"),
+            sidecar_bin: temporary.path().join("unused-sidecar"),
+            sidecar_log_path: temporary.path().join("sidecar.log"),
+            mcp_exec_root: temporary.path().join("mcp"),
+            idle_after: Duration::from_secs(60),
+            l3b: L3bRuntimeConfig::default(),
+        };
+        let runtime = HostRuntime::new(LifecycleTestApp, NoopSink, config);
+        let service = runtime
+            .channel_service()
+            .expect("测试 actor 必须取得 Channel service");
+        let (mut stdout_peer, stdout) = std::os::unix::net::UnixStream::pair()
+            .expect("shutdown cleanup 重试测试必须创建 stdout pipe");
+        let read_started = Arc::new(AtomicBool::new(false));
+        let acp = AcpRuntime::new(
+            std::io::sink(),
+            PanicReader {
+                stream: stdout,
+                read_started: Arc::clone(&read_started),
+            },
+        );
+        // 第一字节确保 reader 已进入 Read；之后 worker 的 panic 会让首次 join 失败。
+        std::io::Write::write_all(&mut stdout_peer, b"x").expect("测试必须触发 ACP reader 异常");
+        let read_deadline = Instant::now() + Duration::from_secs(1);
+        while !read_started.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < read_deadline,
+                "测试必须在期限内观察到 ACP reader 已进入 Read"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        let accepting = Arc::new(AtomicBool::new(true));
+        let exit_intent = Arc::new(AtomicBool::new(false));
+        let submission_lock = Arc::new(Mutex::new(()));
+        let queued_commands = Arc::new(AtomicUsize::new(0));
+        let restart_blocked = Arc::new(AtomicBool::new(false));
+        let cleanup_result = Arc::new(Mutex::new(CleanupResult::default()));
+        let finished = Arc::new(AtomicBool::new(false));
+        let mut actor = ScopeActor::new(
+            "scope-a".to_string(),
+            acp,
+            HostPolicy::new(temporary.path()),
+            service,
+            Arc::new(NoopSink),
+            receiver,
+            Arc::clone(&accepting),
+            Arc::clone(&exit_intent),
+            Arc::clone(&submission_lock),
+            Arc::clone(&queued_commands),
+            Arc::clone(&restart_blocked),
+            Arc::clone(&cleanup_result),
+            Arc::new(Mutex::new(TerminalOutbox::default())),
+            1,
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            ApprovedMcpSpec::default(),
+        );
+        actor.initialized = true;
+        let actor_finished = Arc::clone(&finished);
+        let actor_thread = thread::spawn(move || {
+            actor.run();
+            actor_finished.store(true, Ordering::Release);
+        });
+        let handle = ActorHandle {
+            scope_id: "scope-a".to_string(),
+            sender,
+            accepting,
+            exit_intent,
+            submission_lock,
+            queued_commands,
+            restart_blocked,
+            shutdown_submitted: AtomicBool::new(false),
+            shutdown_attempt: Mutex::new(None),
+            cleanup_result,
+            join: Mutex::new(Some(actor_thread)),
+            finished: Arc::clone(&finished),
+        };
+
+        let first = handle.shutdown();
+        assert!(
+            !first.is_success() && first.failures.contains(&CleanupFailureKind::AcpShutdown),
+            "首次 shutdown 必须暴露 reader cleanup 失败"
+        );
+        assert!(
+            !finished.load(Ordering::Acquire),
+            "资源 cleanup 失败后 actor 不得在重试前退出"
+        );
+
+        let second = handle.shutdown();
+        assert!(
+            second.is_success(),
+            "reader worker 已由首次 shutdown 结算后，第二次 cleanup 必须成功"
+        );
+        assert!(
+            finished.load(Ordering::Acquire),
+            "资源 cleanup 成功后 actor 必须退出"
+        );
+    }
+
+    /// 真实 actor 的 idle cleanup 失败不能销毁重试所需的 actor 生命周期。
+    #[test]
+    fn idle_cleanup_failure_remains_available_for_explicit_shutdown_retry() {
+        let temporary = tempfile::tempdir().expect("必须能创建 idle cleanup 重试测试目录");
+        let config = crate::HostRuntimeConfig {
+            home_root: temporary.path().join("app-data"),
+            sidecar_bin: temporary.path().join("unused-sidecar"),
+            sidecar_log_path: temporary.path().join("sidecar.log"),
+            mcp_exec_root: temporary.path().join("mcp"),
+            idle_after: Duration::from_millis(1),
+            l3b: L3bRuntimeConfig::default(),
+        };
+        let runtime = HostRuntime::new(LifecycleTestApp, NoopSink, config);
+        let service = runtime
+            .channel_service()
+            .expect("测试 actor 必须取得 Channel service");
+        // 保持 stdout peer 存活，避免 EOF 先把 actor 转成 dead，破坏 idle cleanup 场景。
+        let (_stdout_peer, stdout) = std::os::unix::net::UnixStream::pair()
+            .expect("idle cleanup 重试测试必须创建 stdout pipe");
+        let acp = AcpRuntime::new(std::io::sink(), stdout);
+        let (sender, receiver) = mpsc::channel();
+        let accepting = Arc::new(AtomicBool::new(true));
+        let exit_intent = Arc::new(AtomicBool::new(false));
+        let submission_lock = Arc::new(Mutex::new(()));
+        let queued_commands = Arc::new(AtomicUsize::new(0));
+        let restart_blocked = Arc::new(AtomicBool::new(false));
+        let cleanup_result = Arc::new(Mutex::new(CleanupResult::default()));
+        let finished = Arc::new(AtomicBool::new(false));
+        let mut actor = ScopeActor::new(
+            "invalid/scope".to_string(),
+            acp,
+            HostPolicy::new(temporary.path()),
+            service,
+            Arc::new(NoopSink),
+            receiver,
+            Arc::clone(&accepting),
+            Arc::clone(&exit_intent),
+            Arc::clone(&submission_lock),
+            Arc::clone(&queued_commands),
+            Arc::clone(&restart_blocked),
+            Arc::clone(&cleanup_result),
+            Arc::new(Mutex::new(TerminalOutbox::default())),
+            1,
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            ApprovedMcpSpec::default(),
+        );
+        actor.initialized = true;
+        actor.last_activity = Instant::now() - Duration::from_secs(1);
+
+        let actor_finished = Arc::clone(&finished);
+        let actor_thread = thread::spawn(move || {
+            actor.run();
+            actor_finished.store(true, Ordering::Release);
+        });
+        let handle = ActorHandle {
+            scope_id: "invalid/scope".to_string(),
+            sender,
+            accepting,
+            exit_intent,
+            submission_lock,
+            queued_commands,
+            restart_blocked,
+            shutdown_submitted: AtomicBool::new(false),
+            shutdown_attempt: Mutex::new(None),
+            cleanup_result: Arc::clone(&cleanup_result),
+            join: Mutex::new(Some(actor_thread)),
+            finished: Arc::clone(&finished),
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let failed = cleanup_result
+                .lock()
+                .expect("测试 cleanup 结果锁必须可用")
+                .failures
+                .contains(&CleanupFailureKind::ScopeStop);
+            if failed {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "idle cleanup 必须在测试期限内暴露 scope stop 失败"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !finished.load(Ordering::Acquire),
+            "idle cleanup 失败后 actor 必须保持存活，以便显式 shutdown 重试"
+        );
+
+        let cleanup = handle.shutdown();
+        assert!(
+            !cleanup.is_success() && cleanup.failures.contains(&CleanupFailureKind::ScopeStop),
+            "显式 shutdown 必须可达并报告仍失败的 scope stop 步骤"
+        );
+        assert!(
+            !finished.load(Ordering::Acquire),
+            "scope stop 仍失败时 actor 必须保留到下一次 cleanup 边界"
+        );
+
+        // 测试中的 scope 标识始终非法，释放最后一个 sender 以模拟 runtime 终止并收尾 actor。
+        drop(handle);
+        let finish_deadline = Instant::now() + Duration::from_secs(1);
+        while !finished.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < finish_deadline,
+                "runtime 终止后 actor 必须在期限内结束"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// cleanup 某一步失败后，后续调用必须只重试失败步骤并清除已恢复的失败状态。
+    #[test]
+    fn cleanup_retries_failed_scope_stop_step() {
+        let temporary = tempfile::tempdir().expect("必须能创建 cleanup 重试测试目录");
+        let config = crate::HostRuntimeConfig {
+            home_root: temporary.path().join("app-data"),
+            sidecar_bin: temporary.path().join("unused-sidecar"),
+            sidecar_log_path: temporary.path().join("sidecar.log"),
+            mcp_exec_root: temporary.path().join("mcp"),
+            idle_after: Duration::from_secs(60),
+            l3b: L3bRuntimeConfig::default(),
+        };
+        let runtime = HostRuntime::new(LifecycleTestApp, NoopSink, config);
+        let service = runtime
+            .channel_service()
+            .expect("测试 actor 必须取得 Channel service");
+        let (_stdout_peer, stdout) =
+            std::os::unix::net::UnixStream::pair().expect("cleanup 重试测试必须创建 stdout pipe");
+        let acp = AcpRuntime::new(std::io::sink(), stdout);
+        let (_sender, receiver) = mpsc::channel();
+        let accepting = Arc::new(AtomicBool::new(true));
+        let exit_intent = Arc::new(AtomicBool::new(false));
+        let submission_lock = Arc::new(Mutex::new(()));
+        let queued_commands = Arc::new(AtomicUsize::new(0));
+        let restart_blocked = Arc::new(AtomicBool::new(false));
+        let cleanup_result = Arc::new(Mutex::new(CleanupResult::default()));
+        let mut actor = ScopeActor::new(
+            "invalid/scope".to_string(),
+            acp,
+            HostPolicy::new(temporary.path()),
+            service,
+            Arc::new(NoopSink),
+            receiver,
+            Arc::clone(&accepting),
+            Arc::clone(&exit_intent),
+            Arc::clone(&submission_lock),
+            Arc::clone(&queued_commands),
+            Arc::clone(&restart_blocked),
+            Arc::clone(&cleanup_result),
+            Arc::new(Mutex::new(TerminalOutbox::default())),
+            1,
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            ApprovedMcpSpec::default(),
+        );
+
+        let first = actor.cleanup_resources();
+        assert!(
+            !first.is_success(),
+            "非法 scope 必须让第一次 stop cleanup 暴露失败"
+        );
+        actor.scope_id = "scope-a".to_string();
+        let retry = actor.cleanup_resources();
+        assert!(
+            retry.is_success(),
+            "第二次 cleanup 必须重试已失败的 scope stop 步骤"
+        );
+    }
+
+    /// sequence 分配失败时不能先消费 terminal marker；恢复序号后同一回合仍应可结算。
+    #[test]
+    fn terminal_sequence_exhaustion_can_retry_without_losing_terminal_marker() {
+        struct RecordingSink {
+            events: Arc<Mutex<Vec<KitProductEvent>>>,
+        }
+
+        impl KitEventSink for RecordingSink {
+            fn emit(&self, event: KitProductEvent) -> Result<()> {
+                self.events.lock().expect("测试事件锁必须可用").push(event);
+                Ok(())
+            }
+        }
+
+        let temporary = tempfile::tempdir().expect("必须能创建 terminal sequence 测试目录");
+        let config = crate::HostRuntimeConfig {
+            home_root: temporary.path().join("app-data"),
+            sidecar_bin: temporary.path().join("unused-sidecar"),
+            sidecar_log_path: temporary.path().join("sidecar.log"),
+            mcp_exec_root: temporary.path().join("mcp"),
+            idle_after: Duration::from_secs(60),
+            l3b: L3bRuntimeConfig::default(),
+        };
+        let runtime = HostRuntime::new(LifecycleTestApp, NoopSink, config);
+        let service = runtime
+            .channel_service()
+            .expect("测试 actor 必须取得 Channel service");
+        let (_stdout_peer, stdout) = std::os::unix::net::UnixStream::pair()
+            .expect("terminal sequence 测试必须创建 stdout pipe");
+        let acp = AcpRuntime::new(std::io::sink(), stdout);
+        let (_sender, receiver) = mpsc::channel();
+        let accepting = Arc::new(AtomicBool::new(true));
+        let exit_intent = Arc::new(AtomicBool::new(false));
+        let submission_lock = Arc::new(Mutex::new(()));
+        let queued_commands = Arc::new(AtomicUsize::new(0));
+        let restart_blocked = Arc::new(AtomicBool::new(false));
+        let cleanup_result = Arc::new(Mutex::new(CleanupResult::default()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut actor = ScopeActor::new(
+            "scope-a".to_string(),
+            acp,
+            HostPolicy::new(temporary.path()),
+            service,
+            Arc::new(RecordingSink {
+                events: Arc::clone(&events),
+            }),
+            receiver,
+            Arc::clone(&accepting),
+            Arc::clone(&exit_intent),
+            Arc::clone(&submission_lock),
+            Arc::clone(&queued_commands),
+            Arc::clone(&restart_blocked),
+            cleanup_result,
+            Arc::new(Mutex::new(TerminalOutbox::default())),
+            1,
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            ApprovedMcpSpec::default(),
+        );
+
+        actor
+            .projector
+            .set_next_sequence_for_test("session-a", u64::MAX);
+        actor.in_flight.insert(
+            "session-a".to_string(),
+            InFlightTurn {
+                submission_id: "submission-a".to_string(),
+                cancelled: false,
+            },
+        );
+        actor.finish_in_flight_turns("error", "终态错误");
+        assert!(
+            !actor
+                .terminal_turns
+                .contains(&("session-a".to_string(), "submission-a".to_string())),
+            "sequence 分配失败不得永久消费 terminal marker"
+        );
+        assert!(
+            events.lock().expect("测试事件锁必须可用").is_empty(),
+            "sequence 分配失败时 terminal 不能假报已运输"
+        );
+        assert_eq!(
+            actor.pending_terminal_intents.len(),
+            1,
+            "sequence 分配失败必须保留可重试的 terminal 意图"
+        );
+
+        actor.projector.set_next_sequence_for_test("session-a", 0);
+        actor.retry_pending_terminal_events_now();
+        let events = events.lock().expect("测试事件锁必须可用");
+        assert_eq!(events.len(), 1, "恢复序号后同一 terminal 必须仍可运输");
+        assert_eq!(events[0].event_id, "session-a:host:error:0");
+        assert_eq!(events[0].sequence, 0);
+    }
+
+    /// 已报告 terminal cleanup 失败但 actor 仍存活时，下一次 shutdown 必须重新投递 attempt。
+    #[test]
+    fn shutdown_retries_terminal_failure_before_actor_exit() {
+        let (sender, receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_thread = Arc::clone(&attempts);
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_thread = Arc::clone(&finished);
+        let queued_commands = Arc::new(AtomicUsize::new(0));
+        let queued_commands_thread = Arc::clone(&queued_commands);
+        let actor_thread = thread::spawn(move || {
+            match receiver.recv() {
+                Ok(ActorCommand::Shutdown { attempt }) => {
+                    queued_commands_thread.fetch_sub(1, Ordering::AcqRel);
+                    attempts_thread.fetch_add(1, Ordering::AcqRel);
+                    let mut result = CleanupResult::default();
+                    result.record(CleanupFailureKind::TerminalEvent);
+                    attempt.complete(result);
+                }
+                Ok(_) => panic!("测试 actor 首个 command 必须是 shutdown"),
+                Err(_) => panic!("测试 actor 不应先收到 sender 断开"),
+            }
+
+            loop {
+                if release_receiver.try_recv().is_ok() {
+                    break;
+                }
+                match receiver.recv_timeout(Duration::from_millis(5)) {
+                    Ok(ActorCommand::Shutdown { attempt }) => {
+                        queued_commands_thread.fetch_sub(1, Ordering::AcqRel);
+                        attempts_thread.fetch_add(1, Ordering::AcqRel);
+                        attempt.complete(CleanupResult::default());
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            finished_thread.store(true, Ordering::Release);
+        });
+        let handle = Arc::new(ActorHandle {
+            scope_id: "scope-a".to_string(),
+            sender,
+            accepting: Arc::new(AtomicBool::new(true)),
+            exit_intent: Arc::new(AtomicBool::new(false)),
+            submission_lock: Arc::new(Mutex::new(())),
+            queued_commands,
+            restart_blocked: Arc::new(AtomicBool::new(false)),
+            shutdown_submitted: AtomicBool::new(false),
+            shutdown_attempt: Mutex::new(None),
+            cleanup_result: Arc::new(Mutex::new(CleanupResult::default())),
+            join: Mutex::new(Some(actor_thread)),
+            finished,
+        });
+
+        let first = handle.shutdown_with_timeout(Duration::from_millis(100));
+        assert!(first.failures.contains(&CleanupFailureKind::TerminalEvent));
+
+        let second = handle.shutdown_with_timeout(Duration::from_millis(500));
+        let _ = release_sender.send(());
+        let mut join_result = CleanupResult::default();
+        handle.join_if_finished(Duration::from_secs(1), &mut join_result);
+        assert_eq!(attempts.load(Ordering::Acquire), 2);
+        assert!(
+            second.is_success(),
+            "第二次 shutdown 必须取得新的成功 attempt"
+        );
+    }
+
+    /// terminal outbox 已成功运输后，完成的 shutdown attempt 必须同步清除旧失败。
+    #[test]
+    fn delivered_terminal_event_clears_completed_shutdown_failure() {
+        let attempt = ShutdownAttempt::new();
+        let mut failure = CleanupResult::default();
+        failure.record(CleanupFailureKind::TerminalEvent);
+        attempt.complete(failure);
+
+        attempt.clear_failure(CleanupFailureKind::TerminalEvent);
+
+        assert_eq!(attempt.snapshot(), Some(CleanupResult::default()));
+    }
+
+    /// shutdown 收到 actor 回执后也不得无界 join 仍在运行的 actor thread。
+    #[test]
+    fn actor_shutdown_returns_bounded_failure_without_joining_running_thread() {
+        let (sender, receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let actor_thread = thread::spawn(move || match receiver.recv() {
+            Ok(ActorCommand::Shutdown { attempt }) => {
+                attempt.complete(CleanupResult::default());
+                release_receiver
+                    .recv()
+                    .expect("测试必须释放仍在运行的 actor thread");
+            }
+            Ok(_) => panic!("测试 actor 只接受 shutdown"),
+            Err(_) => panic!("测试 actor 不应先收到 sender 断开"),
+        });
+        let handle = Arc::new(ActorHandle {
+            scope_id: "scope-a".to_string(),
+            sender,
+            accepting: Arc::new(AtomicBool::new(true)),
+            exit_intent: Arc::new(AtomicBool::new(false)),
+            submission_lock: Arc::new(Mutex::new(())),
+            queued_commands: Arc::new(AtomicUsize::new(0)),
+            restart_blocked: Arc::new(AtomicBool::new(false)),
+            shutdown_submitted: AtomicBool::new(false),
+            shutdown_attempt: Mutex::new(None),
+            cleanup_result: Arc::new(Mutex::new(CleanupResult::default())),
+            join: Mutex::new(Some(actor_thread)),
+            finished: Arc::new(AtomicBool::new(false)),
+        });
+        let shutdown_handle = Arc::clone(&handle);
+        let (shutdown_done, shutdown_result) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            shutdown_done
+                .send(shutdown_handle.shutdown())
+                .expect("测试必须交付有界 shutdown 结果");
+        });
+
+        let early_result = shutdown_result.recv_timeout(Duration::from_millis(500));
+        let returned_before_release = early_result.is_ok();
+        release_sender
+            .send(())
+            .expect("测试必须释放阻塞的 actor thread");
+        let cleanup = match early_result {
+            Ok(cleanup) => cleanup,
+            Err(_) => shutdown_result
+                .recv_timeout(Duration::from_secs(1))
+                .expect("释放 actor 后 shutdown thread 必须可收尾"),
+        };
+        assert!(
+            returned_before_release,
+            "shutdown 不得在回执后无界等待 actor join"
+        );
+        assert!(
+            !cleanup.is_success(),
+            "未确认 actor 已结束时必须 fail-closed 返回 cleanup 失败"
+        );
+    }
+
+    /// 调用方超时后，后续 cleanup 必须观察同一个已完成的 Shutdown attempt，不能永久粘住失败。
+    #[test]
+    fn timed_out_shutdown_reuses_completed_attempt_without_duplicate_command() {
+        let (sender, receiver) = mpsc::channel();
+        let (shutdown_seen, shutdown_observed) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let finished = Arc::new(AtomicBool::new(false));
+        let actor_finished = Arc::clone(&finished);
+        let actor_thread = thread::spawn(move || {
+            match receiver.recv() {
+                Ok(ActorCommand::Shutdown { attempt }) => {
+                    shutdown_seen
+                        .send(())
+                        .expect("测试必须观察到 shutdown command");
+                    release_receiver
+                        .recv()
+                        .expect("测试必须释放待完成的 shutdown attempt");
+                    attempt.complete(CleanupResult::default());
+                }
+                Ok(_) => panic!("测试 actor 只接受 shutdown"),
+                Err(_) => {}
+            }
+            actor_finished.store(true, Ordering::Release);
+        });
+        let handle = ActorHandle {
+            scope_id: "scope-a".to_string(),
+            sender,
+            accepting: Arc::new(AtomicBool::new(true)),
+            exit_intent: Arc::new(AtomicBool::new(false)),
+            submission_lock: Arc::new(Mutex::new(())),
+            queued_commands: Arc::new(AtomicUsize::new(0)),
+            restart_blocked: Arc::new(AtomicBool::new(false)),
+            shutdown_submitted: AtomicBool::new(false),
+            shutdown_attempt: Mutex::new(None),
+            cleanup_result: Arc::new(Mutex::new(CleanupResult::default())),
+            join: Mutex::new(Some(actor_thread)),
+            finished,
+        };
+
+        let first = handle.shutdown_with_timeout(Duration::from_millis(10));
+        shutdown_observed
+            .recv_timeout(Duration::from_secs(1))
+            .expect("首次 shutdown 必须已经进入 actor");
+        assert!(
+            !first.is_success(),
+            "调用方超时必须先返回 cleanup 失败，而不是假报成功"
+        );
+        release_sender
+            .send(())
+            .expect("测试必须释放已提交的 shutdown attempt");
+        let finish_deadline = Instant::now() + Duration::from_secs(1);
+        while !handle.finished.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < finish_deadline,
+                "已完成 shutdown attempt 必须在期限内结束 actor"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let retry = handle.shutdown_with_timeout(Duration::from_millis(100));
+        assert!(
+            retry.is_success(),
+            "后续 cleanup 观察到资源成功完成后不得被首次 timeout 的 ack 失败永久阻塞"
+        );
+        assert_eq!(
+            handle.queued_commands.load(Ordering::Acquire),
+            1,
+            "已完成的 shutdown attempt 不得再次入队"
+        );
+    }
+
+    /// 活跃 LoadFlight 的结算必须同时匹配 owner、session、replay epoch 与 generation。
+    #[test]
+    fn active_load_settlement_rejects_each_mismatched_identity_field() {
+        let flight = LoadFlight {
+            session_id: "session-1".to_string(),
+            owner_request_id: RequestId::new(41),
+            replay_epoch: 7,
+            waiters: Vec::new(),
+            accepted_resume: true,
+            pending_send: None,
+            deadline: Instant::now() + Duration::from_secs(1),
+            generation: 3,
+            state: LoadFlightState::AcpWritten,
+        };
+
+        assert!(ScopeActor::load_flight_matches(
+            &flight,
+            RequestId::new(41),
+            "session-1",
+            7,
+            3,
+        ));
+        for (label, owner, session, epoch, generation) in [
+            ("owner", RequestId::new(42), "session-1", 7, 3),
+            ("session", RequestId::new(41), "session-2", 7, 3),
+            ("replay_epoch", RequestId::new(41), "session-1", 8, 3),
+            ("generation", RequestId::new(41), "session-1", 7, 4),
+        ] {
+            assert!(
+                !ScopeActor::load_flight_matches(&flight, owner, session, epoch, generation),
+                "active settlement must reject {label} mismatch"
+            );
+        }
+    }
+
+    /// outbox 锁不可用时，actor 仍须保留 terminal pending 以便后续 cleanup 重试。
+    #[test]
+    fn terminal_outbox_lock_failure_preserves_pending_event_for_retry() {
+        let temporary = tempfile::tempdir().expect("必须能创建 terminal outbox 测试目录");
+        let config = crate::HostRuntimeConfig {
+            home_root: temporary.path().join("app-data"),
+            sidecar_bin: temporary.path().join("unused-sidecar"),
+            sidecar_log_path: temporary.path().join("sidecar.log"),
+            mcp_exec_root: temporary.path().join("mcp"),
+            idle_after: Duration::from_secs(60),
+            l3b: L3bRuntimeConfig::default(),
+        };
+        let runtime = HostRuntime::new(LifecycleTestApp, NoopSink, config);
+        let service = runtime
+            .channel_service()
+            .expect("测试 actor 必须取得 Channel service");
+        let (_stdout_peer, stdout) = std::os::unix::net::UnixStream::pair()
+            .expect("terminal outbox 测试必须创建 stdout pipe");
+        let acp = AcpRuntime::new(std::io::sink(), stdout);
+        let (_sender, receiver) = mpsc::channel();
+        let accepting = Arc::new(AtomicBool::new(true));
+        let exit_intent = Arc::new(AtomicBool::new(false));
+        let submission_lock = Arc::new(Mutex::new(()));
+        let queued_commands = Arc::new(AtomicUsize::new(0));
+        let restart_blocked = Arc::new(AtomicBool::new(false));
+        let cleanup_result = Arc::new(Mutex::new(CleanupResult::default()));
+        let terminal_outbox = Arc::new(Mutex::new(TerminalOutbox::default()));
+        let mut actor = ScopeActor::new(
+            "scope-a".to_string(),
+            acp,
+            HostPolicy::new(temporary.path()),
+            service,
+            Arc::new(NoopSink),
+            receiver,
+            accepting,
+            exit_intent,
+            submission_lock,
+            queued_commands,
+            restart_blocked,
+            cleanup_result,
+            Arc::clone(&terminal_outbox),
+            1,
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            ApprovedMcpSpec::default(),
+        );
+        let event_id = "session-a:host:error:0".to_string();
+        actor.pending_terminal_events.insert(
+            ("session-a".to_string(), "submission-a".to_string()),
+            PendingTerminalEvent {
+                event: KitProductEvent {
+                    schema_version: KIT_SCHEMA_VERSION,
+                    scope_id: "scope-a".to_string(),
+                    session_id: "session-a".to_string(),
+                    turn_id: Some("submission-a".to_string()),
+                    submission_id: Some("submission-a".to_string()),
+                    event_id: event_id.clone(),
+                    sequence: 0,
+                    origin: Origin::Live,
+                    block_id: event_id,
+                    block: KitBlock::Status {
+                        code: "error".to_string(),
+                        message: "终态错误".to_string(),
+                    },
+                },
+                retain: true,
+                next_attempt: Instant::now(),
+            },
+        );
+
+        let poisoned_outbox = Arc::clone(&terminal_outbox);
+        let _ = thread::spawn(move || {
+            let _guard = poisoned_outbox.lock().expect("测试必须先取得 outbox 锁");
+            panic!("故意 poison terminal outbox 锁");
+        })
+        .join();
+
+        actor.handoff_pending_terminal_events();
+
+        assert!(
+            actor.pending_terminal_events.is_empty(),
+            "outbox 接管成功后 actor 不应继续持有 terminal pending"
+        );
+        let outbox = terminal_outbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            outbox.pending.len(),
+            1,
+            "poisoned outbox 仍必须接管 terminal event"
+        );
+        let event = outbox
+            .pending
+            .values()
+            .next()
+            .expect("outbox 必须保留 terminal event");
+        assert_eq!(event.event.event_id, "session-a:host:error:0");
     }
 }

@@ -1,0 +1,5 @@
+{"timestamp":1,"method":"session/update","params":{"sessionId":"legacy-1","_meta":{"promptId":"prompt-compaction"},"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"compaction user"}}}}
+{"timestamp":2,"method":"session/update","params":{"sessionId":"legacy-1","_meta":{"promptId":"prompt-compaction"},"update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"compaction thinking"}}}}
+{"timestamp":3,"method":"session/update","params":{"sessionId":"legacy-1","_meta":{"promptId":"prompt-compaction"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"compaction assistant"}}}}
+{"timestamp":3,"method":"_x.ai/session/update","params":{"sessionId":"legacy-1","update":{"sessionUpdate":"turn_completed","prompt_id":"prompt-compaction","stop_reason":"completed"}}}
+{"timestamp":4,"method":"_x.ai/session/update","params":{"sessionId":"legacy-1","update":{"sessionUpdate":"compaction_checkpoint","checkpoint_id":"checkpoint-1","checkpoint_file":"compaction_checkpoints/checkpoint-1.json","created_at":"2026-08-29T00:00:04Z","prompt_index_at_compaction":1,"schema_version":1}}}

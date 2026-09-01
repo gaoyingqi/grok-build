@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
+use efflab_agent_contract::is_prompt_id;
 use serde_json::{Map, Value};
 
 use crate::{
@@ -236,6 +237,15 @@ impl Projector {
             .entry(session_id.to_string())
             .or_default()
             .allocate_sequence()
+    }
+
+    /// 仅供 Host runtime 单元测试构造 sequence 耗尽边界；生产代码没有回退入口。
+    #[cfg(test)]
+    pub(crate) fn set_next_sequence_for_test(&mut self, session_id: &str, next_sequence: u64) {
+        self.sessions
+            .entry(session_id.to_string())
+            .or_default()
+            .next_sequence = next_sequence;
     }
 
     /// 应用一个 ACP notification 的 params，返回零条或多条已校验的 Kit 事件。
@@ -773,7 +783,7 @@ fn required_prompt_id<'a>(
 ) -> Result<&'a str, ProjectError> {
     meta.and_then(|meta| meta.get("promptId"))
         .and_then(Value::as_str)
-        .filter(|prompt_id| !prompt_id.is_empty())
+        .filter(|prompt_id| is_prompt_id(prompt_id))
         .ok_or(ProjectError::MissingPromptId { update_kind })
 }
 

@@ -11,6 +11,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
+use crate::mcp_config::{is_qualified_tool_name, is_server_name};
 use crate::stdio_mcp::deny_stdio_mcp;
 use crate::{
     ApprovedMcpConfig, LoopbackModelSpec, McpServerSpec, RuntimeConfigV1, SidecarModelSpec,
@@ -90,10 +91,46 @@ pub fn render_runtime_config_v1(config: &RuntimeConfigV1) -> Result<String> {
 
 /// 从 Host 写出的 v1 TOML 读取配置，并在任何后续使用前完成闭集与 revision 校验。
 pub fn load_runtime_config_v1(path: &Path) -> Result<RuntimeConfigV1> {
-    let source = fs::read_to_string(path)
-        .with_context(|| format!("读取 RuntimeConfigV1 TOML 失败: {}", path.display()))?;
-    let config: RuntimeConfigV1 = toml::from_str(&source)
-        .with_context(|| format!("解析 RuntimeConfigV1 TOML 失败: {}", path.display()))?;
+    let source = fs::read_to_string(path).context("读取 RuntimeConfigV1 TOML 失败")?;
+    load_runtime_config_v1_from_str(&source)
+}
+
+/// 校验 Host/sidecar 共用的绝对 UTF-8 session cwd 词法合同。
+///
+/// 该函数只做输入 shape 校验，不访问文件系统；实际目录存在性和 no-follow 约束由
+/// sidecar 的 Unix hardening 层继续完成。`&str` 已保证 UTF-8，长度按字节计算。
+pub fn validate_session_cwd(value: &str) -> Result<()> {
+    if value.is_empty() {
+        bail!("session_cwd 不能为空");
+    }
+    if value.len() > MAX_RUNTIME_PATH_BYTES {
+        bail!("session_cwd 长度不能超过 {MAX_RUNTIME_PATH_BYTES} 字节");
+    }
+    if value.as_bytes().contains(&0) {
+        bail!("session_cwd 不允许包含 NUL");
+    }
+
+    let path = Path::new(value);
+    if !path.is_absolute() {
+        bail!("session_cwd 必须是绝对 UTF-8 路径");
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!("session_cwd 不允许包含 ..");
+    }
+    Ok(())
+}
+
+/// 校验已经由调用方安全读取的 v1 TOML 文本。
+///
+/// sidecar 通过受保护的文件句柄读取配置后调用本函数，避免校验一次路径文件、
+/// 再用另一次路径打开得到不同内容。所有 schema、stdio 和 revision 规则在此统一收口。
+pub fn load_runtime_config_v1_from_str(source: &str) -> Result<RuntimeConfigV1> {
+    // 丢弃 TOML parser 的原始错误；未知字段和 MCP server 名可能来自不可信 runtime wire。
+    let config: RuntimeConfigV1 =
+        toml::from_str(source).map_err(|_| anyhow::anyhow!("runtime_config_invalid"))?;
 
     // stdio 必须在 revision 等其他策略校验之前统一走 Task 3 helper，保持稳定错误码。
     deny_stdio_mcp(&config.approved_mcp)?;
@@ -145,14 +182,14 @@ fn validate_runtime_config_v1(config: &RuntimeConfigV1) -> Result<()> {
     if config.session_store_version != RUNTIME_SESSION_STORE_VERSION {
         bail!("session_store_version 必须为 {RUNTIME_SESSION_STORE_VERSION}");
     }
-    if config.session_cwd.is_empty() {
-        bail!("session_cwd 不能为空");
-    }
-    if config.session_cwd.len() > MAX_RUNTIME_PATH_BYTES {
-        bail!("session_cwd 长度不能超过 {MAX_RUNTIME_PATH_BYTES} 字节");
-    }
-    if !Path::new(&config.session_cwd).is_absolute() {
-        bail!("session_cwd 必须是绝对 UTF-8 路径");
+    validate_session_cwd(&config.session_cwd)?;
+
+    // expected_tools 与 Host 审核摘要复用同一 qualified-name 语法。
+    // tool 长度与完整名称的记录上限仍由 sidecar 运行时处理。
+    for tool in &config.expected_tools {
+        if !is_qualified_tool_name(tool) {
+            bail!("expected_tools 包含非法 MCP qualified tool 名称");
+        }
     }
 
     let model_id = &config.model.model_id;
@@ -177,15 +214,14 @@ fn validate_runtime_config_v1(config: &RuntimeConfigV1) -> Result<()> {
     }
 
     for (name, server) in &config.approved_mcp.servers {
-        if name.is_empty() {
-            bail!("approved_mcp.servers 不允许空 server 名称");
+        // RuntimeConfigV1 的 map key 与 qualified name 共用同一 server 边界。
+        if !is_server_name(name) {
+            bail!("approved_mcp.servers.name_invalid");
         }
         match server {
             McpServerSpec::Http { url } => {
                 if !is_literal_loopback_http_url(url) {
-                    bail!(
-                        "approved_mcp.servers.{name}.url 必须是字面量 loopback HTTP 且 path 非空"
-                    );
+                    bail!("approved_mcp.servers.url_invalid");
                 }
             }
             McpServerSpec::Stdio { .. } => {

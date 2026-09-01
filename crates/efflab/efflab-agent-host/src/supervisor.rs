@@ -17,10 +17,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use efflab_agent_contract::{SidecarModelSpec, render_authoritative_config};
+use efflab_agent_contract::{LoopbackModelSpec, RuntimeConfigV1, render_runtime_config_v1};
 use xai_tty_utils::{ProcessGroup, ProcessScope, detach_std_command};
 
 use crate::HostRuntimeConfig;
+use crate::app_port::ApprovedMcpSpecV1;
 use crate::llm_channel::LlmChannelManager;
 use crate::llm_loopback::{BindingToken, BindingTokenRegistry, L3bLoopback};
 
@@ -28,6 +29,16 @@ use crate::llm_loopback::{BindingToken, BindingTokenRegistry, L3bLoopback};
 pub const STDIN_CLOSE_GRACE: Duration = Duration::from_millis(3_500);
 /// 发出终止请求后等待 sidecar 退出的固定宽限期。
 pub const TERMINATE_GRACE: Duration = Duration::from_secs(2);
+/// Host 与 v1 sidecar 之间唯一共享的 runtime 配置文件名。
+const RUNTIME_CONFIG_FILENAME: &str = "runtime-config.v1.toml";
+/// RuntimeConfigV1 固定 schema 版本。
+const RUNTIME_SCHEMA_VERSION: u32 = 1;
+/// RuntimeConfigV1 固定 session store 版本。
+const RUNTIME_SESSION_STORE_VERSION: u32 = 1;
+/// sidecar 连接 Host L3b 时唯一允许的后端。
+const RUNTIME_BACKEND: &str = "chat_completions";
+/// sidecar 从此环境变量读取本代 binding token。
+const RUNTIME_TOKEN_ENV: &str = "EFFLAB_L3B_BIND";
 
 /// Windows fail-closed 时对外暴露的不可用原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +100,8 @@ pub enum SupervisorError {
     },
     /// L3b 或 Channel 未处于可安全启动 sidecar 的状态。
     LlmChannelUnavailable,
+    /// Host 未能取得当前 scope 的已批准 MCP 规格。
+    McpSpecUnavailable,
     /// 同一 scope 已有正在启动或存活的 sidecar，禁止双进程竞争私有 home。
     ScopeAlreadyRunning,
     /// contract renderer 拒绝构造权威 config.toml。
@@ -131,6 +144,7 @@ impl fmt::Display for SupervisorError {
                 formatter.write_str("子进程环境值形如用户 Key")
             }
             Self::LlmChannelUnavailable => formatter.write_str("LLM Channel 或 L3b 不可用"),
+            Self::McpSpecUnavailable => formatter.write_str("MCP 批准规格不可用"),
             Self::ScopeAlreadyRunning => formatter.write_str("scope 已有 sidecar 进程"),
             Self::ConfigRenderFailed => formatter.write_str("权威 sidecar 配置渲染失败"),
             Self::ConfigWriteFailed => formatter.write_str("权威 sidecar 配置写入失败"),
@@ -174,7 +188,7 @@ pub fn sanitize(component: &str) -> Result<String, SupervisorError> {
 /// 一个 scope 固定派生出的 sidecar 私有 home 与非产品库 workspace。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopePaths {
-    /// 传给 sidecar `--grok-home` 的私有、稳定目录。
+    /// 传给 sidecar `--home` 的私有、稳定目录。
     pub home: PathBuf,
     /// 传给 sidecar `--session-cwd` 的 Host 管理目录，绝不使用产品库根。
     pub workspace: PathBuf,
@@ -378,6 +392,24 @@ impl Supervisor {
         validate_absolute_path(&config.home_root)?;
         validate_absolute_path(&config.sidecar_log_path)?;
         let app_id = sanitize(app_id.as_ref())?;
+        let home_root = canonicalize_existing_path_prefix(&config.home_root).map_err(|source| {
+            SupervisorError::Io {
+                operation: "解析 Host home_root",
+                source,
+            }
+        })?;
+        let sidecar_log_path =
+            canonicalize_sidecar_log_path(&config.sidecar_log_path).map_err(|source| {
+                SupervisorError::Io {
+                    operation: "解析 sidecar 日志路径",
+                    source,
+                }
+            })?;
+        let mut config = config;
+        // 只解析安全的现有前缀；非系统符号链接已拒绝，后续 app/scope 和日志尾部仍走严格检查。
+        config.home_root = home_root;
+        config.sidecar_log_path = sidecar_log_path;
+        tracing::debug!("Host 注入的 home_root 与 sidecar 日志路径前缀已 canonicalize");
 
         Ok(Self {
             config,
@@ -453,6 +485,7 @@ impl Supervisor {
         scope: &str,
         loopback: &L3bLoopback,
         channel: &LlmChannelManager,
+        approved_mcp: &ApprovedMcpSpecV1,
     ) -> Result<SidecarProcessInfo, SupervisorError> {
         if let SupervisorCapability::Unavailable { reason } = self.capability() {
             return Err(SupervisorError::Unavailable { reason });
@@ -479,6 +512,7 @@ impl Supervisor {
             generation,
             channel_revision,
             &model_id,
+            approved_mcp,
             loopback,
             token.clone(),
             Arc::clone(&registry),
@@ -510,11 +544,15 @@ impl Supervisor {
     }
 
     /// drain 所有已存活 scope 后按当前 Channel revision 再启动；尽力覆盖所有 scope。
-    pub fn restart_live_scopes(
+    pub fn restart_live_scopes<F>(
         &self,
         loopback: &L3bLoopback,
         channel: &LlmChannelManager,
-    ) -> Result<(), SupervisorError> {
+        mut mcp_for_scope: F,
+    ) -> Result<(), SupervisorError>
+    where
+        F: FnMut(&str) -> Result<ApprovedMcpSpecV1, SupervisorError>,
+    {
         let scopes = self.live_scope_ids()?;
         let mut failed = false;
         for scope in &scopes {
@@ -524,7 +562,15 @@ impl Supervisor {
             }
         }
         for scope in &scopes {
-            if let Err(error) = self.launch_sidecar(scope, loopback, channel) {
+            let approved_mcp = match mcp_for_scope(scope) {
+                Ok(spec) => spec,
+                Err(error) => {
+                    tracing::error!(scope = %scope, error = %error, "sidecar 重启缺少 MCP 批准规格");
+                    failed = true;
+                    continue;
+                }
+            };
+            if let Err(error) = self.launch_sidecar(scope, loopback, channel, &approved_mcp) {
                 tracing::error!(scope = %scope, error = %error, "sidecar 重启启动失败");
                 failed = true;
             }
@@ -560,27 +606,16 @@ impl Supervisor {
         generation: u64,
         channel_revision: u64,
         model_id: &str,
+        approved_mcp: &ApprovedMcpSpecV1,
         loopback: &L3bLoopback,
         token: BindingToken,
         registry: Arc<BindingTokenRegistry>,
         paths: ScopePaths,
     ) -> Result<SidecarProcessInfo, SupervisorError> {
         prepare_scope_directories(&paths)?;
-        let agent_definition = paths.home.join("agents").join("efflab-default.md");
-        let rendered = render_authoritative_config(
-            &paths.home,
-            &agent_definition,
-            None,
-            &[SidecarModelSpec {
-                model: model_id.to_string(),
-                base_url: loopback.sidecar_base_url(),
-                name: "BYOK".to_string(),
-                api_backend: "chat_completions".to_string(),
-                env_key: "EFFLAB_L3B_BIND".to_string(),
-            }],
-        )
-        .map_err(|_| SupervisorError::ConfigRenderFailed)?;
-        write_authoritative_config(&paths.home.join("config.toml"), rendered.as_bytes())?;
+        let rendered = render_runtime_config(&paths, model_id, loopback, approved_mcp)?;
+        let runtime_config_path = paths.home.join(RUNTIME_CONFIG_FILENAME);
+        write_authoritative_config(&runtime_config_path, rendered.as_bytes())?;
 
         // 仅此处把 binding token 注入 child；用户 Key 从不在 env、CLI 或 TOML 中出现。
         let environment = ChildEnvironment::for_sidecar_with_binding(&paths.home, &token)?;
@@ -603,24 +638,26 @@ impl Supervisor {
         })?);
         let mut command = Command::new(&self.config.sidecar_bin);
         command
-            .arg("--stdio")
-            .arg("--grok-home")
+            .arg("--runtime-config")
+            .arg(&runtime_config_path)
+            .arg("--home")
             .arg(&paths.home)
             .arg("--session-cwd")
             .arg(&paths.workspace)
+            .arg("--stdio")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(stderr);
         environment.apply(&mut command);
-        let (child, process_group) =
-            match spawn_enrolled_sidecar(&mut command, &self.process_scope) {
-                Ok(spawned) => spawned,
-                Err(error) => {
-                    let _ = writeln!(log_file, "--- sidecar spawn failed: {error} ---");
-                    let _ = log_file.flush();
-                    return Err(error);
-                }
-            };
+        let (child, process_group) = match spawn_enrolled_sidecar(&mut command, &self.process_scope)
+        {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                let _ = writeln!(log_file, "--- sidecar spawn failed: {error} ---");
+                let _ = log_file.flush();
+                return Err(error);
+            }
+        };
         let pid = child.id();
         let _ = writeln!(log_file, "--- sidecar pid={pid} ---");
         let _ = log_file.flush();
@@ -1098,33 +1135,102 @@ fn force_reap_slot_on_supervisor_drop(slot: &Arc<ScopeSlot>) {
     }
 }
 
-/// Host 在 renderer 写盘前创建自己的隔离目录，并拒绝被符号链接重定向。
+/// 用本代批准 MCP 规格构造 sidecar 唯一可读的 v1 runtime 配置。
+fn render_runtime_config(
+    paths: &ScopePaths,
+    model_id: &str,
+    loopback: &L3bLoopback,
+    approved_mcp: &ApprovedMcpSpecV1,
+) -> Result<String, SupervisorError> {
+    let session_cwd = paths
+        .workspace
+        .to_str()
+        .ok_or(SupervisorError::ConfigRenderFailed)?
+        .to_owned();
+    let config = RuntimeConfigV1 {
+        schema_version: RUNTIME_SCHEMA_VERSION,
+        runtime_revision: String::new(),
+        session_store_version: RUNTIME_SESSION_STORE_VERSION,
+        session_cwd,
+        model: LoopbackModelSpec {
+            model_id: model_id.to_owned(),
+            base_url: loopback.sidecar_base_url(),
+            backend: RUNTIME_BACKEND.to_owned(),
+            token_env: RUNTIME_TOKEN_ENV.to_owned(),
+        },
+        approved_mcp: approved_mcp.servers().clone(),
+        expected_tools: approved_mcp.expected_tools().clone(),
+    };
+    render_runtime_config_v1(&config).map_err(|_| {
+        tracing::error!("RuntimeConfigV1 渲染失败，拒绝启动 sidecar");
+        SupervisorError::ConfigRenderFailed
+    })
+}
+
+/// Host 在 renderer 写盘前逐级创建自己的隔离目录，并拒绝祖先符号链接。
 fn prepare_scope_directories(paths: &ScopePaths) -> Result<(), SupervisorError> {
     for directory in [&paths.home, &paths.workspace] {
-        fs::create_dir_all(directory).map_err(|_| SupervisorError::ConfigWriteFailed)?;
+        ensure_host_owned_directory(directory).map_err(|_| SupervisorError::ConfigWriteFailed)?;
         let metadata =
             fs::symlink_metadata(directory).map_err(|_| SupervisorError::ConfigWriteFailed)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(SupervisorError::ConfigWriteFailed);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
-                .map_err(|_| SupervisorError::ConfigWriteFailed)?;
+        ensure_plain_directory(&metadata).map_err(|_| SupervisorError::ConfigWriteFailed)?;
+        set_private_directory_mode(directory).map_err(|_| SupervisorError::ConfigWriteFailed)?;
+    }
+    Ok(())
+}
+
+/// 逐级检查并创建目录，避免 `create_dir_all` 沿祖先符号链接写到 Host 范围外。
+///
+/// 该检查只使用标准库元数据与单级 `create_dir`，因此不依赖某一平台的 no-follow API。
+/// 检查和后续打开之间仍存在无法由当前抽象消除的 TOCTOU 窗口，调用方必须继续采用
+/// fail-closed 和同目录原子替换策略。
+fn ensure_host_owned_directory(path: &Path) -> io::Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => ensure_plain_directory(&metadata)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match fs::create_dir(&current) {
+                    Ok(()) => {}
+                    // 另一个创建者可能刚刚完成同一级目录；仍必须重新检查其类型。
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error),
+                }
+                let metadata = fs::symlink_metadata(&current)?;
+                ensure_plain_directory(&metadata)?;
+                set_private_directory_mode(&current)?;
+            }
+            Err(error) => return Err(error),
         }
     }
+    Ok(())
+}
+
+/// 目录链中的每一级都必须是普通目录；符号链接和普通文件一律拒绝。
+fn ensure_plain_directory(metadata: &fs::Metadata) -> io::Result<()> {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::other("Host 目录链必须由普通目录组成"));
+    }
+    Ok(())
+}
+
+/// 收紧 Host 新建/管理目录的 Unix 权限；Windows capability 未启用时不依赖此 API。
+fn set_private_directory_mode(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
 /// 原子物化 contract renderer 的完整 TOML；Host 是该文件的唯一写盘 owner。
 fn write_authoritative_config(path: &Path, content: &[u8]) -> Result<(), SupervisorError> {
     let parent = path.parent().ok_or(SupervisorError::ConfigWriteFailed)?;
-    let parent_metadata =
-        fs::symlink_metadata(parent).map_err(|_| SupervisorError::ConfigWriteFailed)?;
-    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
-        return Err(SupervisorError::ConfigWriteFailed);
-    }
+    ensure_host_owned_directory(parent).map_err(|_| SupervisorError::ConfigWriteFailed)?;
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
             return Err(SupervisorError::ConfigWriteFailed);
@@ -1134,7 +1240,11 @@ fn write_authoritative_config(path: &Path, content: &[u8]) -> Result<(), Supervi
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(_) => return Err(SupervisorError::ConfigWriteFailed),
     }
-    let temporary = parent.join(format!(".config.toml.{}.tmp", std::process::id()));
+    let file_name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or(SupervisorError::ConfigWriteFailed)?;
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
     let _ = fs::remove_file(&temporary);
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -1178,8 +1288,12 @@ fn open_sidecar_log_file(path: &Path) -> Result<File, SupervisorError> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .ok_or(SupervisorError::InvalidPathComponent)?;
-    fs::create_dir_all(parent).map_err(|source| SupervisorError::Io {
+    ensure_host_owned_directory(parent).map_err(|source| SupervisorError::Io {
         operation: "创建 sidecar 日志目录",
+        source,
+    })?;
+    set_private_directory_mode(parent).map_err(|source| SupervisorError::Io {
+        operation: "收紧 sidecar 日志目录权限",
         source,
     })?;
     match fs::symlink_metadata(path) {
@@ -1291,19 +1405,17 @@ impl ChildEnvironment {
         Self::from_whitelist(grok_home, inherited)
     }
 
-    /// 在完整 launch 路径只注入唯一的 L3b binding token。
+    /// 在完整 launch 路径清空环境，仅保留平台运行时变量与本代 binding token。
     ///
-    /// 与 Task 5 的通用白名单不同，真实 sidecar 进程必须从完全清空的环境启动：
-    /// `--grok-home` 已由 CLI 显式传递，因而不保留 `GROK_HOME` 或任何平台变量。
-    /// 参数只能是 registry 生成的 [`BindingToken`]，避免调用方把任意用户文本当作
-    /// 业务环境变量注入；用户 Key、XAI Key 和代理变量均不可进入 child。
+    /// `--home` 已由 CLI 显式传递，因而不保留 `GROK_HOME`；用户 Key、XAI Key、代理
+    /// 变量和未登记变量均不可进入 child。binding 参数只能来自 registry 生成的 token。
     pub fn for_sidecar_with_binding(
         grok_home: &Path,
         binding_token: &BindingToken,
     ) -> Result<Self, SupervisorError> {
         // 保留路径形状校验，确保该完整启动入口仍只接受 Host 派生的私有 home。
         validate_absolute_path(grok_home)?;
-        let mut variables = BTreeMap::new();
+        let mut variables = platform_environment_values()?;
         variables.insert(
             OsString::from("EFFLAB_L3B_BIND"),
             OsString::from(binding_token.as_bearer()),
@@ -1417,6 +1529,95 @@ fn validate_absolute_path(path: &Path) -> Result<(), SupervisorError> {
     Ok(())
 }
 
+/// 将路径中最近的现有前缀解析为物理路径，并保留尚不存在的尾部组件。
+///
+/// 现有前缀只允许明确的 macOS 系统别名；Host 或产品目录的符号链接一律拒绝。
+fn canonicalize_existing_path_prefix(path: &Path) -> io::Result<PathBuf> {
+    let mut existing = path.to_path_buf();
+    let mut missing = Vec::<OsString>::new();
+
+    loop {
+        match fs::symlink_metadata(&existing) {
+            Ok(_) => {
+                reject_unexpected_symlink_components(&existing)?;
+                let mut canonical = fs::canonicalize(&existing)?;
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let component = existing.file_name().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "路径没有可回溯的现有前缀")
+                })?;
+                missing.push(component.to_os_string());
+                if !existing.pop() {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// 检查现有前缀的每一级，避免 canonicalize 跟随任意目录符号链接。
+fn reject_unexpected_symlink_components(path: &Path) -> io::Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        // Windows 的盘符和根目录先组合，避免检查盘符相对路径。
+        if matches!(component, Component::Prefix(_) | Component::RootDir) {
+            current.push(component.as_os_str());
+            continue;
+        }
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current)?;
+        if metadata.file_type().is_symlink() && !is_allowed_macos_system_alias(&current)? {
+            tracing::debug!("拒绝路径现有前缀中的非允许符号链接");
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "路径现有前缀包含不允许的符号链接",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 仅允许 macOS 的 `/var`、`/tmp` 和 `/etc` 系统别名，并校验其真实目标。
+fn is_allowed_macos_system_alias(path: &Path) -> io::Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        let Some((alias, expected_target)) = (match path {
+            path if path == Path::new("/var") => Some(("var", Path::new("/private/var"))),
+            path if path == Path::new("/tmp") => Some(("tmp", Path::new("/private/tmp"))),
+            path if path == Path::new("/etc") => Some(("etc", Path::new("/private/etc"))),
+            _ => None,
+        }) else {
+            return Ok(false);
+        };
+        let resolved = fs::canonicalize(path)?;
+        if resolved == expected_target {
+            tracing::debug!(alias, "允许受限 macOS 系统路径别名");
+            return Ok(true);
+        }
+        tracing::debug!(alias, "拒绝目标不符的 macOS 系统路径别名");
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = path;
+    Ok(false)
+}
+
+/// 只 canonicalize 日志路径的目录前缀，保留最终文件名以便 writer 检查文件符号链接。
+fn canonicalize_sidecar_log_path(path: &Path) -> io::Result<PathBuf> {
+    let Some(file_name) = path.file_name() else {
+        return canonicalize_existing_path_prefix(path);
+    };
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "日志路径缺少父目录"))?;
+    Ok(canonicalize_existing_path_prefix(parent)?.join(file_name))
+}
+
 /// Task 5 必须拒绝的 sidecar 环境变量；用户 Key 绝不以环境形式传给 sidecar。
 fn is_forbidden_environment_variable(name: &str) -> bool {
     matches!(
@@ -1470,6 +1671,23 @@ fn platform_environment_allowlist() -> &'static [&'static str] {
     {
         &["PATH"]
     }
+}
+
+/// 从当前进程读取平台运行时所需变量，并拒绝已知 Key 形态。
+fn platform_environment_values() -> Result<BTreeMap<OsString, OsString>, SupervisorError> {
+    let mut variables = BTreeMap::new();
+    for name in platform_environment_allowlist() {
+        let Some(value) = env::var_os(name) else {
+            continue;
+        };
+        if resembles_user_key(&value) {
+            return Err(SupervisorError::EnvironmentValueNotAllowed {
+                name: (*name).to_owned(),
+            });
+        }
+        variables.insert(OsString::from(*name), value);
+    }
+    Ok(variables)
 }
 
 /// 判断变量名是否属于固定的平台运行时白名单。
@@ -1919,9 +2137,325 @@ mod tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod config_write_tests {
+    use super::{
+        ScopePaths, Supervisor, SupervisorError, canonicalize_existing_path_prefix,
+        open_sidecar_log_file, prepare_scope_directories, write_authoritative_config,
+    };
+    use crate::{HostRuntimeConfig, L3bRuntimeConfig};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::time::Duration;
+
+    /// 权威配置必须替换旧文件、保留完整内容，并在成功后不遗留同目录临时文件。
+    #[test]
+    fn authoritative_config_replaces_file_without_temp_residue() {
+        let temporary = tempfile::tempdir().expect("必须能创建配置原子写测试目录");
+        // writer 保持对祖先符号链接的严格拒绝；测试输入使用物理临时根以聚焦原子替换。
+        let parent = fs::canonicalize(temporary.path())
+            .expect("临时目录物理路径必须可解析")
+            .join("scope-home");
+        fs::create_dir(&parent).expect("必须能创建配置父目录");
+        let path = parent.join("runtime-config.v1.toml");
+        fs::write(&path, b"old-config\n").expect("必须能写入旧配置");
+        let temp_path = parent.join(format!(
+            ".{}.{}.tmp",
+            path.file_name()
+                .expect("配置文件名必须存在")
+                .to_string_lossy(),
+            std::process::id()
+        ));
+
+        write_authoritative_config(&path, b"schema_version = 1\n")
+            .expect("权威配置必须成功原子替换");
+
+        assert_eq!(
+            fs::read(&path).expect("必须能读取替换后的配置"),
+            b"schema_version = 1\n",
+            "替换后只能看到完整的新配置"
+        );
+        assert!(
+            !temp_path.exists(),
+            "成功替换后同目录临时文件必须已被 rename 消费"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            fs::symlink_metadata(&path)
+                .expect("必须能读取配置权限")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "权威配置必须保持 owner-only 权限"
+        );
+    }
+
+    /// 原子写入口遇到目标符号链接必须拒绝，不能跟随链接覆盖目录外文件。
+    #[test]
+    fn authoritative_config_rejects_symlink_destination() {
+        let temporary = tempfile::tempdir().expect("必须能创建配置链接测试目录");
+        let root = fs::canonicalize(temporary.path()).expect("临时目录物理路径必须可解析");
+        let target = root.join("outside-config");
+        let path = root.join("runtime-config.v1.toml");
+        fs::write(&target, b"untouched\n").expect("必须能写入链接目标");
+        std::os::unix::fs::symlink(&target, &path).expect("必须能创建配置符号链接");
+
+        let error = write_authoritative_config(&path, b"must-not-write\n")
+            .expect_err("目标符号链接必须 fail-closed");
+        assert!(matches!(error, SupervisorError::ConfigWriteFailed));
+        assert_eq!(
+            fs::read(&target).expect("链接目标必须保持可读"),
+            b"untouched\n",
+            "拒绝符号链接时不得改写目录外目标"
+        );
+    }
+
+    /// 权威配置的父目录链中存在符号链接时，Host 不得沿链写到目录外。
+    #[test]
+    fn authoritative_config_rejects_symlinked_ancestor_directory() {
+        let temporary = tempfile::tempdir().expect("必须能创建祖先链接测试目录");
+        let root = fs::canonicalize(temporary.path()).expect("临时目录物理路径必须可解析");
+        let outside = root.join("outside");
+        let linked = root.join("linked");
+        let nested = outside.join("nested");
+        fs::create_dir(&outside).expect("必须能创建目录外目标");
+        fs::create_dir(&nested).expect("必须能创建目录外嵌套目标");
+        std::os::unix::fs::symlink(&outside, &linked).expect("必须能创建祖先目录符号链接");
+
+        let path = linked.join("nested").join("runtime-config.v1.toml");
+        let error = write_authoritative_config(&path, b"must-not-write\n")
+            .expect_err("配置祖先符号链接必须 fail-closed");
+
+        assert!(matches!(error, SupervisorError::ConfigWriteFailed));
+        assert!(
+            !nested.join("runtime-config.v1.toml").exists(),
+            "拒绝祖先符号链接时不得在目录外创建配置"
+        );
+    }
+
+    /// scope 的 home/workspace 目录必须逐级创建并在每一级拒绝符号链接。
+    #[test]
+    fn scope_directories_reject_symlinked_ancestor_directory() {
+        let temporary = tempfile::tempdir().expect("必须能创建 scope 目录链接测试目录");
+        let root = fs::canonicalize(temporary.path()).expect("临时目录物理路径必须可解析");
+        let outside = root.join("outside");
+        let linked = root.join("linked");
+        fs::create_dir(&outside).expect("必须能创建 scope 目录外目标");
+        std::os::unix::fs::symlink(&outside, &linked).expect("必须能创建 scope 祖先符号链接");
+
+        let paths = ScopePaths {
+            home: linked.join("nested").join("home"),
+            workspace: temporary.path().join("workspace"),
+        };
+        let error =
+            prepare_scope_directories(&paths).expect_err("scope 目录祖先符号链接必须 fail-closed");
+
+        assert!(matches!(error, SupervisorError::ConfigWriteFailed));
+        assert!(
+            !outside.join("nested").exists(),
+            "拒绝 scope 祖先符号链接时不得在目录外创建目录"
+        );
+    }
+
+    /// 缺失尾部应接在最近现有前缀的物理路径后，不能要求调用方预先创建完整根。
+    #[test]
+    fn canonicalize_existing_prefix_preserves_missing_tail() {
+        let temporary = tempfile::tempdir().expect("必须能创建路径 canonical 测试目录");
+        let physical_root =
+            fs::canonicalize(temporary.path()).expect("临时目录现有前缀必须可 canonicalize");
+        let requested = physical_root.join("missing").join("tail");
+
+        let canonical =
+            canonicalize_existing_path_prefix(&requested).expect("现有前缀 canonical 化必须成功");
+        assert_eq!(canonical, requested);
+    }
+
+    /// 任意 Host 根路径符号链接必须在 canonicalize 前拒绝。
+    #[test]
+    fn supervisor_rejects_arbitrary_root_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("必须能创建 Supervisor 根链接测试目录");
+        let physical_root = temporary.path().join("physical-root");
+        let outside = temporary.path().join("outside");
+        let root_alias = temporary.path().join("root-alias");
+        fs::create_dir(&physical_root).expect("必须能创建物理 Host 根目录");
+        fs::create_dir(&outside).expect("必须能创建目录外目标");
+        symlink(&outside, &root_alias).expect("必须能创建任意 Host 根路径符号链接");
+
+        let runtime_config = HostRuntimeConfig {
+            home_root: root_alias,
+            sidecar_bin: temporary.path().join("sidecar"),
+            sidecar_log_path: temporary.path().join("sidecar.log"),
+            mcp_exec_root: temporary.path().join("mcp"),
+            idle_after: Duration::from_secs(60),
+            l3b: L3bRuntimeConfig::default(),
+        };
+        let error = Supervisor::new(runtime_config, "app")
+            .err()
+            .expect("任意 Host 根路径符号链接必须 fail-closed");
+        assert!(matches!(
+            error,
+            SupervisorError::Io { operation, .. } if operation == "解析 Host home_root"
+        ));
+        assert!(
+            !outside.join("app").exists(),
+            "拒绝 Host 根路径符号链接时不得把目录写入链接目标"
+        );
+    }
+
+    /// 物理 Host 根下的 app_id 后缀符号链接仍必须拒绝。
+    #[test]
+    fn supervisor_rejects_suffix_symlink_after_safe_root_resolution() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("必须能创建 Supervisor 路径测试目录");
+        let physical_root = temporary.path().join("physical-root");
+        fs::create_dir(&physical_root).expect("必须能创建物理 Host 根目录");
+        let canonical_root =
+            fs::canonicalize(&physical_root).expect("Host 根目录必须可 canonicalize");
+        let outside = temporary.path().join("outside");
+        fs::create_dir(&outside).expect("必须能创建目录外目标");
+        symlink(&outside, physical_root.join("app")).expect("必须能创建 app_id 后缀符号链接");
+
+        let supervisor = Supervisor::new(
+            HostRuntimeConfig {
+                home_root: physical_root,
+                sidecar_bin: temporary.path().join("sidecar"),
+                sidecar_log_path: temporary.path().join("sidecar.log"),
+                mcp_exec_root: temporary.path().join("mcp"),
+                idle_after: Duration::from_secs(60),
+                l3b: L3bRuntimeConfig::default(),
+            },
+            "app",
+        )
+        .expect("物理根路径必须能构造 Supervisor");
+        let paths = supervisor
+            .paths_for("scope")
+            .expect("合法 scope 必须能派生路径");
+
+        assert_eq!(
+            paths.home,
+            canonical_root.join("app").join("scope").join("home")
+        );
+        let error = prepare_scope_directories(&paths)
+            .expect_err("canonical 根下的 app_id 符号链接必须 fail-closed");
+        assert!(matches!(error, SupervisorError::ConfigWriteFailed));
+        assert!(
+            !outside.join("scope").exists(),
+            "拒绝 canonical 根下的后缀符号链接时不得在目录外创建 scope"
+        );
+    }
+
+    /// 任意 sidecar 日志父目录符号链接必须在 canonicalize 前拒绝。
+    #[test]
+    fn supervisor_rejects_arbitrary_log_parent_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("必须能创建日志父目录链接测试目录");
+        let home_root = temporary.path().join("home-root");
+        let outside = temporary.path().join("outside-log-root");
+        let log_parent_alias = temporary.path().join("log-parent-alias");
+        fs::create_dir(&home_root).expect("必须能创建 Host home 根目录");
+        fs::create_dir(&outside).expect("必须能创建日志目录外目标");
+        symlink(&outside, &log_parent_alias).expect("必须能创建任意日志父目录符号链接");
+
+        let error = Supervisor::new(
+            HostRuntimeConfig {
+                home_root,
+                sidecar_bin: temporary.path().join("sidecar"),
+                sidecar_log_path: log_parent_alias.join("sidecar.log"),
+                mcp_exec_root: temporary.path().join("mcp"),
+                idle_after: Duration::from_secs(60),
+                l3b: L3bRuntimeConfig::default(),
+            },
+            "app",
+        )
+        .err()
+        .expect("任意日志父目录符号链接必须 fail-closed");
+        assert!(matches!(
+            error,
+            SupervisorError::Io { operation, .. } if operation == "解析 sidecar 日志路径"
+        ));
+        assert!(
+            !outside.join("sidecar.log").exists(),
+            "拒绝日志父目录符号链接时不得在目录外创建日志"
+        );
+    }
+
+    /// 物理日志父目录下的最终日志符号链接仍必须由 writer 拒绝。
+    #[test]
+    fn supervisor_preserves_final_log_symlink_rejection() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("必须能创建日志路径测试目录");
+        let physical_log_root = temporary.path().join("physical-log-root");
+        fs::create_dir(&physical_log_root).expect("必须能创建物理日志目录");
+        let target = physical_log_root.join("target.log");
+        fs::write(&target, b"untouched\n").expect("必须能写入日志目标");
+        let log_link = physical_log_root.join("sidecar.log");
+        symlink(&target, &log_link).expect("必须能创建日志文件符号链接");
+        let home_root = temporary.path().join("home-root");
+        fs::create_dir(&home_root).expect("必须能创建 Host home 根目录");
+
+        let supervisor = Supervisor::new(
+            HostRuntimeConfig {
+                home_root,
+                sidecar_bin: temporary.path().join("sidecar"),
+                sidecar_log_path: log_link,
+                mcp_exec_root: temporary.path().join("mcp"),
+                idle_after: Duration::from_secs(60),
+                l3b: L3bRuntimeConfig::default(),
+            },
+            "app",
+        )
+        .expect("物理日志父目录必须能构造 Supervisor");
+        let expected_log_path = fs::canonicalize(&physical_log_root)
+            .expect("物理日志目录必须可 canonicalize")
+            .join("sidecar.log");
+        assert_eq!(supervisor.config.sidecar_log_path, expected_log_path);
+
+        let error = open_sidecar_log_file(&supervisor.config.sidecar_log_path)
+            .expect_err("最终日志符号链接必须 fail-closed");
+        assert!(matches!(
+            error,
+            SupervisorError::Io { operation, .. } if operation == "打开 sidecar 日志文件"
+        ));
+        assert_eq!(
+            fs::read(&target).expect("日志目标必须保持可读"),
+            b"untouched\n"
+        );
+    }
+
+    /// macOS `/var`、`/tmp` 和 `/etc` 系统别名必须保留缺失尾部处理。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn canonicalize_existing_prefix_allows_macos_system_aliases() {
+        for (alias, canonical_root) in [
+            (Path::new("/var"), Path::new("/private/var")),
+            (Path::new("/tmp"), Path::new("/private/tmp")),
+            (Path::new("/etc"), Path::new("/private/etc")),
+        ] {
+            let suffix = format!("efflab-supervisor-alias-{}", std::process::id());
+            let requested = alias.join(format!("{suffix}-missing")).join("tail");
+            let canonical = canonicalize_existing_path_prefix(&requested)
+                .expect("macOS 系统别名的缺失尾部必须可解析");
+            assert_eq!(
+                canonical,
+                canonical_root
+                    .join(format!("{suffix}-missing"))
+                    .join("tail")
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod sidecar_log_tests {
-    use super::{open_sidecar_log_file, SupervisorError};
+    use super::{SupervisorError, open_sidecar_log_file};
+    use std::fs;
     use std::io::Write;
     use std::path::Path;
 
@@ -1930,17 +2464,14 @@ mod sidecar_log_tests {
     fn sidecar_log_path_must_be_absolute_without_parent_dir() {
         let relative = open_sidecar_log_file(Path::new("sidecar.log"))
             .expect_err("相对 sidecar 日志路径必须拒绝");
-        assert!(matches!(
-            relative,
-            SupervisorError::HomeRootMustBeAbsolute
-        ));
+        assert!(matches!(relative, SupervisorError::HomeRootMustBeAbsolute));
 
         let mut traversal = std::env::temp_dir();
         traversal.push("efflab-sidecar");
         traversal.push("..");
         traversal.push("sidecar.log");
-        let traversal = open_sidecar_log_file(&traversal)
-            .expect_err("含 .. 的 sidecar 日志路径必须拒绝");
+        let traversal =
+            open_sidecar_log_file(&traversal).expect_err("含 .. 的 sidecar 日志路径必须拒绝");
         assert!(matches!(
             traversal,
             SupervisorError::HomeRootContainsParentDirectory
@@ -1951,7 +2482,8 @@ mod sidecar_log_tests {
     #[test]
     fn sidecar_log_file_creates_parent_and_appends() {
         let temporary = tempfile::tempdir().expect("必须能创建 sidecar 日志测试目录");
-        let path = temporary.path().join("nested").join("sidecar.log");
+        let root = fs::canonicalize(temporary.path()).expect("临时目录物理路径必须可解析");
+        let path = root.join("nested").join("sidecar.log");
         {
             let mut file = open_sidecar_log_file(&path).expect("首次打开 sidecar 日志必须成功");
             writeln!(file, "first").expect("写入 sidecar 日志必须成功");
@@ -1961,7 +2493,10 @@ mod sidecar_log_tests {
             writeln!(file, "second").expect("追加 sidecar 日志必须成功");
         }
         let text = std::fs::read_to_string(&path).expect("必须能读取 sidecar 日志");
-        assert!(text.contains("first"), "独立日志应保留首次写入，实际: {text}");
+        assert!(
+            text.contains("first"),
+            "独立日志应保留首次写入，实际: {text}"
+        );
         assert!(
             text.contains("second"),
             "独立日志应追加第二次写入，实际: {text}"
@@ -1975,7 +2510,8 @@ mod sidecar_log_tests {
         use std::os::unix::fs::PermissionsExt;
 
         let temporary = tempfile::tempdir().expect("必须能创建 sidecar 权限测试目录");
-        let created = temporary.path().join("created.log");
+        let root = fs::canonicalize(temporary.path()).expect("临时目录物理路径必须可解析");
+        let created = root.join("created.log");
         open_sidecar_log_file(&created).expect("新建 sidecar 日志必须成功");
         let created_mode = std::fs::symlink_metadata(&created)
             .expect("必须能读取新建 sidecar 日志权限")
@@ -1984,7 +2520,7 @@ mod sidecar_log_tests {
             & 0o777;
         assert_eq!(created_mode, 0o600, "新建 sidecar 日志必须是 0o600");
 
-        let existing = temporary.path().join("existing.log");
+        let existing = root.join("existing.log");
         std::fs::write(&existing, "old\n").expect("必须能写入预先存在的 sidecar 日志");
         std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644))
             .expect("必须能把既有 sidecar 日志设为过宽权限");
@@ -2005,14 +2541,44 @@ mod sidecar_log_tests {
     #[test]
     fn sidecar_log_file_rejects_symlink() {
         let temporary = tempfile::tempdir().expect("必须能创建 sidecar symlink 测试目录");
-        let target = temporary.path().join("target.log");
-        let link = temporary.path().join("sidecar.log");
+        let root = fs::canonicalize(temporary.path()).expect("临时目录物理路径必须可解析");
+        let target = root.join("target.log");
+        let link = root.join("sidecar.log");
         std::fs::write(&target, "secret\n").expect("必须能写入 symlink 目标");
         std::os::unix::fs::symlink(&target, &link).expect("必须能创建 sidecar 日志 symlink");
         let error = open_sidecar_log_file(&link).expect_err("sidecar 日志 symlink 必须被拒绝");
         assert!(
             matches!(error, SupervisorError::Io { operation, .. } if operation == "打开 sidecar 日志文件"),
             "symlink 必须按日志文件打开失败处理，实际: {error}"
+        );
+    }
+
+    /// sidecar 日志父目录链中存在符号链接时，不得把日志追加到目录外。
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_log_file_rejects_symlinked_ancestor_directory() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("必须能创建 sidecar 祖先链接测试目录");
+        let root = fs::canonicalize(temporary.path()).expect("临时目录物理路径必须可解析");
+        let outside = root.join("outside");
+        let linked = root.join("linked");
+        let nested = outside.join("nested");
+        fs::create_dir(&outside).expect("必须能创建日志目录外目标");
+        fs::create_dir(&nested).expect("必须能创建日志目录外嵌套目标");
+        symlink(&outside, &linked).expect("必须能创建日志祖先符号链接");
+
+        let path = linked.join("nested").join("sidecar.log");
+        let error =
+            open_sidecar_log_file(&path).expect_err("sidecar 日志祖先符号链接必须 fail-closed");
+
+        assert!(
+            matches!(error, SupervisorError::Io { operation, .. } if operation == "创建 sidecar 日志目录"),
+            "日志祖先链接必须在创建目录阶段拒绝，实际: {error}"
+        );
+        assert!(
+            !nested.join("sidecar.log").exists(),
+            "拒绝日志祖先符号链接时不得在目录外创建日志"
         );
     }
 }

@@ -2985,36 +2985,26 @@ dependencies = [
 name = "efflab-agent-sidecar"
 version = "0.1.0"
 dependencies = [
+ "agent-client-protocol",
  "anyhow",
+ "async-trait",
+ "bytes",
  "clap",
- "dirs 5.0.1",
  "dunce",
  "efflab-agent-contract",
  "fs2",
- "schemars 1.0.4",
+ "libc",
+ "reqwest 0.13.4",
+ "rmcp",
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",
- "xai-grok-agent",
- "xai-grok-config-types",
- "xai-grok-shell",
- "xai-grok-tools",
- "xai-tool-protocol",
- "xai-tool-runtime",
- "xai-tool-types",
-]
-
-[[package]]
-name = "efflab-pr0-http-probe"
-version = "0.1.0"
-dependencies = [
- "reqwest 0.13.4",
- "rmcp",
+ "xai-acp-lib",
 ]
 
 [[package]]

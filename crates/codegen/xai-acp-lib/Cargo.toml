@@ -10,9 +10,14 @@ async-trait = { workspace = true }
 derive_more = { workspace = true }
 futures = { workspace = true }
 serde.workspace = true
-tokio = { workspace = true }
+# 生产代码只使用 current-thread task 与同步通道；禁止继承 workspace 的 Tokio full。
+tokio = { version = "1", default-features = false, features = ["rt", "sync"] }
 tracing = { workspace = true }
 serde_json.workspace = true
+
+[dev-dependencies]
+# xai-acp-lib 测试需要 tokio::test 宏，但不把测试 runtime feature 带入生产闭包。
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "sync"] }
 
 [lints]
 workspace = true

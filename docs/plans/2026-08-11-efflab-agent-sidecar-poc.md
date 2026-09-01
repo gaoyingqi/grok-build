@@ -1,11 +1,14 @@
-# efflab-agent-sidecar 阶段 0 POC 方案与计划（v3 定稿）
+# efflab-agent-sidecar 阶段 0 POC 历史记录（v3 定稿，不可执行）
 
 > 日期：2026-08-11 · 分支：`lab_main` · 基准 `SOURCE_REV=a51a1dc62fe20029ac39a665985bba78edbb870f`
+>
+> **历史、不可执行（2026-09-01）**：本文仅保留旧 shell POC 方案的追溯记录。下文的目标、设计、命令、步骤、改动点、验证计划、同步流程和待办均是当时记录，不是当前待办或实施指令，禁止直接照抄或执行。
+> 文中的 `--grok-home`、`--mcp-config`、`--mcp-exec-root` 及相关启动步骤均已废弃；现行 v1 只使用 `--runtime-config <home>/runtime-config.v1.toml --home <私有 home> --session-cwd <隔离会话目录> --stdio`，stdio MCP 统一拒绝。
+> **当前入口（优先）**：现行合同见 [`../host-acp-contract.md`](../host-acp-contract.md)，现行 minimal-runtime 设计见产品仓 [`../../../ai_music_organizer_br/docs/superpowers/specs/2026-08-28-efflab-sidecar-minimal-runtime-design.md`](../../../ai_music_organizer_br/docs/superpowers/specs/2026-08-28-efflab-sidecar-minimal-runtime-design.md)。`docs/plans/2026-08-11-efflab-agent-sidecar-devplan.md` 与本文一样仅为历史记录，不可执行。
 > **v3 = v2 + gpt-sol 终审修订**。终审结论 Go with changes，4 个 Blocker + 10 项 Major 修订已全部合入。
-> **可执行开发计划见**：`docs/plans/2026-08-11-efflab-agent-sidecar-devplan.md`（P0-P4 分阶段任务、门禁、里程碑）。
 > 里程碑命名：**macOS isolated runtime integration POC**（不宣称完整评估报告 §14 Go）。
 
-## v3 修订记录（gpt-sol 终审 → 合入）
+## 历史 v3 修订记录（不可执行；gpt-sol 终审 → 合入）
 
 | # | 修订 | 合入位置 |
 |---|---|---|
@@ -18,7 +21,7 @@
 | V3-7 | Host 契约用**字段白名单**（非黑名单）：拒绝 agentProfile/pluginDirs/x.ai/hooks/yolo/capability/cwd 覆盖；未知 meta 拒绝 | §3.5、devplan P3 |
 | V3-8 | CWD 隔离加强：process CWD = session cwd（canonical）；目录 0700；启动前拒绝 `.git`/`.grok`/`.mcp.json`/`.claude`/`.cursor`/`AGENTS.md` | §3.7 |
 | V3-9 | config 原子写 + `fs2` 独占锁 + 同 home 并发拒绝 + 不 merge 旧字段 + 私有 managed/requirements 存在即拒绝 | §3.2 步骤 2 |
-| V3-10 | MCP 输入唯一语法 `--mcp-config <ABS_TOML>` + `--mcp-exec-root`；阶段 0 拒 env；HTTP 仅 loopback | §3.2 步骤 1 |
+| V3-10（历史） | 旧 MCP 输入语法 `--mcp-config <ABS_TOML>` + `--mcp-exec-root`；阶段 0 拒 env；HTTP 仅 loopback（现行 v1 不可执行） | §3.2 步骤 1 |
 | V3-11 | 显式关闭 managed MCP / memory / compat env；resolve 后全部断言 | §3.2 步骤 6 |
 | V3-12 | stdio 契约：stdout 仅 ACP；tracing 固定 stderr；退出码 0/2/1；关 stdin 等 3.5s → TERM → 2s KILL | §3.2 步骤 7 |
 | V3-13 | `fork-sync-apply.sh` 固定根 `scripts/`，`--check`/`--apply` 幂等；`FORK_BASE_REV` 对比 | §7 |
@@ -107,7 +110,7 @@ sidecar 为**通用组件**，供多个自家 app 复用：不硬编码业务；
 
 ---
 
-## 3. 设计（v2）
+## 3. 历史设计记录（不可执行；v2）
 
 ### 3.1 目录结构（crate 位置改为 `crates/efflab/`，R10）
 
@@ -216,7 +219,7 @@ toolConfig:
 
 ---
 
-## 4. 改动点清单
+## 4. 历史改动点记录（不可执行）
 
 | 文件 | 改动 | 原因 |
 |---|---|---|
@@ -247,7 +250,7 @@ dirs = "6"                                 # 对齐 shell（workspace 钉 5.0，
 
 ---
 
-## 5. 验证计划
+## 5. 历史验证记录（不可执行）
 
 1. **构建**：`cargo check -p efflab-agent-sidecar` → `cargo build -p efflab-agent-sidecar --release`（macOS）。
 2. **单测**：sidecar_config 解析；hardening 强制字段；fail-closed 静态校验正反例（含「白名单含未知 id → 拒绝启动」R3、`[compat]` 未全关 → 拒绝 R4）；agent definition frontmatter 可被 `AgentDefinition` 解析（`#[serde(rename_all="camelCase")]`，config.rs:738）。
@@ -264,7 +267,7 @@ dirs = "6"                                 # 对齐 shell（workspace 钉 5.0，
 
 ---
 
-## 6. 风险与缓解
+## 6. 历史风险与缓解记录（不可执行）
 
 | 风险 | 缓解 |
 |---|---|
@@ -280,7 +283,7 @@ dirs = "6"                                 # 对齐 shell（workspace 钉 5.0，
 
 ---
 
-## 7. 上游同步流程（R6，固化）
+## 7. 历史上游同步记录（不可执行；R6）
 
 每次官方同步（新 SOURCE_REV 树级替换）后：
 1. `scripts/fork-sync-apply.sh`：检测 SOURCE_REV 变化 → 重放 fork 专属补丁（当前仅：根 Cargo.toml members 一行 + `crates/efflab/` 目录）→ `cargo check --workspace` 冒烟。
@@ -289,7 +292,7 @@ dirs = "6"                                 # 对齐 shell（workspace 钉 5.0，
 
 ---
 
-## 8. 待办/需实现时验证
+## 8. 历史待办记录（不可执行）
 
 1. BYOK endpoint env 变量名字符串（源码混淆为 `n`，构建后 `strings` 或运行时验证）。
 2. BYOK API-key token 下 `start_proactive_refresh` 的 `token_type().is_refreshable()==false`（无触网断言）。

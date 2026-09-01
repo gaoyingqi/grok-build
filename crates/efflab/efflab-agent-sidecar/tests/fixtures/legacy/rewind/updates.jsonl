@@ -1,0 +1,7 @@
+{"timestamp":1,"method":"session/update","params":{"sessionId":"legacy-1","_meta":{"promptId":"prompt-rewind-a"},"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"rewind first user"}}}}
+{"timestamp":2,"method":"session/update","params":{"sessionId":"legacy-1","_meta":{"promptId":"prompt-rewind-a"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"rewind first assistant"}}}}
+{"timestamp":3,"method":"_x.ai/session/update","params":{"sessionId":"legacy-1","update":{"sessionUpdate":"turn_completed","prompt_id":"prompt-rewind-a","stop_reason":"completed"}}}
+{"timestamp":4,"method":"_x.ai/session/update","params":{"sessionId":"legacy-1","update":{"sessionUpdate":"rewind_marker","target_prompt_index":0,"created_at":"2026-08-29T00:00:04Z"}}}
+{"timestamp":5,"method":"session/update","params":{"sessionId":"legacy-1","_meta":{"promptId":"prompt-rewind-b"},"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"rewind second user"}}}}
+{"timestamp":6,"method":"session/update","params":{"sessionId":"legacy-1","_meta":{"promptId":"prompt-rewind-b"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"rewind second assistant"}}}}
+{"timestamp":7,"method":"_x.ai/session/update","params":{"sessionId":"legacy-1","update":{"sessionUpdate":"turn_completed","prompt_id":"prompt-rewind-b","stop_reason":"completed"}}}

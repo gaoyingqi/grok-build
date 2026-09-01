@@ -44,7 +44,7 @@
 //! Every line is forwarded through `normalize_json_line` — see the
 //! crate-private `normalize` module for the contract and its scope.
 
-use std::io::BufRead;
+use std::io::{self, BufRead};
 
 use tokio::sync::mpsc;
 
@@ -61,68 +61,162 @@ const STDIN_LINE_CHANNEL_DEPTH: usize = 64;
 /// returned channel. A final line without a trailing newline is still delivered
 /// before the channel closes.
 ///
-/// Yielded lines are **not guaranteed byte-verbatim**: a line the pinned acp
-/// 0.6 envelope would otherwise drop (a `\/`-escaped `method`, as Foundation
-/// encoders emit) is re-serialized compactly (key order, whitespace, and
-/// number formatting normalized) before forwarding — see the crate-private
-/// `normalize` module. Every line the envelope already accepts, and anything
-/// that fails to parse, passes through byte-identical (trailing terminator
-/// always preserved).
-///
-/// The channel closes (so [`recv`](mpsc::Receiver::recv) returns `None`) when
-/// stdin reaches EOF, the read fails, or the [`Receiver`](mpsc::Receiver) is
-/// dropped. The reader is meant to be the **sole** stdin consumer in the
-/// agent-stdio / leader-bridge paths; on Windows it enforces that by redirecting
-/// the process's standard input to `NUL` so stray readers can't deadlock on it
-/// (see the [module docs](self)).
+/// This compatibility API keeps the historical `Receiver<Vec<u8>>` shape and
+/// therefore treats a reader error as channel termination. New ACP runtimes
+/// must use [`spawn_stdin_line_reader_with_errors`] so EOF and I/O failure stay
+/// distinct. The reader is the **sole** stdin consumer in agent-stdio and
+/// leader-bridge paths; on Windows it also redirects process stdin to `NUL` so
+/// stray readers cannot deadlock (see the [module docs](self)).
 pub fn spawn_stdin_line_reader() -> mpsc::Receiver<Vec<u8>> {
-    let (tx, rx) = mpsc::channel::<Vec<u8>>(STDIN_LINE_CHANNEL_DEPTH);
+    spawn_stdin_line_reader_internal(drop_reader_error)
+}
 
-    // On Windows, synchronously take a private duplicate of the real stdin and
-    // redirect the process's standard input to `NUL` *before* the reader thread
-    // parks in a blocking read holding the global `StdinLock`. After this, any
-    // other `std::io::stdin()` read in the process EOFs immediately instead of
-    // deadlocking. `None` means we couldn't isolate (we fall back to reading
-    // `std::io::stdin()` directly — no worse than before).
+/// Spawn the synchronous stdin reader while preserving fatal read errors.
+///
+/// `None` from the returned receiver means normal EOF (or receiver drop), while
+/// `Some(Err(_))` is a fatal reader error. Error messages are sanitized before
+/// they enter the channel; callers can inspect only the stable [`io::ErrorKind`]
+/// and must not log the underlying OS text.
+pub fn spawn_stdin_line_reader_with_errors() -> mpsc::Receiver<io::Result<Vec<u8>>> {
+    spawn_stdin_line_reader_internal(keep_reader_result)
+}
+
+fn keep_reader_result(result: io::Result<Vec<u8>>) -> Option<io::Result<Vec<u8>>> {
+    Some(result)
+}
+
+fn drop_reader_error(result: io::Result<Vec<u8>>) -> Option<Vec<u8>> {
+    result.ok()
+}
+
+fn spawn_stdin_line_reader_internal<T, F>(map: F) -> mpsc::Receiver<T>
+where
+    T: Send + 'static,
+    F: Fn(io::Result<Vec<u8>>) -> Option<T> + Clone + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel::<T>(STDIN_LINE_CHANNEL_DEPTH);
+
+    // Windows 上先隔离全局 stdin；Unix 直接锁定标准输入，保证只有一个阻塞 reader。
     #[cfg(windows)]
     let private_stdin: Option<std::fs::File> = isolate_process_stdin();
 
-    std::thread::Builder::new()
+    let thread_tx = tx.clone();
+    let thread_map = map.clone();
+    let spawn_result = std::thread::Builder::new()
         .name("acp-stdin".to_string())
         .spawn(move || {
             #[cfg(windows)]
             if let Some(file) = private_stdin {
-                forward_lines(std::io::BufReader::new(file), &tx);
+                forward_lines_with_map(
+                    std::io::BufReader::new(file),
+                    &thread_tx,
+                    &thread_map,
+                    crate::line_reader::MAX_LINE_SIZE,
+                );
                 return;
             }
             let stdin = std::io::stdin();
-            forward_lines(stdin.lock(), &tx);
-        })
-        .expect("failed to spawn acp-stdin reader thread");
+            forward_lines_with_map(
+                stdin.lock(),
+                &thread_tx,
+                &thread_map,
+                crate::line_reader::MAX_LINE_SIZE,
+            );
+        });
+
+    if let Err(error) = spawn_result {
+        // 线程创建失败也必须可观察，不能退化为正常 EOF。
+        let stable_error = io::Error::new(error.kind(), "ACP stdin reader unavailable");
+        if let Some(event) = map(Err(stable_error)) {
+            let _ = tx.blocking_send(event);
+        }
+    }
     rx
 }
 
-/// Read `\n`-delimited lines from `reader` and forward each on `tx` — via
-/// [`normalize_json_line`], so bytes are verbatim except for the lines that
-/// workaround rewrites (terminator always preserved) — until EOF, a read
-/// error, or the receiver is dropped.
-fn forward_lines<R: BufRead>(mut reader: R, tx: &mpsc::Sender<Vec<u8>>) {
+/// 供单元测试复用的错误感知转发器；Ok(0) 只表示正常 EOF。
+#[cfg(test)]
+fn forward_lines<R: BufRead>(reader: R, tx: &mpsc::Sender<io::Result<Vec<u8>>>) {
+    forward_lines_with_map(
+        reader,
+        tx,
+        keep_reader_result,
+        crate::line_reader::MAX_LINE_SIZE,
+    );
+}
+
+fn forward_lines_with_map<R, T, F>(
+    mut reader: R,
+    tx: &mpsc::Sender<T>,
+    map: F,
+    max_line_size: usize,
+) where
+    R: BufRead,
+    T: Send + 'static,
+    F: Fn(io::Result<Vec<u8>>) -> Option<T>,
+{
     let mut line = Vec::new();
     loop {
         line.clear();
-        match reader.read_until(b'\n', &mut line) {
-            // EOF or a fatal read error: return, dropping `tx` closes the channel.
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        let normalized = normalize_json_line(std::mem::take(&mut line));
-        // `blocking_send` parks this thread (not a runtime worker) when the
-        // channel is full, and errors only once the receiver is dropped — at
-        // which point there is nothing left to feed.
-        if tx.blocking_send(normalized).is_err() {
-            break;
+        match read_line_capped_with_limit(&mut reader, &mut line, max_line_size) {
+            Ok(0) => break,
+            Ok(_) => {
+                let normalized = normalize_json_line(std::mem::take(&mut line));
+                let Some(event) = map(Ok(normalized)) else {
+                    break;
+                };
+                // 通道满时阻塞当前 OS reader，向上游施加有界反压。
+                if tx.blocking_send(event).is_err() {
+                    break;
+                }
+            }
+            Err(error) => {
+                let stable_error = sanitize_reader_error(error);
+                if let Some(event) = map(Err(stable_error)) {
+                    let _ = tx.blocking_send(event);
+                }
+                break;
+            }
         }
     }
+}
+
+/// 逐块读取一行，硬限制累计字节数，避免无换行输入触发无界分配。
+fn read_line_capped_with_limit<R: BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    max_line_size: usize,
+) -> io::Result<usize> {
+    line.clear();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(line.len());
+        }
+
+        let (count, complete) = match available.iter().position(|&byte| byte == b'\n') {
+            Some(position) => (position + 1, true),
+            None => (available.len(), false),
+        };
+        let next_len = line.len().checked_add(count).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "ACP stdin line length overflow")
+        })?;
+        if next_len > max_line_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ACP stdin line exceeds maximum length",
+            ));
+        }
+        line.extend_from_slice(&available[..count]);
+        reader.consume(count);
+        if complete {
+            return Ok(line.len());
+        }
+    }
+}
+
+fn sanitize_reader_error(error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), "ACP stdin read failed")
 }
 
 /// Duplicate the real stdin handle for private use and repoint the process's
@@ -212,5 +306,72 @@ fn isolate_process_stdin() -> Option<std::fs::File> {
         }
 
         Some(std::fs::File::from_raw_handle(duplicate as _))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{self, Cursor, Read};
+
+    use super::*;
+
+    /// 先提供一行，再注入错误，验证错误不会伪装成 channel EOF。
+    struct ErrorAfterLine {
+        state: u8,
+    }
+
+    impl Read for ErrorAfterLine {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::Other, "raw reader secret"))
+        }
+    }
+
+    impl BufRead for ErrorAfterLine {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            if self.state == 0 {
+                Ok(b"ok\n")
+            } else {
+                Err(io::Error::new(io::ErrorKind::Other, "raw reader secret"))
+            }
+        }
+
+        fn consume(&mut self, amount: usize) {
+            if amount > 0 {
+                self.state = 1;
+            }
+        }
+    }
+
+    #[test]
+    fn bufread_error_is_forwarded_separately_from_eof() {
+        let (tx, mut rx) = mpsc::channel(4);
+        forward_lines(ErrorAfterLine { state: 0 }, &tx);
+
+        let first = rx
+            .blocking_recv()
+            .expect("reader should forward the complete line")
+            .expect("the complete line should be successful");
+        assert_eq!(first, b"ok\n");
+
+        let error = rx
+            .blocking_recv()
+            .expect("reader error must be observable before channel close")
+            .expect_err("reader error must not be converted to EOF");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "ACP stdin read failed");
+    }
+
+    #[test]
+    fn unterminated_line_is_rejected_at_small_test_limit_without_large_buffer() {
+        let mut reader = Cursor::new(b"123456789".to_vec());
+        let mut line = Vec::new();
+        let error = read_line_capped_with_limit(&mut reader, &mut line, 8)
+            .expect_err("an unterminated line over the limit must fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            line.len() <= 8,
+            "test reader must never retain bytes over the cap"
+        );
     }
 }

@@ -1,17 +1,25 @@
-//! efflab-agent-sidecar 库根。
+//! efflab-agent-sidecar 的最小运行时库。
 //!
-//! 里程碑：macOS isolated runtime integration POC。
-//!
-//! 职责（按开发计划 P0→P4 依次填充）：
-//! - `sidecar_config`：CLI / SidecarConfig / ApprovedMcpConfig 解析与校验（P1）
-//! - `hardening`：私有 GROK_HOME、fs2 独占锁、原子写工具、Host 权威 config 校验、env 卫生（P1）
-//! - `toolset`：内置占位工具 `GrokBuild:efflab_noop` 与注册（P2）
-//! - `host_contract`：Host 请求字段白名单校验（P3）
-//!
-//! 设计约束：不修改任何 `xai-grok-*` 核心 crate；stdout 仅承载 ACP JSON-RPC。
+//! `sidecar_config` 负责 v1 CLI/config 校验，`hardening` 负责 Unix 私有 home、锁和环境
+//! allowlist；`runtime` 负责 ACP stdio 生命周期，`acp_agent` 负责 session/prompt 边界，
+//! `session_store` 负责 v1 journal，`model_client` 负责受控 loopback L3b，`turn_loop` 负责
+//! 可取消的有限模型/工具回合。replay update 在 load response 前经同一 gateway 顺序交付，
+//! active prompt 的取消与 terminal journal 通过共享 control 线性化；stdout 仅承载 ACP。
+//! `host_contract` 保留共享 Host 合同的 re-export。
 
+pub mod acp_agent;
 pub mod hardening;
-/// 向下兼容既有 sidecar 测试与调用方的 Host 合同模块路径。
+/// 复用无 grok runtime 的 Host 合同模块路径。
 pub mod host_contract;
+pub mod mcp_client;
+pub mod model_client;
+pub mod observability;
+pub mod runtime;
+pub mod session_store;
 pub mod sidecar_config;
-pub mod toolset;
+#[cfg(debug_assertions)]
+pub(crate) mod test_seam;
+pub mod turn_loop;
+
+/// 当前最小 ACP turn loop 使用的编译期系统提示词。
+pub const MINIMAL_SYSTEM_PROMPT: &str = include_str!("../assets/efflab-minimal-system-prompt.md");

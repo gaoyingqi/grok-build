@@ -1,0 +1,2 @@
+{"timestamp":1,"method":"session/update","params":{"sessionId":"legacy-1","_meta":{"promptId":"prompt-partial"},"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"partial tail user"}}}}
+{"timestamp":2,"method":"session/update","params":{"sessionId":"legacy-1","_meta":{"promptId":"prompt-partial"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"partial tail assistant"}}}}

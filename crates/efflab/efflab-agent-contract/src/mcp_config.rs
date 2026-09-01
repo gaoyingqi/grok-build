@@ -352,9 +352,9 @@ struct ApprovedMcpRevisionServer<'a> {
     url: &'a str,
 }
 
-/// 校验 server 名称的 ASCII 正则和 64 字节上限。
-fn is_server_name(name: &str) -> bool {
-    is_name_segment(name) && name.len() <= 64
+/// 校验 server 名称的 ASCII 正则、单段分隔语义和 64 字节上限。
+pub fn is_server_name(name: &str) -> bool {
+    is_name_segment(name) && !name.contains("__") && name.len() <= 64
 }
 
 /// 校验 server/tool segment 共用的 ASCII 标识规则。
@@ -367,12 +367,14 @@ fn is_name_segment(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
-/// 校验 qualified tool 只有一个明确分隔，并且两段都符合 ASCII 标识规则。
-fn is_qualified_tool_name(name: &str) -> bool {
+/// 校验 qualified tool 只有一个明确分隔，server 使用完整 validator，tool 保持无长度上限。
+/// `approved_mcp_revision` 与 RuntimeConfigV1 loader 共用本规则；完整名称的 1024-byte
+/// 持久化上限由 sidecar catalog/record 边界继续执行。
+pub fn is_qualified_tool_name(name: &str) -> bool {
     let Some((server, tool)) = name.split_once("__") else {
         return false;
     };
-    !tool.contains("__") && is_name_segment(server) && is_name_segment(tool)
+    !tool.contains("__") && is_server_name(server) && is_name_segment(tool)
 }
 
 /// 只用于短小审核摘要的纯 Rust SHA-256，不接触秘密或网络数据。
@@ -561,7 +563,14 @@ mod tests {
     /// server 与 qualified tool 名称必须是单段受控标识，归一化冲突也必须失败关闭。
     #[test]
     fn approved_mcp_revision_rejects_invalid_names_and_normalized_conflicts() {
-        for name in ["", "1demo", "demo.name", "demo name", "demo/tool"] {
+        for name in [
+            "",
+            "1demo",
+            "demo.name",
+            "demo name",
+            "demo/tool",
+            "demo__server",
+        ] {
             let config = http_config([(name, "http://127.0.0.1:4313/mcp")]);
             assert!(
                 approved_mcp_revision(&config, &BTreeSet::new()).is_err(),

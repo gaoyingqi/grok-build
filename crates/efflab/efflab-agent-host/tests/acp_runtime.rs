@@ -23,6 +23,19 @@ while IFS= read -r line; do
 done
 "#;
 
+/// 先写半行，收到 Host 的同步 notification 后才补换行，锁定生产 reader 的分帧边界。
+const PARTIAL_LINE_CHILD: &str = r#"
+printf '%s' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"partial"'
+printf '%s\n' 'half-line-ready' >&2
+IFS= read -r control
+printf '%s\n' "$control" >&2
+printf '%s\n' '}}}}'
+printf '%s\n' 'complete-line' >&2
+while IFS= read -r line; do
+    :
+done
+"#;
+
 /// 收到一个 Host request 后，在其 result 前插入 notification，验证读循环不会阻塞。
 const INTERLEAVED_NOTIFICATION_AND_RESPONSE: &str = r#"
 IFS= read -r line
@@ -232,7 +245,7 @@ fn next_inbound(runtime: &AcpRuntime) -> Inbound {
             return inbound;
         }
         assert!(Instant::now() < deadline, "等待 sidecar 入站消息超时");
-        thread::sleep(Duration::from_millis(5));
+        thread::yield_now();
     }
 }
 
@@ -244,11 +257,54 @@ fn next_inbound_error(runtime: &AcpRuntime) -> String {
             Ok(Some(inbound)) => panic!("预期入站错误，实际收到消息: {inbound:?}"),
             Ok(None) => {
                 assert!(Instant::now() < deadline, "等待 ACP 入站错误超时");
-                thread::sleep(Duration::from_millis(5));
+                thread::yield_now();
             }
             Err(error) => return error.to_string(),
         }
     }
+}
+
+/// 真实 AcpRuntime 必须等待 child 补齐换行后才投递一条完整 notification。
+#[test]
+fn production_reader_delivers_one_message_after_child_completes_partial_line() {
+    let (runtime, mut peer) = runtime_with_peer(PARTIAL_LINE_CHILD);
+
+    assert_eq!(peer.read_stderr_marker(), "half-line-ready");
+    assert!(
+        runtime
+            .poll_inbound()
+            .expect("补齐换行前读取 partial-line 必须成功")
+            .is_none(),
+        "child 只写出半行时，生产 AcpRuntime 不得投递入站消息"
+    );
+    runtime
+        .notify_validated(
+            "session/cancel",
+            json!({ "sessionId": "session-1" }),
+            &policy(),
+        )
+        .expect("Host 控制 notification 必须写入 child stdin");
+    assert_eq!(peer.read_wire()["method"], "session/cancel");
+    assert_eq!(peer.read_stderr_marker(), "complete-line");
+
+    let inbound = next_inbound(&runtime);
+    assert!(matches!(
+        inbound,
+        Inbound::Notification { method, params }
+            if method == "session/update"
+                && params["sessionId"] == "session-1"
+                && params["update"]["content"]["text"] == "partial"
+    ));
+    assert!(
+        runtime
+            .poll_inbound()
+            .expect("读取 partial-line 后的入站队列必须成功")
+            .is_none(),
+        "child 只补齐一行，Runtime 不得拆出或复制第二条消息"
+    );
+
+    drop(runtime);
+    peer.finish();
 }
 
 /// 构造本任务无需 cwd 校验的最小 Host contract 策略。
@@ -266,8 +322,11 @@ fn terminal_initialize_is_rejected_before_any_stdin_write() {
             "initialize",
             json!({
                 "protocolVersion": 1,
-                "client": { "name": "test-host", "mcpServers": [] },
-                "capabilities": { "terminal": true, "fs": false }
+                "clientCapabilities": {
+                    "terminal": true,
+                    "fs": { "readTextFile": false, "writeTextFile": false }
+                },
+                "clientInfo": { "name": "test-host", "version": "1.0.0" }
             }),
             &policy(),
         )

@@ -1,4 +1,4 @@
-# Task 5 sidecar closure baseline: repository-relative workspace member manifests.
+# Sidecar closure baseline: repository-relative workspace member manifests.
 crates/build/xai-proto-build/Cargo.toml
 crates/codegen/ptyctl-cli/Cargo.toml
 crates/codegen/ptyctl/Cargo.toml
@@ -78,7 +78,6 @@ crates/common/xai-tracing/Cargo.toml
 crates/efflab/efflab-agent-contract/Cargo.toml
 crates/efflab/efflab-agent-host/Cargo.toml
 crates/efflab/efflab-agent-sidecar/Cargo.toml
-crates/efflab/efflab-pr0-http-probe/Cargo.toml
 prod/mc/cli-chat-proxy-types/Cargo.toml
 third_party/dagre_rust/Cargo.toml
 third_party/graphlib_rust/Cargo.toml

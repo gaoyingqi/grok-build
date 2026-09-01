@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 pub mod acp_client;
+pub mod mock_l3b;
 pub mod process;
 
 /// 定位 `tests/fixtures/` 下的测试资源绝对路径。

@@ -60,15 +60,13 @@ fn fixture_cases_all_pass() {
     let cwd_dir = TempDir::new().expect("创建临时 cwd 目录");
     let other_dir = TempDir::new().expect("创建临时 other 目录");
 
-    // 构造策略：允许 modelId=grok-code-fast，cwd 指向 cwd_dir。
+    // 构造策略：允许会话 Channel 槽名 byok，cwd 指向 cwd_dir。
     let policy = HostPolicy::new(cwd_dir.path().to_path_buf())
-        // 既有方法保留 modelId，新 prompt 方法只允许 submission 对应的 promptId。
-        .with_meta_key_for("initialize", "modelId")
+        // initialize 不承载产品 modelId；只有会话方法使用 modelId，prompt 使用 promptId。
         .with_meta_key_for("session/new", "modelId")
         .with_meta_key_for("session/load", "modelId")
-        .with_meta_key_for("x.ai/mcp/list", "modelId")
         .with_meta_key_for("session/prompt", "promptId")
-        .with_model_id("grok-code-fast".to_string());
+        .with_model_id("byok".to_string());
 
     for case in &cases {
         // 替换路径占位符。

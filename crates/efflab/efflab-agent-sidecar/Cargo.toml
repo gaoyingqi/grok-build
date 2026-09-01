@@ -1,40 +1,77 @@
-# efflab-agent-sidecar：复用 xai-grok-shell 运行时的薄 ACP stdio sidecar。
-# 里程碑：macOS isolated runtime integration POC。
-# 注意：本文件是 crate 级 manifest；根 Cargo.toml 为生成物，member 注册由 scripts/fork-sync-apply.sh 维护。
+# efflab-agent-sidecar：最小 ACP stdio sidecar 的 crate manifest。
+# 里程碑：Task 12 S2 入口；根 Cargo.toml 为生成物，member 注册由脚本维护。
 [package]
 name = "efflab-agent-sidecar"
 version = "0.1.0"
-description = "Efflab thin ACP stdio sidecar reusing the xai-grok-shell runtime (macOS isolated runtime POC)"
+description = "Efflab minimal ACP stdio sidecar runtime"
 edition.workspace = true
 license.workspace = true
 publish = false
 
 [dependencies]
-# Efflab 共享契约：Host 与 sidecar 仅通过该无 grok runtime crate 共享 DTO / 校验。
+# Host 与 sidecar 仅通过无 grok runtime 的共享契约交换版本化 DTO。
 efflab-agent-contract = { path = "../efflab-agent-contract" }
-# 内部 workspace crate：全部按 path 依赖复用，禁止改动核心源码
-xai-grok-agent = { workspace = true }
-xai-grok-config-types = { workspace = true }
-xai-grok-shell = { workspace = true }
-xai-grok-tools = { workspace = true }
-xai-tool-protocol = { workspace = true }
-xai-tool-runtime = { workspace = true }
-xai-tool-types = { workspace = true }
-# 第三方依赖：统一走 workspace.dependencies（版本/feature 单一来源）
+# ACP 类型与 gateway 是后续最小 runtime 的直接协议边界；unstable 是 xai-acp-lib 的既定要求。
+agent-client-protocol = { workspace = true, features = ["unstable"] }
+async-trait = { workspace = true }
+xai-acp-lib = { path = "../../codegen/xai-acp-lib" }
 anyhow = { workspace = true }
-clap = { workspace = true }
-dirs = { workspace = true }
+# sidecar 只需 CLI 派生与基础帮助文本；禁止继承 workspace 的 env/color/suggestions。
+clap = { version = "4", default-features = false, features = [
+    "derive",
+    "std",
+    "help",
+    "usage",
+    "error-context",
+] }
 dunce = { workspace = true }
 fs2 = { workspace = true }
-schemars = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+# Task 2 已验证的最小 HTTP 闭包；不启用默认代理、压缩或其他 transport feature。
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "rustls",
+    "stream",
+] }
+# Task 2 已证明的最小 rmcp streamable HTTP client 闭包；禁止 auth/server/process transport。
+rmcp = { version = "2.1", default-features = false, features = [
+    "client",
+    "transport-async-rw",
+    "transport-streamable-http-client-reqwest",
+] }
+tempfile = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+# 不继承 workspace 的 full feature，避免 process 及其他未使用 Tokio 模块进入闭包。
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "macros",
+    "net",
+    "time",
+    "io-util",
+    "io-std",
+    "sync",
+    "fs",
+    "signal",
+] }
+# ACP 使用 Tokio stdio 与 futures-compatible adapter；不启用 process 或其他完整 feature。
+tokio-util = { version = "0.7", default-features = false, features = ["io", "compat"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = [
+    "fmt",
+    "smallvec",
+    "tracing-log",
+    "std",
+] }
+
+[dev-dependencies]
+# 保留现有合同测试所需的纯数据解析依赖；不恢复旧 runtime。
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true }
 toml = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

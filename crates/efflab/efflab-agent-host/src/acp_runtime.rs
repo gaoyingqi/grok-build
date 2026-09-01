@@ -11,7 +11,8 @@ use std::io::{ErrorKind, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -34,6 +35,10 @@ const MAX_INBOUND_QUEUE: usize = 64;
 pub const MAX_ACP_LINE_BYTES: usize = 1_048_576;
 /// Host 或 sidecar 侧单向在途 request 账本的硬上限。
 const MAX_PENDING_REQUESTS: usize = 64;
+/// reader worker 关闭时的最大等待时间；超时保留 JoinHandle，禁止无界 join。
+const READER_JOIN_TIMEOUT: Duration = Duration::from_millis(100);
+/// reader worker 轮询结束状态的间隔，避免关闭路径忙等。
+const READER_JOIN_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Host 使用的数值 JSON-RPC request id。
 ///
@@ -77,6 +82,24 @@ pub struct RpcError {
     /// 可选的结构化错误上下文。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
+}
+
+/// 出站 request 写失败的保守分类；只有确认未触碰 stdin 时才能安全重试。
+#[derive(Debug)]
+pub(crate) enum RequestWriteFailure {
+    /// 校验、序列化、锁或已关闭 stdin 在真正写入前失败。
+    NotWritten(anyhow::Error),
+    /// write/flush 过程中失败，无法从 `Write` 契约判断 sidecar 是否收到部分消息。
+    MayHaveBeenWritten(anyhow::Error),
+}
+
+impl RequestWriteFailure {
+    /// 保留现有公共 API 的 anyhow 错误形状，同时不向调用方暴露底层 payload。
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::NotWritten(error) | Self::MayHaveBeenWritten(error) => error,
+        }
+    }
 }
 
 /// sidecar stdout 上由 Host 消费的三种 JSON-RPC 消息。
@@ -196,27 +219,44 @@ impl AcpRuntime {
         let outbound_requests = Arc::new(Mutex::new(BTreeMap::new()));
         let terminal_error = Arc::new(Mutex::new(None));
         let requested = Arc::new(AtomicBool::new(false));
+        let shutdown_pair = match UnixStream::pair() {
+            Ok(pair) => Some(pair),
+            Err(error) => {
+                // 构造函数不能返回 Result；没有关闭唤醒管道时直接标记 transport 不可用，
+                // 不启动一个无法受控的 reader worker。
+                tracing::error!(
+                    error = %error,
+                    "无法创建 ACP reader shutdown 管道，transport 将 fail-closed"
+                );
+                if let Ok(mut terminal) = terminal_error.lock() {
+                    *terminal = Some("ACP reader shutdown control unavailable".to_string());
+                }
+                None
+            }
+        };
         let (shutdown_read, shutdown_write) =
-            UnixStream::pair().expect("创建 ACP reader shutdown 管道必须成功");
+            shutdown_pair.map_or((None, None), |(read, write)| (Some(read), Some(write)));
         let reader_shutdown = ReaderShutdown {
             requested: Arc::clone(&requested),
-            writer: Mutex::new(Some(shutdown_write)),
+            writer: Mutex::new(shutdown_write),
         };
 
         // stdout 由独立线程独占，避免任何 request 等待路径吞掉中途 notification。
-        let reader_inbound_requests = Arc::clone(&inbound_requests);
-        let reader_outbound_requests = Arc::clone(&outbound_requests);
-        let reader_terminal_error = Arc::clone(&terminal_error);
-        let reader_handle = std::thread::spawn(move || {
-            read_stdout_loop(
-                stdout,
-                shutdown_read,
-                requested,
-                reader_inbound_requests,
-                reader_outbound_requests,
-                reader_terminal_error,
-                sender,
-            );
+        let reader_handle = shutdown_read.map(|shutdown_read| {
+            let reader_inbound_requests = Arc::clone(&inbound_requests);
+            let reader_outbound_requests = Arc::clone(&outbound_requests);
+            let reader_terminal_error = Arc::clone(&terminal_error);
+            std::thread::spawn(move || {
+                read_stdout_loop(
+                    stdout,
+                    shutdown_read,
+                    requested,
+                    reader_inbound_requests,
+                    reader_outbound_requests,
+                    reader_terminal_error,
+                    sender,
+                );
+            })
         });
 
         Self {
@@ -224,7 +264,7 @@ impl AcpRuntime {
             inbound: Mutex::new(receiver),
             terminal_error,
             reader_shutdown,
-            reader_handle: Mutex::new(Some(reader_handle)),
+            reader_handle: Mutex::new(reader_handle),
             // 侧车现有 stdio 测试的 Host request id 从 1 开始。
             next_request_id: AtomicU64::new(1),
             outbound_requests,
@@ -286,20 +326,40 @@ impl AcpRuntime {
         params: Value,
         policy: &HostPolicy,
     ) -> Result<RequestId> {
-        validate_host_request(method, &params, policy)
-            .map_err(|error| anyhow!("ACP request {method} 未通过 Host contract: {error}"))?;
+        self.request_validated_with_outcome(method, params, policy)
+            .map_err(RequestWriteFailure::into_error)
+    }
+
+    /// 发送 request 并保留“绝对未写入”与“可能部分写入”的内部区别。
+    pub(crate) fn request_validated_with_outcome(
+        &self,
+        method: &str,
+        params: Value,
+        policy: &HostPolicy,
+    ) -> std::result::Result<RequestId, RequestWriteFailure> {
+        self.ensure_transport_available()?;
+        validate_host_request(method, &params, policy).map_err(|error| {
+            RequestWriteFailure::NotWritten(anyhow!(
+                "ACP request {method} 未通过 Host contract: {error}"
+            ))
+        })?;
         if method == "session/cancel" {
-            bail!("session/cancel 必须通过 notify_validated 作为 notification 发送");
+            return Err(RequestWriteFailure::NotWritten(anyhow!(
+                "session/cancel 必须通过 notify_validated 作为 notification 发送"
+            )));
         }
 
-        let id = self.allocate_request_id()?;
+        let id = self
+            .allocate_request_id()
+            .map_err(RequestWriteFailure::NotWritten)?;
         {
-            let mut requests = self
-                .outbound_requests
-                .lock()
-                .map_err(|_| anyhow!("ACP 出站 request 账本不可用"))?;
+            let mut requests = self.outbound_requests.lock().map_err(|_| {
+                RequestWriteFailure::NotWritten(anyhow!("ACP 出站 request 账本不可用"))
+            })?;
             if requests.len() >= MAX_PENDING_REQUESTS {
-                bail!("ACP 出站 request 账本达到上限 {MAX_PENDING_REQUESTS}");
+                return Err(RequestWriteFailure::NotWritten(anyhow!(
+                    "ACP 出站 request 账本达到上限 {MAX_PENDING_REQUESTS}"
+                )));
             }
             requests.insert(
                 id,
@@ -316,7 +376,7 @@ impl AcpRuntime {
             "method": wire_method(method),
             "params": params,
         });
-        if let Err(error) = self.write_message(&message) {
+        if let Err(error) = self.write_message_with_outcome(&message) {
             // 写入失败时不保留永远无法收到 response 的在途记录。
             let _ = self.revoke_outbound_request(id);
             return Err(error);
@@ -433,12 +493,13 @@ impl AcpRuntime {
         }
     }
 
-    /// 主动关闭 stdin、唤醒并 join stdout reader；重复调用是幂等的。
+    /// 关闭 stdin、唤醒并有界等待 stdout reader；重复调用是幂等的。
     pub fn shutdown(&self) -> Result<()> {
         self.reader_shutdown.request();
+        // 先关闭 sidecar stdin，给非 Unix 阻塞 stdout reader 一个随进程退出而结束的机会。
+        self.close_stdin();
         let join_result = self.join_reader();
         self.clear_pending_requests();
-        self.close_stdin();
         join_result
     }
 
@@ -451,19 +512,52 @@ impl AcpRuntime {
         Ok(RequestId::new(id))
     }
 
+    /// 确认 reader 未报告 transport 终止；终止后所有新出站消息都必须拒绝。
+    fn ensure_transport_available(&self) -> std::result::Result<(), RequestWriteFailure> {
+        let terminal = self
+            .terminal_error
+            .lock()
+            .map_err(|_| RequestWriteFailure::NotWritten(anyhow!("ACP reader 状态不可用")))?;
+        if terminal.is_some() {
+            tracing::debug!(
+                cleanup_failure = "transport_terminal",
+                "ACP transport 已终止，拒绝新的出站消息"
+            );
+            return Err(RequestWriteFailure::NotWritten(anyhow!(
+                "ACP transport 已终止"
+            )));
+        }
+        Ok(())
+    }
+
     /// 唯一的 stdin 写入入口；调用方必须先完成对应的 request/reply 校验。
     fn write_message(&self, message: &Value) -> Result<()> {
-        let encoded = serde_json::to_vec(message).context("序列化 ACP JSON-RPC 消息失败")?;
+        self.write_message_with_outcome(message)
+            .map_err(RequestWriteFailure::into_error)
+    }
+
+    /// 写入 ACP wire，并区分尚未触碰 stdin 与可能已经提交部分消息的失败。
+    fn write_message_with_outcome(
+        &self,
+        message: &Value,
+    ) -> std::result::Result<(), RequestWriteFailure> {
+        self.ensure_transport_available()?;
+        let encoded = serde_json::to_vec(message)
+            .context("序列化 ACP JSON-RPC 消息失败")
+            .map_err(RequestWriteFailure::NotWritten)?;
         let mut stdin = self
             .stdin
             .lock()
-            .map_err(|_| anyhow!("ACP stdin 写锁不可用"))?;
-        let stdin = stdin.as_mut().ok_or_else(|| anyhow!("ACP stdin 已关闭"))?;
+            .map_err(|_| RequestWriteFailure::NotWritten(anyhow!("ACP stdin 写锁不可用")))?;
+        let stdin = stdin
+            .as_mut()
+            .ok_or_else(|| RequestWriteFailure::NotWritten(anyhow!("ACP stdin 已关闭")))?;
         stdin
             .write_all(&encoded)
             .and_then(|_| stdin.write_all(b"\n"))
             .and_then(|_| stdin.flush())
             .context("写入 ACP stdin 失败")
+            .map_err(RequestWriteFailure::MayHaveBeenWritten)
     }
 
     /// 按 sessionId 释放被取消的 Host→sidecar 在途 request，保留其它 session 的账本。
@@ -478,19 +572,46 @@ impl AcpRuntime {
         Ok(())
     }
 
-    /// join 已保存的 reader worker；worker 只会在 EOF、错误或 shutdown 后结束。
+    /// 在有限预算内回收 reader worker；超时保留句柄，交由后续 cleanup 或 Drop 再试。
     fn join_reader(&self) -> Result<()> {
-        let handle = self
-            .reader_handle
-            .lock()
-            .map_err(|_| anyhow!("ACP reader worker 状态不可用"))?
-            .take();
-        if let Some(handle) = handle {
-            handle
-                .join()
-                .map_err(|_| anyhow!("ACP reader worker 异常退出"))?;
+        let deadline = Instant::now() + READER_JOIN_TIMEOUT;
+        loop {
+            let finished = self
+                .reader_handle
+                .lock()
+                .map_err(|_| anyhow!("ACP reader worker 状态不可用"))?
+                .as_ref()
+                .is_none_or(JoinHandle::is_finished);
+            if finished {
+                let handle = self
+                    .reader_handle
+                    .lock()
+                    .map_err(|_| anyhow!("ACP reader worker 状态不可用"))?
+                    .take();
+                if let Some(handle) = handle {
+                    handle
+                        .join()
+                        .map_err(|_| anyhow!("ACP reader worker 异常退出"))?;
+                }
+                return Ok(());
+            }
+
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                tracing::error!(
+                    cleanup_failure = "reader_join_timeout",
+                    "ACP reader worker 未在有界时间内结束，保留句柄等待后续 cleanup"
+                );
+                return Err(anyhow!("ACP reader worker 关闭超时"));
+            };
+            if remaining.is_zero() {
+                tracing::error!(
+                    cleanup_failure = "reader_join_timeout",
+                    "ACP reader worker 未在有界时间内结束，保留句柄等待后续 cleanup"
+                );
+                return Err(anyhow!("ACP reader worker 关闭超时"));
+            }
+            thread::sleep(remaining.min(READER_JOIN_POLL_INTERVAL));
         }
-        Ok(())
     }
 
     /// 清理 transport 生命周期结束后所有仍在途的 request 账本。
@@ -1053,5 +1174,141 @@ fn validate_permission_result(result: &Value, request_params: &Value) -> Result<
             }
         }
         _ => bail!("permission reply outcome 必须是 selected 或 cancelled"),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                ErrorKind::BrokenPipe,
+                "测试故意让 ACP 写入失败",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn request_outcome_classifies_contract_failure_as_not_written() {
+        let (_stdout_peer, stdout) = UnixStream::pair().expect("测试必须创建 stdout pipe");
+        let runtime = AcpRuntime::new(std::io::sink(), stdout);
+        let outcome = runtime.request_validated_with_outcome(
+            "x.ai/mcp/list",
+            json!({ "sessionId": "session-a", "unexpected": true }),
+            &HostPolicy::new("/"),
+        );
+        assert!(matches!(outcome, Err(RequestWriteFailure::NotWritten(_))));
+    }
+
+    #[test]
+    fn request_outcome_classifies_write_failure_as_may_have_been_written() {
+        let (_stdout_peer, stdout) = UnixStream::pair().expect("测试必须创建 stdout pipe");
+        let runtime = AcpRuntime::new(FailingWriter, stdout);
+        let outcome = runtime.request_validated_with_outcome(
+            "x.ai/mcp/list",
+            json!({ "sessionId": "session-a" }),
+            &HostPolicy::new("/"),
+        );
+        assert!(matches!(
+            outcome,
+            Err(RequestWriteFailure::MayHaveBeenWritten(_))
+        ));
+    }
+
+    /// transport 已终止时，统一写入口必须在 ledger 登记前 fail-closed。
+    #[test]
+    fn request_is_rejected_after_transport_becomes_terminal() {
+        let (_stdout_peer, stdout) = UnixStream::pair().expect("测试必须创建 stdout pipe");
+        let runtime = AcpRuntime::new(std::io::sink(), stdout);
+        *runtime
+            .terminal_error
+            .lock()
+            .expect("测试 terminal 状态锁必须可用") = Some("测试 transport 已终止".to_string());
+
+        let outcome = runtime.request_validated_with_outcome(
+            "x.ai/mcp/list",
+            json!({ "sessionId": "session-a" }),
+            &HostPolicy::new("/"),
+        );
+        assert!(matches!(outcome, Err(RequestWriteFailure::NotWritten(_))));
+        assert_eq!(
+            runtime
+                .outbound_requests
+                .lock()
+                .expect("测试出站 ledger 锁必须可用")
+                .len(),
+            0,
+            "terminal transport 不得登记新的出站 request"
+        );
+    }
+
+    /// reader join 不能因无法取消的 worker 永久阻塞 shutdown；释放后线程仍须可收尾。
+    #[test]
+    fn shutdown_returns_bounded_failure_when_reader_does_not_stop() {
+        let (_stdout_peer, stdout) = UnixStream::pair().expect("测试必须创建 stdout pipe");
+        let runtime = std::sync::Arc::new(AcpRuntime::new(std::io::sink(), stdout));
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let blocking_reader = thread::spawn(move || {
+            release_receiver
+                .recv()
+                .expect("测试必须释放阻塞 reader worker");
+        });
+        let previous_reader = runtime
+            .reader_handle
+            .lock()
+            .expect("测试 reader handle 锁必须可用")
+            .replace(blocking_reader);
+        drop(previous_reader);
+
+        let shutdown_runtime = std::sync::Arc::clone(&runtime);
+        let (shutdown_done, shutdown_result) = mpsc::sync_channel(1);
+        let shutdown_thread = thread::spawn(move || {
+            let result = shutdown_runtime.shutdown();
+            shutdown_done
+                .send(result)
+                .expect("测试必须交付 bounded shutdown 结果");
+        });
+
+        let start = std::time::Instant::now();
+        let first_result = shutdown_result.recv_timeout(Duration::from_millis(500));
+        let returned_before_release = first_result.is_ok();
+
+        release_sender
+            .send(())
+            .expect("测试必须释放阻塞 reader worker");
+        let shutdown_result = match first_result {
+            Ok(result) => result,
+            Err(_) => shutdown_result
+                .recv_timeout(Duration::from_secs(1))
+                .expect("释放 reader 后 shutdown 线程必须正常退出"),
+        };
+        shutdown_thread
+            .join()
+            .expect("测试 shutdown 线程必须正常退出");
+        assert!(
+            returned_before_release,
+            "reader 无法停止时 shutdown 仍必须在有界时间内返回"
+        );
+        assert!(
+            shutdown_result.is_err(),
+            "未确认 reader 结束时 shutdown 必须 fail-closed"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "shutdown 不得等待不可取消的 reader worker"
+        );
+        drop(runtime);
     }
 }

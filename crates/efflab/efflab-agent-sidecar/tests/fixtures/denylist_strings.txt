@@ -1,0 +1,14 @@
+# Task20 release binary string policy.
+# denylist entries are case-insensitive substrings; allowlist entries are exact strings.
+[denylist]
+grok.com
+x.com
+api.x.ai
+mixpanel
+otlp
+trace upload
+
+[allowlist]
+EFFLAB_L3B_BIND
+http://127.0.0.1
+minimal-v1

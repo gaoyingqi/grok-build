@@ -14,20 +14,315 @@
 use std::{
     io,
     pin::Pin,
-    task::{Context, Poll},
+    sync::{Arc, Mutex},
+    task::{Context, Poll, Waker},
 };
 
 use futures::{
-    AsyncBufRead, AsyncBufReadExt as _, AsyncRead, SinkExt as _, StreamExt as _, channel::mpsc,
-    io::BufReader,
+    AsyncBufRead, AsyncBufReadExt as _, AsyncRead, AsyncWrite, SinkExt as _, StreamExt as _,
+    channel::mpsc, io::BufReader,
 };
 
 /// Maximum size of a single NDJSON line (64 MiB).
 ///
-/// Prevents unbounded memory growth if a peer sends data without newlines.
-/// 64 MiB accommodates the largest legitimate ACP messages (e.g. a
-/// multi-megabyte file read response after JSON string escaping).
-const MAX_LINE_SIZE: usize = 64 * 1024 * 1024;
+/// This is shared with the synchronous stdin reader so every ACP ingress has
+/// one hard allocation bound.
+pub(crate) const MAX_LINE_SIZE: usize = 64 * 1024 * 1024;
+
+/// Stable categories used by the failure-aware ACP I/O wrappers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcpTransportErrorKind {
+    /// stdout write returned an error or an unexpected zero-byte write.
+    StdoutWrite,
+    /// stdout flush returned an error.
+    StdoutFlush,
+    /// stdout close returned an error.
+    StdoutClose,
+    /// stdin/ACP input returned an I/O error.
+    StdinRead,
+    /// An input line exceeded [`MAX_LINE_SIZE`].
+    StdinLineTooLong,
+    /// The stdin-to-ACP bridge could not write to its bounded duplex stream.
+    StdinBridge,
+}
+
+impl AcpTransportErrorKind {
+    /// Stable, non-sensitive label suitable for stderr debug events.
+    pub const fn stable_code(self) -> &'static str {
+        match self {
+            Self::StdoutWrite => "stdout_write_failed",
+            Self::StdoutFlush => "stdout_flush_failed",
+            Self::StdoutClose => "stdout_close_failed",
+            Self::StdinRead => "stdin_read_failed",
+            Self::StdinLineTooLong => "stdin_line_too_long",
+            Self::StdinBridge => "stdin_bridge_failed",
+        }
+    }
+
+    fn io_error(self) -> io::Error {
+        let kind = match self {
+            Self::StdoutWrite | Self::StdoutFlush | Self::StdoutClose => io::ErrorKind::BrokenPipe,
+            Self::StdinRead | Self::StdinBridge => io::ErrorKind::Other,
+            Self::StdinLineTooLong => io::ErrorKind::InvalidData,
+        };
+        let message = match self {
+            Self::StdoutWrite => "ACP stdout write failed",
+            Self::StdoutFlush => "ACP stdout flush failed",
+            Self::StdoutClose => "ACP stdout close failed",
+            Self::StdinRead => "ACP stdin read failed",
+            Self::StdinLineTooLong => "ACP stdin line exceeds maximum length",
+            Self::StdinBridge => "ACP stdin bridge failed",
+        };
+        io::Error::new(kind, message)
+    }
+}
+
+#[derive(Debug, Default)]
+struct TransportStateSnapshot {
+    failure: Option<AcpTransportErrorKind>,
+    reader_waker: Option<Waker>,
+}
+
+#[derive(Debug, Default)]
+struct TransportStateInner {
+    snapshot: Mutex<TransportStateSnapshot>,
+}
+
+/// 连接级共享失败状态；首个失败会唤醒正在等待输入的 ACP reader。
+#[derive(Clone, Debug, Default)]
+pub struct AcpTransportState {
+    inner: Arc<TransportStateInner>,
+}
+
+impl AcpTransportState {
+    /// 创建一个未失败的 transport 状态。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 返回首个稳定失败分类，不暴露底层错误正文。
+    pub fn failure(&self) -> Option<AcpTransportErrorKind> {
+        let snapshot = match self.inner.snapshot.lock() {
+            Ok(snapshot) => snapshot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        snapshot.failure
+    }
+
+    /// 记录首个失败并唤醒 ACP input future。
+    pub fn fail(&self, kind: AcpTransportErrorKind) {
+        let reader_waker = {
+            let mut snapshot = match self.inner.snapshot.lock() {
+                Ok(snapshot) => snapshot,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if snapshot.failure.is_some() {
+                return;
+            }
+            snapshot.failure = Some(kind);
+            snapshot.reader_waker.take()
+        };
+        if let Some(waker) = reader_waker {
+            waker.wake();
+        }
+    }
+
+    fn register_reader(&self, waker: &Waker) -> Option<AcpTransportErrorKind> {
+        let mut snapshot = match self.inner.snapshot.lock() {
+            Ok(snapshot) => snapshot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(kind) = snapshot.failure {
+            return Some(kind);
+        }
+        snapshot.reader_waker = Some(waker.clone());
+        None
+    }
+
+    fn clear_reader_waker(&self) {
+        let mut snapshot = match self.inner.snapshot.lock() {
+            Ok(snapshot) => snapshot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        snapshot.reader_waker = None;
+    }
+
+    fn failure_error(&self) -> io::Error {
+        match self.failure() {
+            Some(kind) => kind.io_error(),
+            None => io::Error::new(io::ErrorKind::Other, "ACP transport failed"),
+        }
+    }
+}
+
+/// 在共享失败状态下读取 ACP 输入；写端失败后立即拒绝后续输入。
+pub struct AcpTransportReader<R> {
+    inner: R,
+    state: AcpTransportState,
+}
+
+impl<R> AcpTransportReader<R> {
+    /// 包装一个 futures-compatible reader。
+    pub fn new(inner: R, state: AcpTransportState) -> Self {
+        Self { inner, state }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for AcpTransportReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.state.register_reader(cx.waker()).is_some() {
+            return Poll::Ready(Err(self.state.failure_error()));
+        }
+
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        match result {
+            Poll::Ready(Ok(size)) => {
+                self.state.clear_reader_waker();
+                match self.state.failure() {
+                    Some(_) => Poll::Ready(Err(self.state.failure_error())),
+                    None => Poll::Ready(Ok(size)),
+                }
+            }
+            Poll::Ready(Err(error)) => {
+                self.state.clear_reader_waker();
+                let kind = if error.kind() == io::ErrorKind::InvalidData {
+                    AcpTransportErrorKind::StdinLineTooLong
+                } else {
+                    AcpTransportErrorKind::StdinRead
+                };
+                self.state.fail(kind);
+                Poll::Ready(Err(self.state.failure_error()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// 在共享失败状态下写出 ACP 输出；写失败会唤醒 reader 让第三方循环退出。
+pub struct AcpTransportWriter<W> {
+    inner: W,
+    state: AcpTransportState,
+    /// Tokio stdio may report bytes accepted before its blocking write finishes.
+    pending_write: Option<usize>,
+}
+
+impl<W> AcpTransportWriter<W> {
+    /// 包装唯一的 ACP stdout writer。
+    pub fn new(inner: W, state: AcpTransportState) -> Self {
+        Self {
+            inner,
+            state,
+            pending_write: None,
+        }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for AcpTransportWriter<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.state.failure().is_some() {
+            return Poll::Ready(Err(self.state.failure_error()));
+        }
+
+        // Tokio stdout 会先报告“已接收”再在 flush 中返回阻塞写错误；先确认它。
+        if let Some(size) = self.pending_write {
+            return match Pin::new(&mut self.inner).poll_flush(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(())) => {
+                    self.pending_write = None;
+                    Poll::Ready(Ok(size))
+                }
+                Poll::Ready(Err(_)) => {
+                    self.pending_write = None;
+                    self.state.fail(AcpTransportErrorKind::StdoutWrite);
+                    Poll::Ready(Err(self.state.failure_error()))
+                }
+            };
+        }
+
+        match Pin::new(&mut self.inner).poll_write(cx, buf) {
+            Poll::Ready(Ok(0)) if !buf.is_empty() => {
+                self.state.fail(AcpTransportErrorKind::StdoutWrite);
+                Poll::Ready(Err(self.state.failure_error()))
+            }
+            Poll::Ready(Ok(size)) if size > 0 => {
+                self.pending_write = Some(size);
+                match Pin::new(&mut self.inner).poll_flush(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(Ok(())) => {
+                        self.pending_write = None;
+                        Poll::Ready(Ok(size))
+                    }
+                    Poll::Ready(Err(_)) => {
+                        self.pending_write = None;
+                        self.state.fail(AcpTransportErrorKind::StdoutWrite);
+                        Poll::Ready(Err(self.state.failure_error()))
+                    }
+                }
+            }
+            Poll::Ready(Err(_)) => {
+                self.state.fail(AcpTransportErrorKind::StdoutWrite);
+                Poll::Ready(Err(self.state.failure_error()))
+            }
+            result => result,
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.state.failure().is_some() {
+            return Poll::Ready(Err(self.state.failure_error()));
+        }
+        if self.pending_write.is_some() {
+            match Pin::new(&mut self.inner).poll_flush(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(())) => self.pending_write = None,
+                Poll::Ready(Err(_)) => {
+                    self.pending_write = None;
+                    self.state.fail(AcpTransportErrorKind::StdoutFlush);
+                    return Poll::Ready(Err(self.state.failure_error()));
+                }
+            }
+        }
+        match Pin::new(&mut self.inner).poll_flush(cx) {
+            Poll::Ready(Err(_)) => {
+                self.state.fail(AcpTransportErrorKind::StdoutFlush);
+                Poll::Ready(Err(self.state.failure_error()))
+            }
+            result => result,
+        }
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.state.failure().is_some() {
+            return Poll::Ready(Err(self.state.failure_error()));
+        }
+        if self.pending_write.is_some() {
+            match Pin::new(&mut self.inner).poll_flush(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(())) => self.pending_write = None,
+                Poll::Ready(Err(_)) => {
+                    self.pending_write = None;
+                    self.state.fail(AcpTransportErrorKind::StdoutClose);
+                    return Poll::Ready(Err(self.state.failure_error()));
+                }
+            }
+        }
+        match Pin::new(&mut self.inner).poll_close(cx) {
+            Poll::Ready(Err(_)) => {
+                self.state.fail(AcpTransportErrorKind::StdoutClose);
+                Poll::Ready(Err(self.state.failure_error()))
+            }
+            result => result,
+        }
+    }
+}
 
 /// An [`AsyncRead`] that only yields complete `\n`-delimited lines.
 ///
@@ -141,6 +436,14 @@ async fn read_line_capped(
     reader: &mut (impl AsyncBufRead + Unpin),
     buf: &mut Vec<u8>,
 ) -> io::Result<usize> {
+    read_line_capped_with_limit(reader, buf, MAX_LINE_SIZE).await
+}
+
+async fn read_line_capped_with_limit(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    buf: &mut Vec<u8>,
+    max_line_size: usize,
+) -> io::Result<usize> {
     buf.clear();
     loop {
         let (consumed, done) = {
@@ -148,28 +451,23 @@ async fn read_line_capped(
             if available.is_empty() {
                 return Ok(buf.len()); // EOF
             }
-            match available.iter().position(|&b| b == b'\n') {
-                Some(pos) => {
-                    buf.extend_from_slice(&available[..=pos]);
-                    (pos + 1, true)
-                }
-                None => {
-                    buf.extend_from_slice(available);
-                    (available.len(), false)
-                }
+            let (count, done) = match available.iter().position(|&byte| byte == b'\n') {
+                Some(position) => (position + 1, true),
+                None => (available.len(), false),
+            };
+            let next_len = buf.len().checked_add(count).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "ACP input line length overflow")
+            })?;
+            if next_len > max_line_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "ACP input line exceeds maximum length",
+                ));
             }
+            buf.extend_from_slice(&available[..count]);
+            (count, done)
         };
         reader.consume_unpin(consumed);
-        if buf.len() > MAX_LINE_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "ACP message exceeds {} byte limit ({} bytes read)",
-                    MAX_LINE_SIZE,
-                    buf.len()
-                ),
-            ));
-        }
         if done {
             return Ok(buf.len());
         }
@@ -178,7 +476,9 @@ async fn read_line_capped(
 
 #[cfg(test)]
 mod tests {
-    use futures::{AsyncReadExt as _, io::Cursor};
+    use std::{cell::Cell, future::Future, io::ErrorKind, rc::Rc, task::Poll};
+
+    use futures::{AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, io::Cursor};
 
     use super::*;
 
@@ -298,6 +598,100 @@ mod tests {
             // EOF
             let n = reader.read(&mut small_buf).await.unwrap();
             assert_eq!(n, 0);
+        });
+    }
+
+    #[test]
+    fn unterminated_line_is_rejected_at_small_async_limit() {
+        run(async {
+            let data = b"123456789";
+            let mut reader = BufReader::new(Cursor::new(&data[..]));
+            let mut line = Vec::new();
+            let error = read_line_capped_with_limit(&mut reader, &mut line, 8)
+                .await
+                .expect_err("an unterminated line over the limit must fail");
+
+            assert_eq!(error.kind(), ErrorKind::InvalidData);
+            assert!(
+                line.len() <= 8,
+                "the async reader must not retain bytes over the cap"
+            );
+        });
+    }
+
+    struct AlwaysFailWriter {
+        calls: Rc<Cell<usize>>,
+    }
+
+    impl AsyncWrite for AlwaysFailWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.calls.set(self.calls.get() + 1);
+            Poll::Ready(Err(std::io::Error::new(
+                ErrorKind::BrokenPipe,
+                "raw stdout failure",
+            )))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.calls.set(self.calls.get() + 1);
+            Poll::Ready(Err(std::io::Error::new(
+                ErrorKind::BrokenPipe,
+                "raw stdout failure",
+            )))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.calls.set(self.calls.get() + 1);
+            Poll::Ready(Err(std::io::Error::new(
+                ErrorKind::BrokenPipe,
+                "raw stdout failure",
+            )))
+        }
+    }
+
+    #[test]
+    fn stdout_write_failure_stops_reader_without_leaking_error_text() {
+        run(async {
+            let calls = Rc::new(Cell::new(0));
+            let state = AcpTransportState::new();
+            let mut writer = AcpTransportWriter::new(
+                AlwaysFailWriter {
+                    calls: calls.clone(),
+                },
+                state.clone(),
+            );
+
+            let error = writer
+                .write_all(b"secret output")
+                .await
+                .expect_err("writer failure must be returned");
+            assert_eq!(error.kind(), ErrorKind::BrokenPipe);
+            assert_eq!(error.to_string(), "ACP stdout write failed");
+            assert_eq!(state.failure(), Some(AcpTransportErrorKind::StdoutWrite));
+
+            // 后续写入必须在 wrapper 层短路，不能再次触碰底层 writer。
+            let _ = writer.write_all(b"later").await;
+            assert_eq!(calls.get(), 1);
+
+            // writer 失败后，reader 立即返回错误，不能再消费后续请求。
+            let mut reader = AcpTransportReader::new(Cursor::new(b"later request\n"), state);
+            let mut buf = [0u8; 32];
+            let error = reader
+                .read(&mut buf)
+                .await
+                .expect_err("reader must stop after stdout failure");
+            assert_eq!(error.kind(), ErrorKind::BrokenPipe);
+            assert_eq!(error.to_string(), "ACP stdout write failed");
         });
     }
 }

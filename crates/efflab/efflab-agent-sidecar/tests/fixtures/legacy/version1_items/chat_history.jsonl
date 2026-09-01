@@ -1,0 +1,4 @@
+{"type":"system","content":"legacy system item"}
+{"type":"user","content":[{"type":"text","text":"legacy version one user"}]}
+{"type":"assistant","content":"legacy version one assistant"}
+{"type":"tool_result","tool_call_id":"call-tool","content":"legacy tool result"}

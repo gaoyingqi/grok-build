@@ -1003,6 +1003,12 @@ while IFS= read -r line; do
       esac
       /usr/bin/printf '{"jsonrpc":"2.0","id":%s,"result":{"sessions":[],"nextCursor":null}}\n' "$id"
       ;;
+    *'"method":"session/close"'*)
+      case "$line" in
+        *'"_meta":'*) exit 59 ;;
+      esac
+      /usr/bin/printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      ;;
     *'"method":"session/load"'*)
       load_count=$((load_count + 1))
       test "$cwd" = "$expected_session_cwd" || exit 54

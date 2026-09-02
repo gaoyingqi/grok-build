@@ -16,7 +16,8 @@ use xai_acp_lib::AcpGatewaySender;
 
 use crate::mcp_client::{McpCallResult, McpCancellationToken, McpError, McpRuntime};
 use crate::model_client::{
-    CancellationToken, HttpModelClient, ModelDelta, ModelError, ModelToolCall, ModelTurnRequest,
+    CancellationToken, DEBUG_PREVIEW_BYTES, HttpModelClient, ModelDelta, ModelError, ModelToolCall,
+    ModelTurnRequest, truncate_for_debug,
 };
 use crate::session_store::{
     MAX_RECORD_ID_BYTES, MAX_RECORD_LINE_BYTES, SessionError, SessionRecord, SessionRepository,
@@ -242,7 +243,13 @@ impl TurnLoop {
         user_text: &str,
         control: TurnControl,
     ) -> Result<acp::PromptResponse, TurnLoopError> {
-        tracing::debug!(event = "turn_started", "sidecar turn loop 已进入 prompt");
+        tracing::debug!(
+            event = "turn_started",
+            prompt_id_bytes = prompt_id.len(),
+            user_text_bytes = user_text.len(),
+            user_text = %truncate_for_debug(user_text, DEBUG_PREVIEW_BYTES),
+            "sidecar turn loop 已进入 prompt"
+        );
         let cancellation = control.cancellation();
 
         // 读取当前 session 只用于构造本轮模型快照；审核工具集合同时约束 legacy 读取。
@@ -314,6 +321,7 @@ impl TurnLoop {
                     tracing::debug!(
                         event = "turn_model_request_failed",
                         error = %error,
+                        message_count = messages.len(),
                         "模型 turn 请求失败"
                     );
                     return self
@@ -329,6 +337,7 @@ impl TurnLoop {
             };
 
             let mut model_text = String::new();
+            let mut thought_text = String::new();
             let mut tool_calls = Vec::new();
             loop {
                 match stream.recv().await {
@@ -383,6 +392,33 @@ impl TurnLoop {
                                 .await;
                         }
                     }
+                    Ok(Some(ModelDelta::Thought(delta))) => {
+                        // thinking 只经 ACP 展示，不写入 journal，也不进入下一轮模型 messages。
+                        if !append_bounded(&mut thought_text, &delta) {
+                            return self
+                                .finish_failed(
+                                    session_id,
+                                    prompt_id,
+                                    &mut next_sequence,
+                                    &control,
+                                    TurnLoopError::Model,
+                                )
+                                .await;
+                        }
+                        if let Err(error) =
+                            self.send_thought_delta(session_id, prompt_id, &delta).await
+                        {
+                            return self
+                                .finish_failed(
+                                    session_id,
+                                    prompt_id,
+                                    &mut next_sequence,
+                                    &control,
+                                    error,
+                                )
+                                .await;
+                        }
+                    }
                     Ok(Some(ModelDelta::ToolCall(call))) => tool_calls.push(call),
                     Ok(Some(ModelDelta::Done)) | Ok(None) => {
                         #[cfg(debug_assertions)]
@@ -400,6 +436,11 @@ impl TurnLoop {
                         tracing::debug!(
                             event = "turn_model_stream_failed",
                             error = %error,
+                            assistant_text_bytes = assistant_text.len(),
+                            assistant_text = %truncate_for_debug(
+                                &assistant_text,
+                                DEBUG_PREVIEW_BYTES
+                            ),
                             "模型 SSE stream 读取失败"
                         );
                         return self
@@ -463,12 +504,14 @@ impl TurnLoop {
                 .await;
             match tool_result {
                 Ok(ToolRoundResult::Continue(tool_messages)) => {
-                    let assistant_tool_message = assistant_tool_message(&model_text, &tool_calls)?;
+                    let assistant_tool_message =
+                        assistant_tool_message(&model_text, &thought_text, &tool_calls)?;
                     messages.push(assistant_tool_message);
                     messages.extend(tool_messages);
                     tool_rounds = tool_rounds.saturating_add(1);
                     // 工具 round 文本已由 AssistantToolCalls 承载；后续 snapshot 只记录普通 assistant 文本。
                     assistant_text.clear();
+                    thought_text.clear();
                 }
                 Ok(ToolRoundResult::Cancelled) => {
                     return self
@@ -496,7 +539,8 @@ impl TurnLoop {
         }
     }
 
-    /// 计算唯一的 approved∩ready 工具集；MCP runtime 只把 actual ready 交集加入 ready。
+    /// 计算唯一的 approved∩ready 工具集。
+    /// Chat Completions 协议会完整解析 tool_calls；真正可执行的只有 App 审核通过的工具，不含 bash。
     fn allowed_tools(&self) -> BTreeSet<String> {
         self.expected_tools
             .intersection(&self.ready_tools)
@@ -561,6 +605,23 @@ impl TurnLoop {
         let notification = acp::SessionNotification::new(
             session_id.to_owned(),
             acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(acp::ContentBlock::Text(
+                acp::TextContent::new(delta),
+            ))),
+        )
+        .meta(prompt_meta(prompt_id));
+        self.enqueue_notification(notification).await
+    }
+
+    /// 发送推理增量；Host 投影为 thinking block，不进入模型 transcript。
+    async fn send_thought_delta(
+        &self,
+        session_id: &str,
+        prompt_id: &str,
+        delta: &str,
+    ) -> Result<(), TurnLoopError> {
+        let notification = acp::SessionNotification::new(
+            session_id.to_owned(),
+            acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(acp::ContentBlock::Text(
                 acp::TextContent::new(delta),
             ))),
         )
@@ -1371,7 +1432,11 @@ struct TranscriptToolRecord {
 }
 
 /// 构造当前模型回合的 assistant tool-call 消息；参数只留在模型内部请求，不进日志/journal。
-fn assistant_tool_message(text: &str, calls: &[ModelToolCall]) -> Result<Value, TurnLoopError> {
+fn assistant_tool_message(
+    text: &str,
+    reasoning: &str,
+    calls: &[ModelToolCall],
+) -> Result<Value, TurnLoopError> {
     let mut tool_calls = Vec::with_capacity(calls.len());
     for call in calls {
         let id = call.id.as_deref().ok_or(TurnLoopError::ToolRejected)?;
@@ -1390,11 +1455,15 @@ fn assistant_tool_message(text: &str, calls: &[ModelToolCall]) -> Result<Value, 
             }
         }));
     }
-    Ok(json!({
+    let mut message = json!({
         "role": "assistant",
         "content": if text.is_empty() { Value::Null } else { Value::String(text.to_owned()) },
         "tool_calls": tool_calls
-    }))
+    });
+    if !reasoning.is_empty() {
+        message["reasoning_content"] = Value::String(reasoning.to_owned());
+    }
+    Ok(message)
 }
 
 #[cfg(test)]

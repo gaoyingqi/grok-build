@@ -9,7 +9,7 @@
 //! - `session/new` / `session/load` 仅允许会话、cwd、MCP 与 `_meta` 字段；
 //!   `cwd` 精确匹配策略指定值，`mcpServers` 必须为空数组。
 //! - `session/prompt` 只接受纯文本 ContentBlock，并在写入前阻断 grok-shell
-//!   可解析的文件引用文本；`session/cancel` 与 `session/list` 只开放最小字段面。
+//!   可解析的文件引用文本；`session/cancel`、`session/close` 与 `session/list` 只开放最小字段面。
 //! - `_meta` 白名单按 method 隔离；顶层 `modelId` 不在方法字段白名单，
 //!   因此一律拒绝。
 //! - 未知字段与未知 method 默认拒绝（fail-closed）。
@@ -53,6 +53,9 @@ const SESSION_PROMPT_ALLOWED_FIELDS: &[&str] = &["sessionId", "prompt", "_meta"]
 
 /// `session/cancel` 顶层 params 的唯一允许字段集合。
 const SESSION_CANCEL_ALLOWED_FIELDS: &[&str] = &["sessionId"];
+
+/// `session/close` 顶层 params 的唯一允许字段集合。
+const SESSION_CLOSE_ALLOWED_FIELDS: &[&str] = &["sessionId"];
 
 /// `session/list` 顶层 params 的唯一允许字段集合。
 const SESSION_LIST_ALLOWED_FIELDS: &[&str] = &["cwd", "cursor"];
@@ -198,6 +201,7 @@ pub fn validate_host_request(
         "session/new" | "session/load" => validate_session_request(method, params, policy),
         "session/prompt" => validate_session_prompt(params, policy),
         "session/cancel" => validate_session_cancel(params),
+        "session/close" => validate_session_close(params),
         "session/list" => validate_session_list(params, policy),
         // 只读协议方法：要求 sessionId，并只允许空 _meta。
         "x.ai/mcp/list" => validate_mcp_list(params),
@@ -214,6 +218,7 @@ fn validate_top_level_fields(method: &str, params: &Value) -> Result<(), HostRej
         "session/load" => SESSION_LOAD_ALLOWED_FIELDS,
         "session/prompt" => SESSION_PROMPT_ALLOWED_FIELDS,
         "session/cancel" => SESSION_CANCEL_ALLOWED_FIELDS,
+        "session/close" => SESSION_CLOSE_ALLOWED_FIELDS,
         "session/list" => SESSION_LIST_ALLOWED_FIELDS,
         "x.ai/mcp/list" => MCP_LIST_ALLOWED_FIELDS,
         _ => return Err(HostRejection::UnknownMethod(method.to_string())),
@@ -556,6 +561,11 @@ fn validate_session_cancel(params: &Value) -> Result<(), HostRejection> {
     validate_required_non_empty_string("session/cancel", params, "sessionId")
 }
 
+/// `session/close` 删除持久化 session，只允许非空 sessionId，拒绝任何 `_meta`。
+fn validate_session_close(params: &Value) -> Result<(), HostRejection> {
+    validate_required_non_empty_string("session/close", params, "sessionId")
+}
+
 /// `session/list` 只能列出当前 scope 的 session，并只接受标准 cursor 分页字段。
 fn validate_session_list(params: &Value, policy: &HostPolicy) -> Result<(), HostRejection> {
     const METHOD: &str = "session/list";
@@ -840,6 +850,11 @@ mod tests {
                 serde_json::json!({ "sessionId": "existing-session" }),
             ),
             (
+                "session/close",
+                "session/close",
+                serde_json::json!({ "sessionId": "existing-session" }),
+            ),
+            (
                 "session/list",
                 "session/list",
                 serde_json::json!({ "cwd": cwd, "cursor": "next-page" }),
@@ -951,6 +966,7 @@ mod tests {
         assert_eq!(new_session_keys, ["modelId"]);
         assert!(policy.meta_keys_for("x.ai/mcp/list").is_empty());
         assert!(policy.meta_keys_for("session/cancel").is_empty());
+        assert!(policy.meta_keys_for("session/close").is_empty());
         assert!(policy.meta_keys_for("session/list").is_empty());
     }
 

@@ -424,6 +424,23 @@ impl MinimalAgent {
             .insert(session_id.to_owned());
     }
 
+    /// 取消进行中的 prompt，并清除该 session 的内存槽位。
+    fn forget_session(&self, session_id: &str) {
+        let notify = {
+            let mut state = self.state.borrow_mut();
+            if let Some(active) = state.active_prompts.remove(session_id) {
+                active.control.request_cancel();
+            }
+            state.pending_admissions.remove(session_id);
+            state.cancel_latches.remove(session_id);
+            state.sessions.remove(session_id);
+            state.known_sessions.remove(session_id);
+            state.active_changed.clone()
+        };
+        notify.notify_waiters();
+        tracing::debug!(event = "session_forgotten", "已清除 session 内存槽位");
+    }
+
     /// 判断 session 是否已经通过当前 runtime 的存在性确认。
     fn has_confirmed_session(&self, session_id: &str) -> bool {
         self.state.borrow().known_sessions.contains(session_id)
@@ -911,6 +928,37 @@ impl acp::Agent for MinimalAgent {
         };
         observability::sessions_listed(count);
         Ok(acp::ListSessionsResponse::new(sessions))
+    }
+
+    /// 关闭并删除指定 session；进行中的 prompt 先取消，再移除持久化目录。
+    async fn close_session(
+        &self,
+        args: acp::CloseSessionRequest,
+    ) -> acp::Result<acp::CloseSessionResponse> {
+        if args.session_id.0.is_empty() {
+            return Err(rejected_params("session_close_id_missing"));
+        }
+        if args.meta.is_some() {
+            return Err(rejected_params("session_close_meta_not_allowed"));
+        }
+        let session_id = args.session_id.0.as_ref().to_owned();
+        let known = self.has_confirmed_session(&session_id)
+            || self.has_memory_session(&args.session_id);
+        self.forget_session(&session_id);
+        if let Some(dependencies) = self.runtime_dependencies() {
+            match dependencies.repository.delete(&session_id).await {
+                Ok(()) => {}
+                Err(SessionError::NotFound) if known => {}
+                Err(SessionError::NotFound) => {
+                    return Err(rejected_params("session_not_found"));
+                }
+                Err(_) => return Err(acp::Error::internal_error()),
+            }
+        } else if !known {
+            return Err(rejected_params("session_not_found"));
+        }
+        observability::session_closed();
+        Ok(acp::CloseSessionResponse::new())
     }
 
     /// 启动一个 session turn；同一 session 只允许一个 active prompt，完成后 exactly-once 清理。

@@ -235,6 +235,10 @@ mod task13 {
             name: String,
             arguments: String,
         },
+        ReasoningAndText {
+            reasoning: String,
+            text: String,
+        },
     }
 
     impl ScriptedResponse {
@@ -274,6 +278,14 @@ mod task13 {
             Self::ToolCall {
                 name: name.into(),
                 arguments: arguments.into(),
+            }
+        }
+
+        /// 构造 MiMo 风格首帧 + 推理 + 正文的 SSE 响应。
+        fn reasoning_and_text(reasoning: impl Into<String>, text: impl Into<String>) -> Self {
+            Self::ReasoningAndText {
+                reasoning: reasoning.into(),
+                text: text.into(),
             }
         }
     }
@@ -716,6 +728,10 @@ mod task13 {
                     "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{{\"name\":{encoded_name},\"arguments\":{encoded_arguments}}}}}]}}}}]}}\n\n"
                 )
             }
+            ScriptedResponse::ReasoningAndText { .. } => {
+                // 与 MiMo 首帧同构：空 content、null reasoning、null tool_calls。
+                "data: {\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":null,\"tool_calls\":null}}]}\n\n".to_owned()
+            }
         };
         if stream
             .write_all(
@@ -761,6 +777,26 @@ mod task13 {
             ScriptedResponse::Blocked(_) => {
                 while !stop.load(Ordering::Acquire) {
                     thread::sleep(Duration::from_millis(10));
+                }
+            }
+            ScriptedResponse::ReasoningAndText { reasoning, text } => {
+                let encoded_reasoning =
+                    serde_json::to_string(&reasoning).expect("测试推理文本必须可序列化");
+                let encoded_text = serde_json::to_string(&text).expect("测试 SSE 文本必须可序列化");
+                let reasoning_frame = format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":{encoded_reasoning}}}}}]}}\n\n"
+                );
+                let text_frame = format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":{encoded_text}}}}}]}}\n\n"
+                );
+                if stream
+                    .write_all(reasoning_frame.as_bytes())
+                    .and_then(|_| stream.write_all(text_frame.as_bytes()))
+                    .and_then(|_| stream.write_all(b"data: [DONE]\n\n"))
+                    .and_then(|_| stream.flush())
+                    .is_err()
+                {
+                    return;
                 }
             }
         }
@@ -1219,6 +1255,51 @@ mod task13 {
         }));
         assert_jsonrpc_lines(&client.raw_lines());
         process.finish(&mut client, "session/list");
+    }
+
+    /// session/close 删除已创建的 session，随后 list 不再返回该 id。
+    #[test]
+    fn session_close_removes_session_from_list() {
+        let fixture = Fixture::new();
+        let (mut process, mut client) = fixture.spawn();
+        let _ = initialize(&mut client);
+        let created = new_session(&mut client, &fixture.session_cwd);
+        let created_id = session_id(&created);
+        let closed = client
+            .request(
+                "session/close",
+                serde_json::json!({ "sessionId": created_id }),
+                REQUEST_TIMEOUT,
+            )
+            .expect("session/close 必须成功");
+        assert!(closed["result"].is_object());
+        let listed = client
+            .request(
+                "session/list",
+                session_list_params(&fixture.session_cwd),
+                REQUEST_TIMEOUT,
+            )
+            .expect("session/list 必须成功");
+        let sessions = listed["result"]["sessions"]
+            .as_array()
+            .expect("session/list result.sessions 必须是数组");
+        assert!(
+            sessions
+                .iter()
+                .all(|session| session["sessionId"].as_str() != Some(created_id.as_str())),
+            "已 close 的 session 不得再出现在 list"
+        );
+        let missing = client.request(
+            "session/close",
+            serde_json::json!({ "sessionId": created_id }),
+            REQUEST_TIMEOUT,
+        );
+        assert!(
+            missing.is_err(),
+            "重复 close 未知 session 必须失败"
+        );
+        assert_jsonrpc_lines(&client.raw_lines());
+        process.finish(&mut client, "session/close");
     }
 
     /// 标准 session/load 可加载当前进程的最小内存 session，不触及持久化或模型。
@@ -1680,6 +1761,33 @@ mod task13 {
         process.finish(&mut client, "minimal prompt");
     }
 
+    /// OpenAI 兼容推理字段必须投影为 agent_thought_chunk，且不得让 turn 失败。
+    #[test]
+    fn prompt_streams_reasoning_content_as_thought_chunks() {
+        let server = ScriptedL3b::new([ScriptedResponse::reasoning_and_text("先想一步", "你好")]);
+        let fixture = Fixture::with_model_url(server.base_url().to_owned());
+        let (mut process, mut client) = fixture.spawn();
+        let _ = initialize(&mut client);
+        let created = new_session(&mut client, &fixture.session_cwd);
+        let response = client
+            .request(
+                "session/prompt",
+                serde_json::json!({
+                    "sessionId": session_id(&created),
+                    "prompt": [{ "type": "text", "text": "hello" }],
+                    "_meta": { "promptId": "prompt-reasoning" }
+                }),
+                REQUEST_TIMEOUT,
+            )
+            .expect("带 reasoning_content 的 session/prompt 必须返回 response");
+        assert_eq!(response["result"]["stopReason"], "end_turn");
+        let lines = client.raw_lines();
+        assert_eq!(thought_snapshots(&lines, "prompt-reasoning"), ["先想一步"]);
+        assert_eq!(assistant_snapshots(&lines, "prompt-reasoning"), ["你好"]);
+        assert_jsonrpc_lines(&lines);
+        process.finish(&mut client, "reasoning prompt");
+    }
+
     /// 当前 profile 只接受 text；其它 ACP ContentBlock 变体和 text 扩展字段都拒绝。
     #[test]
     fn prompt_rejects_non_text_and_extended_text_blocks() {
@@ -2044,6 +2152,22 @@ mod task13 {
             .filter(|value| value["method"] == "session/update")
             .filter(|value| value["params"]["_meta"]["promptId"] == prompt_id)
             .filter(|value| value["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+            .filter_map(|value| {
+                value["params"]["update"]["content"]["text"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    /// 取得指定 prompt 的 thought 文本，按 ACP 通知到达顺序保留。
+    fn thought_snapshots(lines: &[String], prompt_id: &str) -> Vec<String> {
+        lines
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|value| value["method"] == "session/update")
+            .filter(|value| value["params"]["_meta"]["promptId"] == prompt_id)
+            .filter(|value| value["params"]["update"]["sessionUpdate"] == "agent_thought_chunk")
             .filter_map(|value| {
                 value["params"]["update"]["content"]["text"]
                     .as_str()

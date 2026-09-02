@@ -1375,6 +1375,26 @@
     "rejection": "UnknownField"
   },
   {
+    "name": "session/close ok",
+    "method": "session/close",
+    "params": { "sessionId": "s1" },
+    "expect": "allow"
+  },
+  {
+    "name": "session/close missing sessionId",
+    "method": "session/close",
+    "params": {},
+    "expect": "reject",
+    "rejection": "MissingRequiredField"
+  },
+  {
+    "name": "session/close rejects meta",
+    "method": "session/close",
+    "params": { "sessionId": "s1", "_meta": { "promptId": "submission-1" } },
+    "expect": "reject",
+    "rejection": "UnknownField"
+  },
+  {
     "name": "session/list cwd ok",
     "method": "session/list",
     "params": { "cwd": "{{CWD}}" },

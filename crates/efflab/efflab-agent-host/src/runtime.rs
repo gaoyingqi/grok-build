@@ -45,6 +45,8 @@ const ACTOR_JOIN_GRACE: Duration = Duration::from_millis(100);
 const LOAD_TIMEOUT: Duration = Duration::from_secs(60);
 /// ACP 明确表示 session 不存在的错误码；其它 load error 不能伪装成 NotFound。
 const ACP_SESSION_NOT_FOUND: i64 = -32004;
+/// JSON-RPC invalid params；sidecar close 未知 session 使用该码。
+const JSON_RPC_INVALID_PARAMS: i64 = -32602;
 /// actor 空闲轮询间隔；stdout reader 独立运行，因此该值不影响 ACP 收包顺序。
 const ACTOR_TICK: Duration = Duration::from_millis(5);
 /// terminal sink 失败后的重试间隔；不让失败 sink 造成 actor 忙循环。
@@ -63,6 +65,21 @@ const EFFLAB_SESSION_STORE_VERSION: u64 = 1;
 const NOOP_TOOL: &str = "GrokBuild:efflab_noop";
 /// Kit capability 与实际写入 sidecar 的单次 prompt 统一字符上限。
 const MAX_PROMPT_CHARS: usize = 32_000;
+/// 用户可见的回合失败提示；不得出现 sidecar 等实现名词。
+const TURN_FAILED_USER_MESSAGE: &str = "回复未完成，请重试";
+
+/// 把 sidecar 稳定错误码转成用户可读提示，不暴露内部实现名词。
+fn turn_failure_user_message(code: &str) -> &'static str {
+    match code {
+        "turn_model_error" => "模型没有返回有效回复，请重试",
+        "turn_session_not_found" | "turn_session_read_only" => "当前会话无法继续，请新建对话",
+        "turn_session_error" => "会话保存失败，请重试",
+        "turn_transport_error" => "连接中断，请重试",
+        "turn_tool_rejected" => "这次工具调用未被允许",
+        "turn_permission_error" => "工具授权未完成，请重试",
+        _ => TURN_FAILED_USER_MESSAGE,
+    }
+}
 
 /// 产品唯一调用入口的进程内状态。
 pub struct HostRuntime {
@@ -199,6 +216,17 @@ impl HostRuntime {
                     reply,
                 })
             }
+            KitCommand::DeleteSession {
+                scope_id,
+                session_id,
+            } => {
+                self.require_conversation_channel()?;
+                let actor = self.actor_for_scope(&scope_id)?;
+                request_actor(&actor, |reply| ActorCommand::DeleteSession {
+                    session_id,
+                    reply,
+                })
+            }
             KitCommand::GetLlmChannelView => Ok(KitReply::LlmChannelView {
                 channel: self.channel_service()?.view().map_err(channel_error)?,
             }),
@@ -256,6 +284,7 @@ impl HostRuntime {
             "new_session".to_string(),
             "list_sessions".to_string(),
             "resume_session".to_string(),
+            "delete_session".to_string(),
             "llm_channel".to_string(),
         ];
         if self.app.mentions().is_some() {
@@ -1181,6 +1210,10 @@ enum ActorCommand {
         session_id: String,
         reply: ReplySender,
     },
+    DeleteSession {
+        session_id: String,
+        reply: ReplySender,
+    },
     Send {
         session_id: String,
         submission_id: String,
@@ -1308,6 +1341,10 @@ enum PendingRpc {
         reply: ReplySender,
     },
     ListSessions {
+        reply: ReplySender,
+    },
+    DeleteSession {
+        session_id: String,
         reply: ReplySender,
     },
     Load {
@@ -1790,6 +1827,9 @@ impl ScopeActor {
         match pending {
             PendingRpc::NewSession { reply } => self.finish_new_session(reply, result),
             PendingRpc::ListSessions { reply } => self.finish_list_sessions(reply, result),
+            PendingRpc::DeleteSession { session_id, reply } => {
+                self.finish_delete_session(session_id, reply, result)
+            }
             PendingRpc::Load {
                 session_id,
                 replay_epoch,
@@ -1976,6 +2016,10 @@ impl ScopeActor {
                         self.resume_session(session_id, reply);
                         false
                     }
+                    ActorCommand::DeleteSession { session_id, reply } => {
+                        self.start_delete_session(session_id, reply);
+                        false
+                    }
                     ActorCommand::Send {
                         session_id,
                         submission_id,
@@ -2047,6 +2091,43 @@ impl ScopeActor {
             }
             Err(_) => {
                 let _ = reply.send(Err(sidecar_unavailable("无法写入 session/list")));
+                self.enter_dead(sidecar_unavailable("sidecar stdin 不可用"));
+            }
+        }
+    }
+
+    /// session/close 删除持久化历史；busy 时拒绝，避免打断正在生成或恢复的回合。
+    fn start_delete_session(&mut self, session_id: String, reply: ReplySender) {
+        if session_id.is_empty() {
+            let _ = reply.send(Err(KitError::non_retryable(
+                "invalid_request",
+                "删除会话缺少 session_id",
+            )));
+            return;
+        }
+        if self.load_flight.is_some() || !self.in_flight.is_empty() {
+            let _ = reply.send(Err(KitError::non_retryable(
+                "session_busy",
+                "当前 scope 正在生成或恢复，不能删除会话",
+            )));
+            return;
+        }
+        let params = json!({ "sessionId": session_id });
+        match self
+            .acp
+            .request_validated("session/close", params, &self.policy)
+        {
+            Ok(id) => {
+                self.pending.insert(
+                    id,
+                    PendingRpc::DeleteSession {
+                        session_id,
+                        reply,
+                    },
+                );
+            }
+            Err(_) => {
+                let _ = reply.send(Err(sidecar_unavailable("无法写入 session/close")));
                 self.enter_dead(sidecar_unavailable("sidecar stdin 不可用"));
             }
         }
@@ -2421,6 +2502,40 @@ impl ScopeActor {
         }));
     }
 
+    /// 成功 close 后从 actor 内存摘掉该 session；找不到则映射为 session_not_found。
+    fn finish_delete_session(
+        &mut self,
+        session_id: String,
+        reply: ReplySender,
+        result: Result<Value, RpcError>,
+    ) {
+        match result {
+            Ok(_) => {
+                self.active_sessions.remove(&session_id);
+                self.transcript.remove(&session_id);
+                self.mcp_failed_sessions.remove(&session_id);
+                if self.current_session.as_deref() == Some(session_id.as_str()) {
+                    self.current_session = None;
+                }
+                tracing::debug!(
+                    scope = %self.scope_id,
+                    event = "session_deleted",
+                    "Kit delete_session 已删除 sidecar session"
+                );
+                let _ = reply.send(Ok(KitReply::DeleteSession { session_id }));
+            }
+            Err(error) if is_close_session_not_found(&error) => {
+                let _ = reply.send(Err(KitError::non_retryable(
+                    "session_not_found",
+                    "sidecar 未找到指定会话",
+                )));
+            }
+            Err(_) => {
+                let _ = reply.send(Err(sidecar_unavailable("sidecar 删除会话失败")));
+            }
+        }
+    }
+
     /// 按当前 actor 的唯一 owner 结算 load；取走 flight 后后续 response 只能被丢弃。
     fn finish_current_load(&mut self, outcome: LoadOutcome) -> bool {
         let Some((owner_request_id, session_id, replay_epoch, generation)) =
@@ -2658,9 +2773,12 @@ impl ScopeActor {
             Ok(_) => {
                 self.emit_turn_status(&session_id, &submission_id, "turn_completed", "回合已完成")
             }
-            Err(_) => {
-                self.emit_turn_status(&session_id, &submission_id, "error", "sidecar 回合失败")
-            }
+            Err(error) => self.emit_turn_status(
+                &session_id,
+                &submission_id,
+                "error",
+                turn_failure_user_message(&error.message),
+            ),
         }
     }
 
@@ -3217,7 +3335,7 @@ impl ScopeActor {
         self.dead = true;
         // ScopeDead 结算必须发生在 ACP shutdown 前，确保 accepted resume 有终止事件。
         self.finish_current_load(LoadOutcome::ScopeDead);
-        self.finish_in_flight_turns("error", "sidecar 回合失败");
+        self.finish_in_flight_turns("error", TURN_FAILED_USER_MESSAGE);
         // 给 transient sink failure 一次额外机会；若仍失败则由 dead actor 后续有限重试。
         self.retry_pending_terminal_events();
         self.cleanup_resources();
@@ -3374,16 +3492,21 @@ impl ScopeActor {
         }
         for (_, pending) in std::mem::take(&mut self.pending) {
             match pending {
-                PendingRpc::NewSession { reply } | PendingRpc::ListSessions { reply } => {
+                PendingRpc::NewSession { reply }
+                | PendingRpc::ListSessions { reply }
+                | PendingRpc::DeleteSession { reply, .. } => {
                     let _ = reply.send(Err(error.clone()));
                 }
                 PendingRpc::Load { .. } | PendingRpc::McpCatalog { .. } => {}
                 PendingRpc::Prompt {
                     session_id,
                     submission_id,
-                } => {
-                    self.emit_turn_status(&session_id, &submission_id, "error", "sidecar 回合失败")
-                }
+                } => self.emit_turn_status(
+                    &session_id,
+                    &submission_id,
+                    "error",
+                    TURN_FAILED_USER_MESSAGE,
+                ),
             }
         }
     }
@@ -3483,6 +3606,7 @@ fn send_command_error(command: ActorCommand, error: KitError) {
         ActorCommand::NewSession { reply }
         | ActorCommand::ListSessions { reply, .. }
         | ActorCommand::ResumeSession { reply, .. }
+        | ActorCommand::DeleteSession { reply, .. }
         | ActorCommand::Cancel { reply, .. } => {
             let _ = reply.send(Err(error));
         }
@@ -3610,6 +3734,11 @@ fn sidecar_unavailable(message: &str) -> KitError {
 /// 只把明确的 ACP NotFound 错误码映射为 session_not_found。
 fn is_session_not_found(error: &RpcError) -> bool {
     error.code == ACP_SESSION_NOT_FOUND
+}
+
+/// session/close 的 not-found 同时接受 ACP 专用码与 JSON-RPC invalid_params。
+fn is_close_session_not_found(error: &RpcError) -> bool {
+    error.code == ACP_SESSION_NOT_FOUND || error.code == JSON_RPC_INVALID_PARAMS
 }
 
 /// 失败 load 必须保持可观察且不泄漏 sidecar 原始错误内容。
@@ -3867,6 +3996,23 @@ mod tests {
     };
     use crate::config::L3bRuntimeConfig;
     use crate::event_sink::KitEventSink;
+
+    #[test]
+    fn turn_failure_user_message_hides_sidecar_and_maps_model_error() {
+        assert_eq!(
+            turn_failure_user_message("turn_model_error"),
+            "模型没有返回有效回复，请重试"
+        );
+        assert_eq!(turn_failure_user_message("unknown"), "回复未完成，请重试");
+        assert!(
+            !turn_failure_user_message("turn_model_error").contains("sidecar"),
+            "用户提示不得出现 sidecar"
+        );
+        assert!(
+            !TURN_FAILED_USER_MESSAGE.contains("sidecar"),
+            "默认失败提示不得出现 sidecar"
+        );
+    }
 
     struct LifecycleTestApp;
 

@@ -46,6 +46,11 @@ pub enum KitCommand {
         scope_id: String,
         session_id: String,
     },
+    /// 删除指定会话及其持久化历史。
+    DeleteSession {
+        scope_id: String,
+        session_id: String,
+    },
     /// 查询不会回显秘密的 Channel view。
     GetLlmChannelView,
     /// 设置产品全局 Channel；秘密只允许存在于该请求内。
@@ -112,6 +117,14 @@ impl fmt::Debug for KitCommand {
                 .field("scope_id", scope_id)
                 .field("session_id", session_id)
                 .finish(),
+            Self::DeleteSession {
+                scope_id,
+                session_id,
+            } => formatter
+                .debug_struct("DeleteSession")
+                .field("scope_id", scope_id)
+                .field("session_id", session_id)
+                .finish(),
             Self::GetLlmChannelView => formatter.write_str("GetLlmChannelView"),
             Self::SetLlmChannel {
                 kind,
@@ -166,6 +179,9 @@ impl KitCommand {
             "list_sessions" => serde_json::from_value::<ListSessionsCommand>(value).map(Into::into),
             "resume_session" => {
                 serde_json::from_value::<ResumeSessionCommand>(value).map(Into::into)
+            }
+            "delete_session" => {
+                serde_json::from_value::<DeleteSessionCommand>(value).map(Into::into)
             }
             "get_llm_channel_view" => serde_json::from_value::<GetLlmChannelViewCommand>(value)
                 .map(|_| Self::GetLlmChannelView),
@@ -240,6 +256,15 @@ impl Serialize for KitCommand {
                 session_id,
             } => ResumeSessionCommand {
                 cmd: "resume_session".to_string(),
+                scope_id: scope_id.clone(),
+                session_id: session_id.clone(),
+            }
+            .serialize(serializer),
+            Self::DeleteSession {
+                scope_id,
+                session_id,
+            } => DeleteSessionCommand {
+                cmd: "delete_session".to_string(),
                 scope_id: scope_id.clone(),
                 session_id: session_id.clone(),
             }
@@ -366,6 +391,8 @@ pub enum KitReply {
     },
     /// 恢复会话的立即受理。
     ResumeSession { accepted: bool, session_id: String },
+    /// 删除会话的结果。
+    DeleteSession { session_id: String },
     /// 不含秘密的 Channel view；外层 tag 固定为 `llm_channel_view`。
     LlmChannelView { channel: LlmChannelView },
 }
@@ -717,6 +744,14 @@ struct ResumeSessionCommand {
     session_id: String,
 }
 
+/// `delete_session` 命令的 wire 形状。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeleteSessionCommand {
+    cmd: String,
+    scope_id: String,
+    session_id: String,
+}
+
 /// `get_llm_channel_view` 命令的 wire 形状。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GetLlmChannelViewCommand {
@@ -906,6 +941,16 @@ impl From<ListSessionsCommand> for KitCommand {
 impl From<ResumeSessionCommand> for KitCommand {
     fn from(command: ResumeSessionCommand) -> Self {
         Self::ResumeSession {
+            scope_id: command.scope_id,
+            session_id: command.session_id,
+        }
+    }
+}
+
+/// 将 DeleteSession wire DTO 转成公开命令。
+impl From<DeleteSessionCommand> for KitCommand {
+    fn from(command: DeleteSessionCommand) -> Self {
+        Self::DeleteSession {
             scope_id: command.scope_id,
             session_id: command.session_id,
         }

@@ -1082,6 +1082,12 @@ while IFS= read -r line; do
       esac
       /usr/bin/printf '{"jsonrpc":"2.0","id":%s,"result":{"sessions":[{"sessionId":"sidecar-session","title":"来自 sidecar 的标题","updatedAt":"2026-08-14T00:00:00Z"},{"sessionId":"untitled-session","updatedAt":"2026-08-13T00:00:00Z"}],"nextCursor":"next-page"}}\n' "$id"
       ;;
+    *'"method":"session/close"'*)
+      case "$line" in
+        *'"_meta":'*) exit 59 ;;
+      esac
+      /usr/bin/printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      ;;
     *'"method":"session/load"'*)
       load_count=$((load_count + 1))
       test "$cwd" = "$expected_scope_cwd" || exit 54
@@ -1848,6 +1854,10 @@ fn unconfigured_channel_rejects_all_conversation_commands_without_spawning() {
             scope_id: "scope-a".to_string(),
             session_id: "session-a".to_string(),
         },
+        KitCommand::DeleteSession {
+            scope_id: "scope-a".to_string(),
+            session_id: "session-a".to_string(),
+        },
         KitCommand::Cancel {
             scope_id: "scope-a".to_string(),
             session_id: "session-a".to_string(),
@@ -2475,6 +2485,32 @@ fn list_without_cursor_omits_cursor_from_acp_params() {
     assert!(
         list_wire["params"].get("cursor").is_none(),
         "ListSessions cursor=None 时 session/list params 不得包含 cursor"
+    );
+}
+
+/// delete_session 等待 sidecar session/close，并在成功后从 actor 内存摘掉该 session。
+#[test]
+fn delete_session_waits_for_acp_close_and_drops_active_session() {
+    let harness = Harness::configured("basic", [], Duration::from_secs(60));
+    let session_id = harness.new_session("scope-a");
+    let reply = harness
+        .runtime
+        .dispatch(KitCommand::DeleteSession {
+            scope_id: "scope-a".to_string(),
+            session_id: session_id.clone(),
+        })
+        .expect("DeleteSession 必须等待 sidecar result");
+    assert_eq!(reply, KitReply::DeleteSession { session_id: session_id.clone() });
+
+    let close_wire = harness
+        .captured_requests("session/close")
+        .into_iter()
+        .next()
+        .expect("必须调用标准 session/close");
+    assert_eq!(close_wire["params"]["sessionId"], session_id);
+    assert!(
+        close_wire["params"].get("_meta").is_none(),
+        "session/close 不得携带 _meta"
     );
 }
 

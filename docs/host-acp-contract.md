@@ -46,6 +46,7 @@
 | `session/list` | request | `cwd`（强制 = session_cwd）、可选 `cursor` | 空 | **顶层 `limit`**（ACP 0.10.4 / schema 0.11.4 的 `ListSessionsRequest` 无此字段）；真实 wire 字段 `additionalDirectories`（本产品 profile 拒绝）；web/产品传入的其它 cwd；`allowRelax`；`mcpServers`；facet / 远程 roster；任何 `_meta` 键 |
 | `session/prompt` | request（长） | `sessionId`、`prompt`（**ContentBlock 数组**，见 §3.1） | **仅 `promptId`**（= Kit `submission_id`） | 扁平 `text`、image/resource、未知顶层字段、`modelId`、把 ACP union 暴露给 web |
 | `session/cancel` | **notification** | `sessionId` | 空 | 当成 request 等 result；任何 `_meta`（含 `yolo` / `rewindIfNoOutput` / `cancelSubagents` / `promptId`） |
+| `session/close` | request | `sessionId`（必填且为非空字符串） | 空 | `_meta`、未知顶层字段、空 `sessionId`；关闭时取消该 session 的进行中 prompt，并删除 v1/legacy 持久化目录 |
 | `_x.ai/mcp/list` | request | `sessionId`（**M1 必填**；无 session 时 catalog 的 local tools 为 `None`） | 空 | 未知 `_meta` 键；`cache` 字段（不在白名单；默认 true 可接受） |
 
 **M1 明确拒绝（保持 UnknownMethod）：**

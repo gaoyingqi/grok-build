@@ -265,6 +265,8 @@ fn host_policy_builder_rejects_contract_forbidden_meta_combinations() {
         ("session/list", "promptId"),
         ("session/cancel", "modelId"),
         ("session/cancel", "promptId"),
+        ("session/close", "modelId"),
+        ("session/close", "promptId"),
         ("session/new", "promptId"),
         ("session/load", "promptId"),
         ("session/prompt", "modelId"),

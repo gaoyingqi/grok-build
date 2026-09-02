@@ -1,7 +1,8 @@
 //! 可信 Host 的 ACP stdio JSON-RPC 运行时。
 //!
 //! 此模块只负责拆分后的 stdin/stdout 传输、消息复用与反向 RPC 回复校验；
-//! 不启动 sidecar，也不把 ACP 类型泄漏到产品层。
+//! 不启动 sidecar，也不把 ACP 类型泄漏到产品层。DEBUG 级别会输出截断后的
+//! Host↔sidecar JSON-RPC 预览，并对 token/key 等字段脱敏。
 
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::fmt;
@@ -39,6 +40,8 @@ const MAX_PENDING_REQUESTS: usize = 64;
 const READER_JOIN_TIMEOUT: Duration = Duration::from_millis(100);
 /// reader worker 轮询结束状态的间隔，避免关闭路径忙等。
 const READER_JOIN_POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// DEBUG 日志中 ACP JSON 预览上限。
+const ACP_WIRE_PREVIEW_BYTES: usize = 4096;
 
 /// Host 使用的数值 JSON-RPC request id。
 ///
@@ -557,7 +560,9 @@ impl AcpRuntime {
             .and_then(|_| stdin.write_all(b"\n"))
             .and_then(|_| stdin.flush())
             .context("写入 ACP stdin 失败")
-            .map_err(RequestWriteFailure::MayHaveBeenWritten)
+            .map_err(RequestWriteFailure::MayHaveBeenWritten)?;
+        log_acp_wire("host_to_sidecar", message);
+        Ok(())
     }
 
     /// 按 sessionId 释放被取消的 Host→sidecar 在途 request，保留其它 session 的账本。
@@ -736,6 +741,7 @@ fn read_stdout_loop<R>(
 
             match decode_inbound(line, &inbound_requests, &outbound_requests) {
                 Ok(inbound) => {
+                    log_acp_wire_line("sidecar_to_host", line);
                     if !try_enqueue(
                         &sender,
                         Ok(inbound),
@@ -833,6 +839,7 @@ fn read_stdout_loop<R>(
                 }
                 match decode_inbound(line, &inbound_requests, &outbound_requests) {
                     Ok(inbound) => {
+                        log_acp_wire_line("sidecar_to_host", line);
                         if !try_enqueue(
                             &sender,
                             Ok(inbound),
@@ -1177,6 +1184,111 @@ fn validate_permission_result(result: &Value, request_params: &Value) -> Result<
     }
 }
 
+/// 按 UTF-8 字节边界截断 ACP 预览，避免整行 JSON 打满日志。
+fn truncate_acp_preview(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…<truncated,total_bytes={}>", &text[..end], text.len())
+}
+
+/// 识别不应进入 DEBUG 日志的凭据字段名。
+fn is_sensitive_acp_key(key: &str) -> bool {
+    let normalized = key.replace('-', "_").to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "authorization"
+            | "api_key"
+            | "apikey"
+            | "access_token"
+            | "app_key"
+            | "password"
+            | "secret"
+            | "binding"
+            | "token"
+            | "env_key"
+    ) || normalized.ends_with("_token")
+        || normalized.ends_with("_secret")
+        || normalized.ends_with("_password")
+        || (normalized.ends_with("_key") && normalized.contains("api"))
+}
+
+/// 递归脱敏 JSON 对象中的凭据字段，保留 method/id/prompt 等追踪字段。
+fn redact_acp_json(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut redacted = serde_json::Map::new();
+            for (key, child) in map {
+                if is_sensitive_acp_key(key) {
+                    redacted.insert(key.clone(), Value::String("<redacted>".to_owned()));
+                } else {
+                    redacted.insert(key.clone(), redact_acp_json(child));
+                }
+            }
+            Value::Object(redacted)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(redact_acp_json).collect()),
+        other => other.clone(),
+    }
+}
+
+/// 记录一条已解析的 ACP JSON-RPC 消息，仅 DEBUG 且不含凭据明文。
+fn log_acp_wire(direction: &'static str, payload: &Value) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let method = payload.get("method").and_then(Value::as_str);
+    let id = payload.get("id").map(ToString::to_string);
+    let kind = if method.is_some() {
+        if payload.get("id").is_some() {
+            "request"
+        } else {
+            "notification"
+        }
+    } else if payload.get("error").is_some() {
+        "error_response"
+    } else {
+        "response"
+    };
+    let preview = truncate_acp_preview(
+        &redact_acp_json(payload).to_string(),
+        ACP_WIRE_PREVIEW_BYTES,
+    );
+    tracing::debug!(
+        event = "acp_wire",
+        direction,
+        kind,
+        method,
+        id = id.as_deref(),
+        payload_bytes = preview.len(),
+        payload = %preview,
+        "ACP Host↔sidecar 消息"
+    );
+}
+
+/// 将 stdout 原始行解析后记入 DEBUG；无法解析时仍输出截断文本。
+fn log_acp_wire_line(direction: &'static str, line: &str) {
+    match serde_json::from_str::<Value>(line) {
+        Ok(value) => log_acp_wire(direction, &value),
+        Err(_) => {
+            if !tracing::enabled!(tracing::Level::DEBUG) {
+                return;
+            }
+            tracing::debug!(
+                event = "acp_wire",
+                direction,
+                kind = "unparsed",
+                payload = %truncate_acp_preview(line, ACP_WIRE_PREVIEW_BYTES),
+                "ACP Host↔sidecar 非 JSON 行"
+            );
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1198,6 +1310,30 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn redact_acp_json_keeps_prompt_and_hides_credentials() {
+        let value = json!({
+            "method": "session/prompt",
+            "params": {
+                "prompt": [{"type": "text", "text": "hello"}],
+                "api_key": "should-not-log",
+                "access_token": "should-not-log",
+            }
+        });
+        let redacted = redact_acp_json(&value);
+        assert_eq!(redacted["method"], "session/prompt");
+        assert_eq!(redacted["params"]["prompt"][0]["text"], "hello");
+        assert_eq!(redacted["params"]["api_key"], "<redacted>");
+        assert_eq!(redacted["params"]["access_token"], "<redacted>");
+    }
+
+    #[test]
+    fn truncate_acp_preview_marks_overflow() {
+        let preview = truncate_acp_preview("abcdefghij", 4);
+        assert!(preview.contains("truncated,total_bytes=10"), "{preview}");
+        assert!(preview.starts_with("abcd"), "{preview}");
     }
 
     #[test]

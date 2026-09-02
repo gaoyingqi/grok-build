@@ -43,6 +43,19 @@ async fn next_text(stream: &mut impl ModelStreamLike) -> String {
     }
 }
 
+/// 读取一个 SSE delta，并断言它是推理增量。
+async fn next_thought(stream: &mut impl ModelStreamLike) -> String {
+    match stream
+        .recv()
+        .await
+        .expect("读取 SSE delta")
+        .expect("应有 delta")
+    {
+        ModelDelta::Thought(text) => text,
+        other => panic!("预期推理 delta，实际为 {other:?}"),
+    }
+}
+
 /// 为测试复用 client stream 的异步接收接口。
 trait ModelStreamLike {
     fn recv(
@@ -251,6 +264,114 @@ async fn rejects_known_oversized_content_length_before_stream() {
 }
 
 #[tokio::test]
+async fn accepts_mimo_first_frame_and_streams_reasoning_then_content() {
+    let body = concat!(
+        r#"data: {"id":"chunk-1","object":"chat.completion.chunk","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":"","reasoning_content":null,"tool_calls":null}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[{"delta":{"reasoning_content":"先想一步"}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[{"delta":{"content":"你好"}}]}"#,
+        "\n\n",
+        "data: [DONE]\n\n",
+    );
+    let server = MockL3b::raw_sse_chunks([(body.as_bytes().to_vec(), Duration::ZERO)]);
+    let mut stream = client_for(&server)
+        .stream_turn(test_request(), CancellationToken::new())
+        .await
+        .expect("创建模型 SSE stream");
+    assert_eq!(next_thought(&mut stream).await, "先想一步");
+    assert_eq!(next_text(&mut stream).await, "你好");
+    assert_eq!(
+        stream.recv().await.expect("读取 DONE"),
+        Some(ModelDelta::Done)
+    );
+}
+
+#[tokio::test]
+async fn emits_thought_before_text_when_same_delta_carries_both() {
+    let body = concat!(
+        r#"data: {"choices":[{"delta":{"content":"答案","reasoning_content":"思考"}}]}"#,
+        "\n\n",
+        "data: [DONE]\n\n",
+    );
+    let server = MockL3b::raw_sse_chunks([(body.as_bytes().to_vec(), Duration::ZERO)]);
+    let mut stream = client_for(&server)
+        .stream_turn(test_request(), CancellationToken::new())
+        .await
+        .expect("创建模型 SSE stream");
+    assert_eq!(next_thought(&mut stream).await, "思考");
+    assert_eq!(next_text(&mut stream).await, "答案");
+    assert_eq!(
+        stream.recv().await.expect("读取 DONE"),
+        Some(ModelDelta::Done)
+    );
+}
+
+#[tokio::test]
+async fn ignores_trailing_usage_chunk_with_empty_choices() {
+    let body = concat!(
+        r#"data: {"choices":[{"index":0,"finish_reason":null,"delta":{"role":null,"content":"吗？😊","reasoning_content":null,"tool_calls":null}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[{"index":0,"finish_reason":"stop","delta":{"role":null,"content":null,"reasoning_content":null,"tool_calls":null}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[],"usage":{"prompt_tokens":291,"completion_tokens":32,"total_tokens":323,"prompt_tokens_details":{"cached_tokens":256},"completion_tokens_details":{"reasoning_tokens":0}}}"#,
+        "\n\n",
+        "data: [DONE]\n\n",
+    );
+    let server = MockL3b::raw_sse_chunks([(body.as_bytes().to_vec(), Duration::ZERO)]);
+    let mut stream = client_for(&server)
+        .stream_turn(test_request(), CancellationToken::new())
+        .await
+        .expect("创建模型 SSE stream");
+    assert_eq!(next_text(&mut stream).await, "吗？😊");
+    assert_eq!(
+        stream.recv().await.expect("读取 DONE"),
+        Some(ModelDelta::Done)
+    );
+}
+
+#[tokio::test]
+async fn ignores_unknown_delta_keys_and_streams_content() {
+    let body = concat!(
+        r#"data: {"choices":[{"delta":{"content":"ok","mystery":1,"annotations":[]}}]}"#,
+        "\n\n",
+        "data: [DONE]\n\n",
+    );
+    let server = MockL3b::raw_sse_chunks([(body.as_bytes().to_vec(), Duration::ZERO)]);
+    let mut stream = client_for(&server)
+        .stream_turn(test_request(), CancellationToken::new())
+        .await
+        .expect("创建模型 SSE stream");
+    assert_eq!(next_text(&mut stream).await, "ok");
+    assert_eq!(
+        stream.recv().await.expect("读取 DONE"),
+        Some(ModelDelta::Done)
+    );
+}
+
+#[tokio::test]
+async fn accepts_reasoning_alias_and_refusal_text() {
+    let body = concat!(
+        r#"data: {"choices":[{"delta":{"reasoning":"想一下"}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[{"delta":{"refusal":"不能回答"}}]}"#,
+        "\n\n",
+        "data: [DONE]\n\n",
+    );
+    let server = MockL3b::raw_sse_chunks([(body.as_bytes().to_vec(), Duration::ZERO)]);
+    let mut stream = client_for(&server)
+        .stream_turn(test_request(), CancellationToken::new())
+        .await
+        .expect("创建模型 SSE stream");
+    assert_eq!(next_thought(&mut stream).await, "想一下");
+    assert_eq!(next_text(&mut stream).await, "不能回答");
+    assert_eq!(
+        stream.recv().await.expect("读取 DONE"),
+        Some(ModelDelta::Done)
+    );
+}
+
+#[tokio::test]
 async fn ignores_empty_sse_frames_and_non_data_lines() {
     let body = concat!(
         "event: ignored\n\n",
@@ -316,6 +437,25 @@ async fn accepts_tool_calls_finish_reason_but_waits_for_done() {
     assert!(
         started.elapsed() >= Duration::from_millis(40),
         "finish_reason 不能代替 [DONE]"
+    );
+}
+
+#[tokio::test]
+async fn accepts_length_finish_reason_but_waits_for_done() {
+    let server = MockL3b::raw_sse_chunks([
+        (
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n".to_vec(),
+            Duration::ZERO,
+        ),
+        (b"data: [DONE]\n\n".to_vec(), Duration::from_millis(80)),
+    ]);
+    let mut stream = client_for(&server)
+        .stream_turn(test_request(), CancellationToken::new())
+        .await
+        .expect("创建模型 SSE stream");
+    assert_eq!(
+        stream.recv().await.expect("读取 [DONE]"),
+        Some(ModelDelta::Done)
     );
 }
 
@@ -454,7 +594,7 @@ async fn rejects_conflicting_tool_call_fragments() {
 }
 
 #[tokio::test]
-async fn rejects_non_function_tool_call_type() {
+async fn ignores_non_function_tool_call_type() {
     let body = concat!(
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"custom\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}\n\n",
         "data: [DONE]\n\n",
@@ -463,11 +603,43 @@ async fn rejects_non_function_tool_call_type() {
     let mut stream = client_for(&server)
         .stream_turn(test_request(), CancellationToken::new())
         .await
-        .expect("HTTP 200 应先返回 stream");
-    assert!(matches!(
-        stream.recv().await,
-        Err(ModelError::InvalidResponse)
-    ));
+        .expect("创建模型 SSE stream");
+    assert_eq!(
+        stream.recv().await.expect("读取 DONE"),
+        Some(ModelDelta::Done)
+    );
+}
+
+#[tokio::test]
+async fn ignores_extra_tool_call_keys_and_aggregates_function() {
+    let body = concat!(
+        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","extra":true,"function":{"name":"lookup","arguments":"{}","description":"x"}}]}}]}"#,
+        "\n\n",
+        "data: [DONE]\n\n",
+    );
+    let server = MockL3b::raw_sse_chunks([(body.as_bytes().to_vec(), Duration::ZERO)]);
+    let mut stream = client_for(&server)
+        .stream_turn(test_request(), CancellationToken::new())
+        .await
+        .expect("创建模型 SSE stream");
+    match stream
+        .recv()
+        .await
+        .expect("读取工具调用")
+        .expect("应有工具调用")
+    {
+        ModelDelta::ToolCall(call) => {
+            assert_eq!(call.index, 0);
+            assert_eq!(call.id.as_deref(), Some("call-1"));
+            assert_eq!(call.name.as_deref(), Some("lookup"));
+            assert_eq!(call.arguments, "{}");
+        }
+        other => panic!("预期工具调用，实际为 {other:?}"),
+    }
+    assert_eq!(
+        stream.recv().await.expect("读取 DONE"),
+        Some(ModelDelta::Done)
+    );
 }
 
 #[tokio::test]

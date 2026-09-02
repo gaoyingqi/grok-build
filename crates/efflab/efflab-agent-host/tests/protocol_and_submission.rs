@@ -89,6 +89,27 @@ fn kit_command_serde_is_adjacent_cmd_snake_case() {
     assert!(value.get("Send").is_none());
 }
 
+/// delete_session 必须使用内标 cmd，并保留 scope/session 标识。
+#[test]
+fn kit_command_delete_session_uses_adjacent_cmd() {
+    let cmd = KitCommand::DeleteSession {
+        scope_id: "scope".to_string(),
+        session_id: "session".to_string(),
+    };
+    let value = serde_json::to_value(&cmd).expect("DeleteSession 必须可序列化");
+    assert_eq!(value["cmd"], "delete_session");
+    assert_eq!(value["scope_id"], "scope");
+    assert_eq!(value["session_id"], "session");
+    let decoded = KitCommand::from_json_value(value).expect("DeleteSession 必须可解码");
+    assert_eq!(
+        decoded,
+        KitCommand::DeleteSession {
+            scope_id: "scope".to_string(),
+            session_id: "session".to_string(),
+        }
+    );
+}
+
 /// Capability reply 必须保持协议规定的扁平字段形状，而非嵌套 `capability` 对象。
 #[test]
 fn kit_reply_capability_is_flattened_under_kind() {

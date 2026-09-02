@@ -550,6 +550,13 @@ impl SessionRepository {
         run_blocking(move || repository.append_sync(&session_id, &records)).await
     }
 
+    /// 删除 v1 或可列出的 legacy session 目录；未知 id 返回 NotFound。
+    pub async fn delete(&self, session_id: &str) -> Result<(), SessionError> {
+        let repository = self.clone();
+        let session_id = session_id.to_owned();
+        run_blocking(move || repository.delete_sync(&session_id)).await
+    }
+
     /// 生成不含路径和秘密的 session id，并在冲突时重试有限次数。
     fn create_generated_sync(&self) -> Result<Session, SessionError> {
         let _guard = self.lock()?;
@@ -766,6 +773,35 @@ impl SessionRepository {
             legacy_corrupt_total: manifest.legacy_corrupt_total,
             partial_tail: manifest.partial_tail,
         })
+    }
+
+    /// 删除已校验 id 的 v1 目录，或对应的可列出 legacy 目录。
+    fn delete_sync(&self, session_id: &str) -> Result<(), SessionError> {
+        let _guard = self.lock()?;
+        ensure_storage_platform()?;
+        validate_home_path(&self.home)?;
+        validate_session_id(session_id)?;
+        if self.v1_session_exists(session_id)? {
+            let directory = self.session_dir(session_id);
+            fs::remove_dir_all(&directory).map_err(|_| {
+                tracing::debug!(event = "session_delete_failed", "删除 v1 session 目录失败");
+                SessionError::Io
+            })?;
+            tracing::debug!(event = "session_deleted", "v1 session 已删除");
+            return Ok(());
+        }
+        if let Some(candidate) = self.find_legacy_candidate(session_id)? {
+            fs::remove_dir_all(&candidate.path).map_err(|_| {
+                tracing::debug!(
+                    event = "legacy_session_delete_failed",
+                    "删除 legacy session 目录失败"
+                );
+                SessionError::Io
+            })?;
+            tracing::debug!(event = "legacy_session_deleted", "legacy session 已删除");
+            return Ok(());
+        }
+        Err(SessionError::NotFound)
     }
 
     /// 校验旧 journal 后合并新记录，再执行同目录原子替换。
@@ -3063,7 +3099,10 @@ impl<'de> Deserialize<'de> for SessionRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_JSON_DEPTH, SessionRecord, validate_json_depth, validate_session_id};
+    use super::{
+        MAX_JSON_DEPTH, SessionError, SessionRecord, SessionRepository, validate_json_depth,
+        validate_session_id,
+    };
 
     #[test]
     fn session_id_contract_is_ascii_bounded() {
@@ -3083,5 +3122,29 @@ mod tests {
         let record = SessionRecord::user(4, "prompt", "text");
         assert_eq!(record.prompt_id(), Some("prompt"));
         assert_eq!(record.sequence(), 4);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_removes_created_v1_session() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().expect("创建 session 存储临时目录");
+        let home = temporary.path().join("home");
+        fs::create_dir(&home).expect("创建 repository home");
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).expect("设置 home 权限");
+        let repository = SessionRepository::new(&home);
+        let session = repository.create().await.expect("创建 v1 session");
+        repository
+            .delete(&session.id)
+            .await
+            .expect("删除刚创建的 session");
+        let listed = repository.list().await.expect("列出剩余 session");
+        assert!(listed.iter().all(|item| item.id != session.id));
+        assert!(matches!(
+            repository.delete(&session.id).await,
+            Err(SessionError::NotFound)
+        ));
     }
 }

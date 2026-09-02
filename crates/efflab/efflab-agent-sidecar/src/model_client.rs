@@ -1,8 +1,9 @@
 //! Host L3b Chat Completions 的最小 HTTP client。
 //!
-//! 本模块只连接受控 loopback URL，不读取 ACP `_meta.modelId`，也不把 binding、请求正文或
-//! 响应正文写入日志。`turn_loop` 负责调用本 client；每次请求关闭自动重试，取消信号会
-//! 中止请求头和 SSE 等待，工具参数只在受限内存 transcript 中使用，不进入 journal 或日志。
+//! 本模块只连接受控 loopback URL，不读取 ACP `_meta.modelId`。binding / Authorization
+//! 不得写入日志、session 或 transcript。DEBUG 级别可以输出截断后的请求/响应/SSE 预览，
+//! 便于排查合同失败；生产 ACP 错误码仍保持稳定分类。`turn_loop` 负责调用本 client；
+//! 每次请求关闭自动重试，取消信号会中止请求头和 SSE 等待。
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -33,6 +34,78 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
 const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+/// DEBUG 日志正文预览上限，避免把整段 SSE/请求打进 sidecar.log。
+pub(crate) const DEBUG_PREVIEW_BYTES: usize = 4096;
+
+/// 按 UTF-8 字节边界截断，供 debug 日志输出内容预览。
+pub(crate) fn truncate_for_debug(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…<truncated,total_bytes={}>", &text[..end], text.len())
+}
+
+/// 记录合同失败原因与内容预览，再返回稳定的 InvalidResponse。
+/// 调用方不得传入 binding / Authorization。
+fn model_contract_error(reason: &'static str, detail: &str) -> ModelError {
+    tracing::debug!(
+        event = "l3b_contract_error",
+        reason,
+        detail_bytes = detail.len(),
+        detail = %truncate_for_debug(detail, DEBUG_PREVIEW_BYTES),
+        "L3b 合同校验失败"
+    );
+    ModelError::InvalidResponse
+}
+
+/// 读取响应头里的 Content-Type，缺失时返回空串。
+fn content_type_of(response: &reqwest::Response) -> String {
+    response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// 有界读取响应正文供 debug 预览；失败时返回已读到的内容。
+async fn read_body_preview(mut response: reqwest::Response, max_bytes: usize) -> String {
+    let mut collected = Vec::new();
+    let mut truncated = false;
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if !chunk.is_empty() => {
+                if collected.len() >= max_bytes {
+                    truncated = true;
+                    break;
+                }
+                let remaining = max_bytes - collected.len();
+                if chunk.len() > remaining {
+                    collected.extend_from_slice(&chunk[..remaining]);
+                    truncated = true;
+                    break;
+                }
+                collected.extend_from_slice(&chunk);
+            }
+            Ok(Some(_)) => continue,
+            _ => break,
+        }
+    }
+    let preview = String::from_utf8_lossy(&collected);
+    if truncated {
+        format!(
+            "{}…<truncated,read_bytes={}>",
+            truncate_for_debug(preview.as_ref(), max_bytes),
+            collected.len()
+        )
+    } else {
+        preview.into_owned()
+    }
+}
 
 /// 一个可被取消的 turn 信号；取消操作幂等且不会携带任何凭据。
 #[derive(Clone, Debug, Default)]
@@ -115,10 +188,10 @@ impl ModelTurnRequest {
         self
     }
 
-    /// 组装闭集根键的请求正文，并在序列化前校验消息 role。
+    /// 组装出站 Chat Completions 最小根键；入站解析不使用字段白名单。
     fn to_body(&self, model_id: &str) -> Result<Vec<u8>, ModelError> {
         if self.messages.is_empty() {
-            return Err(ModelError::InvalidResponse);
+            return Err(model_contract_error("empty_messages", ""));
         }
         for message in &self.messages {
             validate_message(message)?;
@@ -138,7 +211,8 @@ impl ModelTurnRequest {
             }
         }
 
-        serde_json::to_vec(&Value::Object(object)).map_err(|_| ModelError::InvalidResponse)
+        serde_json::to_vec(&Value::Object(object))
+            .map_err(|error| model_contract_error("serialize_request", &error.to_string()))
     }
 }
 
@@ -167,6 +241,8 @@ impl fmt::Debug for ModelTurnRequest {
 pub enum ModelDelta {
     /// 文本增量。
     Text(String),
+    /// OpenAI 兼容推理字段 `reasoning_content` 的增量；只展示，不进入模型续写。
+    Thought(String),
     /// 在 `[DONE]` 前按 index 聚合完成的工具调用。
     ToolCall(ModelToolCall),
     /// 上游正常结束。
@@ -191,6 +267,10 @@ impl fmt::Debug for ModelDelta {
         match self {
             Self::Text(text) => formatter
                 .debug_struct("ModelDelta::Text")
+                .field("length", &text.len())
+                .finish(),
+            Self::Thought(text) => formatter
+                .debug_struct("ModelDelta::Thought")
                 .field("length", &text.len())
                 .finish(),
             Self::ToolCall(call) => formatter
@@ -321,9 +401,24 @@ impl HttpModelClient {
 
         // binding 只在请求构造点借用；不写入 client 日志、session 或 transcript。
         let authorization = self.authorization_header()?;
-        let client = self.client.as_ref().ok_or(ModelError::Http { status: 0 })?;
-        let endpoint = self.endpoint.as_ref().ok_or(ModelError::InvalidResponse)?;
-        tracing::debug!("发送 L3b Chat Completions 请求");
+        let client = self.client.as_ref().ok_or_else(|| {
+            tracing::debug!(event = "l3b_http_client_missing", "L3b HTTP client 未构造");
+            ModelError::Http { status: 0 }
+        })?;
+        let endpoint = self
+            .endpoint
+            .as_ref()
+            .ok_or_else(|| model_contract_error("missing_endpoint", ""))?;
+        tracing::debug!(
+            event = "l3b_request_sent",
+            model_id = %self.model_id,
+            endpoint = %endpoint,
+            body_bytes = body.len(),
+            message_count = request.messages.len(),
+            tool_count = request.tools.as_ref().map(Vec::len).unwrap_or(0),
+            body = %truncate_for_debug(&String::from_utf8_lossy(&body), DEBUG_PREVIEW_BYTES),
+            "发送 L3b Chat Completions 请求"
+        );
         let send_future = client
             .post(endpoint.clone())
             .header(AUTHORIZATION, authorization)
@@ -342,30 +437,58 @@ impl HttpModelClient {
         let response = match response_result {
             Ok(response) => response,
             Err(_) if cancellation.is_cancelled() => return Err(ModelError::Cancelled),
-            Err(_) => return Err(ModelError::Http { status: 0 }),
+            Err(error) => {
+                tracing::debug!(
+                    event = "l3b_http_transport_failed",
+                    error = %error,
+                    "L3b HTTP 传输失败"
+                );
+                return Err(ModelError::Http { status: 0 });
+            }
         };
 
         let status = response.status().as_u16();
-        tracing::debug!(status, "收到 L3b Chat Completions 响应");
+        let content_type = content_type_of(&response);
+        tracing::debug!(
+            event = "l3b_response_headers",
+            status,
+            content_type = %content_type,
+            content_length = ?response.content_length(),
+            "收到 L3b Chat Completions 响应"
+        );
         if cancellation.is_cancelled() {
             drop(response);
             return Err(ModelError::Cancelled);
         }
         if !response.status().is_success() {
-            drop(response);
+            let preview = read_body_preview(response, DEBUG_PREVIEW_BYTES).await;
+            tracing::debug!(
+                event = "l3b_http_error_body",
+                status,
+                content_type = %content_type,
+                body = %preview,
+                "L3b HTTP 错误响应正文"
+            );
             return Err(ModelError::Http { status });
         }
         if response
             .content_length()
             .is_some_and(|length| length > MAX_SSE_RESPONSE_BYTES as u64)
         {
-            tracing::debug!("拒绝已知长度超出上限的 L3b 模型响应");
+            tracing::debug!(
+                event = "l3b_response_too_large",
+                content_length = ?response.content_length(),
+                "拒绝已知长度超出上限的 L3b 模型响应"
+            );
             drop(response);
             return Err(ModelError::ResponseTooLarge);
         }
         if !is_event_stream(response.headers()) {
-            drop(response);
-            return Err(ModelError::InvalidResponse);
+            let preview = read_body_preview(response, DEBUG_PREVIEW_BYTES).await;
+            return Err(model_contract_error(
+                "not_event_stream",
+                &format!("content_type={content_type}; body={preview}"),
+            ));
         }
 
         Ok(ModelStream::new(response, cancellation))
@@ -374,16 +497,16 @@ impl HttpModelClient {
     /// 在请求构造点读取生产 binding 并转换为 Authorization header。
     fn authorization_header(&self) -> Result<HeaderValue, ModelError> {
         let binding = match &self.binding {
-            BindingSource::Environment(name) => {
-                std::env::var(name).map_err(|_| ModelError::InvalidResponse)?
-            }
+            BindingSource::Environment(name) => std::env::var(name)
+                .map_err(|_| model_contract_error("missing_binding_env", name))?,
             BindingSource::Fixed(value) => value.clone(),
         };
         if binding.is_empty() {
-            return Err(ModelError::InvalidResponse);
+            return Err(model_contract_error("empty_binding", ""));
         }
         let value = format!("Bearer {binding}");
-        let mut header = HeaderValue::from_str(&value).map_err(|_| ModelError::InvalidResponse)?;
+        let mut header = HeaderValue::from_str(&value)
+            .map_err(|_| model_contract_error("invalid_binding_header", ""))?;
         header.set_sensitive(true);
         Ok(header)
     }
@@ -408,22 +531,50 @@ impl HttpModelClient {
 
 /// 将 v1 base URL 变成固定 `/v1/chat/completions` endpoint。
 fn endpoint_for_model(model: &LoopbackModelSpec) -> Result<reqwest::Url, ModelError> {
-    if model.backend != MODEL_BACKEND
-        || model.token_env != MODEL_TOKEN_ENV
-        || model.model_id.is_empty()
-        || !model
-            .model_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
-        || model.model_id.chars().count() > 128
-        || !is_literal_loopback_http_url(&model.base_url)
+    if model.backend != MODEL_BACKEND {
+        return Err(model_contract_error("invalid_backend", &model.backend));
+    }
+    if model.token_env != MODEL_TOKEN_ENV {
+        return Err(model_contract_error("invalid_token_env", &model.token_env));
+    }
+    if model.model_id.is_empty() {
+        return Err(model_contract_error("empty_model_id", ""));
+    }
+    if !model
+        .model_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
     {
-        return Err(ModelError::InvalidResponse);
+        return Err(model_contract_error(
+            "invalid_model_id_charset",
+            &model.model_id,
+        ));
+    }
+    if model.model_id.chars().count() > 128 {
+        return Err(model_contract_error(
+            "model_id_too_long",
+            &format!("len={}", model.model_id.chars().count()),
+        ));
+    }
+    if !is_literal_loopback_http_url(&model.base_url) {
+        return Err(model_contract_error(
+            "base_url_not_loopback",
+            &model.base_url,
+        ));
     }
 
-    let mut base = reqwest::Url::parse(&model.base_url).map_err(|_| ModelError::InvalidResponse)?;
+    let mut base = reqwest::Url::parse(&model.base_url)
+        .map_err(|error| model_contract_error("base_url_parse", &error.to_string()))?;
     if base.path() != MODEL_BASE_PATH || base.query().is_some() || base.fragment().is_some() {
-        return Err(ModelError::InvalidResponse);
+        return Err(model_contract_error(
+            "invalid_base_path",
+            &format!(
+                "path={}; query={:?}; fragment={:?}",
+                base.path(),
+                base.query(),
+                base.fragment()
+            ),
+        ));
     }
     base.set_path(MODEL_ENDPOINT_PATH);
     Ok(base)
@@ -448,7 +599,14 @@ fn build_http_client() -> Result<reqwest::Client, ModelError> {
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(TOTAL_TIMEOUT)
         .build()
-        .map_err(|_| ModelError::Http { status: 0 })
+        .map_err(|error| {
+            tracing::debug!(
+                event = "l3b_http_client_build_failed",
+                error = %error,
+                "构造 L3b HTTP client 失败"
+            );
+            ModelError::Http { status: 0 }
+        })
 }
 
 #[cfg(test)]
@@ -469,6 +627,18 @@ mod tests {
             .expect("测试 binding 应构造 Authorization");
         assert!(header.is_sensitive());
     }
+
+    #[test]
+    fn truncate_for_debug_keeps_short_text() {
+        assert_eq!(truncate_for_debug("hello", 16), "hello");
+    }
+
+    #[test]
+    fn truncate_for_debug_cuts_on_char_boundary() {
+        let preview = truncate_for_debug("你好世界", 4);
+        assert!(preview.contains("truncated,total_bytes=12"), "{preview}");
+        assert!(preview.starts_with("你"), "{preview}");
+    }
 }
 
 /// 只接受 event-stream media type，允许标准参数但拒绝其他媒体类型。
@@ -482,17 +652,32 @@ fn is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
 
 /// 校验请求消息的 role，避免把任意 ACP 结构直接转发给上游。
 fn validate_message(message: &Value) -> Result<(), ModelError> {
-    let object = message.as_object().ok_or(ModelError::InvalidResponse)?;
+    let object = message
+        .as_object()
+        .ok_or_else(|| model_contract_error("message_not_object", &message.to_string()))?;
     let role = object
         .get("role")
         .and_then(Value::as_str)
-        .ok_or(ModelError::InvalidResponse)?;
+        .ok_or_else(|| model_contract_error("message_missing_role", &message.to_string()))?;
     if matches!(role, "system" | "user" | "assistant" | "tool") {
         Ok(())
     } else {
-        Err(ModelError::InvalidResponse)
+        Err(model_contract_error(
+            "invalid_message_role",
+            &format!("role={role}; message={message}"),
+        ))
     }
 }
+
+/// SSE `choices[].delta` 中 sidecar 会消费的语义字段；其它键忽略。
+const CONSUMED_DELTA_KEYS: &[&str] = &[
+    "role",
+    "content",
+    "tool_calls",
+    "reasoning_content",
+    "reasoning",
+    "refusal",
+];
 
 /// 一个 cancel-safe、单向消费的 SSE response stream。
 pub struct ModelStream {
@@ -596,6 +781,20 @@ impl ModelStream {
                 Err(error) => return self.fail(error),
             };
             let Some(chunk) = chunk else {
+                tracing::debug!(
+                    event = "l3b_sse_eof_without_done",
+                    done_seen = self.done_seen,
+                    response_bytes = self.response_bytes,
+                    line_buffer = %truncate_for_debug(
+                        &String::from_utf8_lossy(&self.line_buffer),
+                        DEBUG_PREVIEW_BYTES
+                    ),
+                    frame_data = %truncate_for_debug(
+                        &String::from_utf8_lossy(&self.frame_data),
+                        DEBUG_PREVIEW_BYTES
+                    ),
+                    "L3b SSE 在 [DONE] 前结束"
+                );
                 return self.fail(ModelError::Http { status: 0 });
             };
             self.first_chunk_seen = true;
@@ -629,11 +828,29 @@ impl ModelStream {
 
         tokio::select! {
             biased;
-            result = &mut chunk_future => result
-                .map(|chunk| chunk.map(|bytes| bytes.to_vec()))
-                .map_err(|_| ModelError::Http { status: 0 }),
+            result = &mut chunk_future => match result {
+                Ok(chunk) => Ok(chunk.map(|bytes| bytes.to_vec())),
+                Err(error) => {
+                    tracing::debug!(
+                        event = "l3b_sse_chunk_failed",
+                        error = %error,
+                        first_chunk_seen = self.first_chunk_seen,
+                        response_bytes = self.response_bytes,
+                        "L3b SSE chunk 读取失败"
+                    );
+                    Err(ModelError::Http { status: 0 })
+                }
+            },
             _ = cancel.cancelled() => Err(ModelError::Cancelled),
-            _ = &mut timer => Err(ModelError::Http { status: 0 }),
+            _ = &mut timer => {
+                tracing::debug!(
+                    event = "l3b_sse_timeout",
+                    first_chunk_seen = self.first_chunk_seen,
+                    response_bytes = self.response_bytes,
+                    "L3b SSE 读取超时"
+                );
+                Err(ModelError::Http { status: 0 })
+            }
         }
     }
 
@@ -693,10 +910,25 @@ impl ModelStream {
             return Ok(());
         }
 
-        let data = String::from_utf8(data).map_err(|_| ModelError::InvalidResponse)?;
+        let data = match String::from_utf8(data) {
+            Ok(data) => data,
+            Err(error) => {
+                return Err(model_contract_error(
+                    "sse_frame_not_utf8",
+                    &String::from_utf8_lossy(error.as_bytes()),
+                ));
+            }
+        };
+        tracing::debug!(
+            event = "l3b_sse_frame",
+            frame_bytes = data.len(),
+            done = data == "[DONE]",
+            frame = %truncate_for_debug(&data, DEBUG_PREVIEW_BYTES),
+            "收到 L3b SSE frame"
+        );
         if data == "[DONE]" {
             if self.done_seen {
-                return Err(ModelError::InvalidResponse);
+                return Err(model_contract_error("duplicate_done", &data));
             }
             let tool_calls = std::mem::take(&mut self.tool_calls);
             // [DONE] 前必须已经得到完整身份，避免把不确定调用交给执行层。
@@ -704,7 +936,10 @@ impl ModelStream {
                 !call.id.as_deref().is_some_and(|id| !id.is_empty())
                     || !call.name.as_deref().is_some_and(|name| !name.is_empty())
             }) {
-                return Err(ModelError::InvalidResponse);
+                return Err(model_contract_error(
+                    "incomplete_tool_call_at_done",
+                    &format!("{tool_calls:?}"),
+                ));
             }
             self.done_seen = true;
             for (index, call) in tool_calls {
@@ -719,71 +954,115 @@ impl ModelStream {
             return Ok(());
         }
         if self.done_seen {
-            return Err(ModelError::InvalidResponse);
+            return Err(model_contract_error("data_after_done", &data));
         }
         self.parse_delta(&data)
     }
 
-    /// 将一个 Chat Completions JSON frame 转换为文本或聚合工具调用。
+    /// 将一个 Chat Completions JSON frame 转换为文本、推理或聚合工具调用。
+    /// 入站按 OpenAI 兼容协议解析：消费已知语义字段，扩展键忽略，不因白名单中断 stream。
     fn parse_delta(&mut self, data: &str) -> Result<(), ModelError> {
-        let payload =
-            serde_json::from_str::<Value>(data).map_err(|_| ModelError::InvalidResponse)?;
-        let choices = payload
-            .get("choices")
-            .and_then(Value::as_array)
-            .ok_or(ModelError::InvalidResponse)?;
+        let payload = serde_json::from_str::<Value>(data).map_err(|error| {
+            model_contract_error("sse_json_parse", &format!("error={error}; frame={data}"))
+        })?;
+        let choices = match payload.get("choices") {
+            None | Some(Value::Null) => {
+                tracing::debug!(
+                    event = "l3b_usage_or_empty_choices",
+                    has_usage = payload.get("usage").is_some(),
+                    "忽略无 choices 的 Chat Completions chunk"
+                );
+                return Ok(());
+            }
+            Some(Value::Array(choices)) => choices,
+            Some(other) => {
+                return Err(model_contract_error(
+                    "choices_not_array",
+                    &format!("choices={other}; frame={data}"),
+                ));
+            }
+        };
         if choices.is_empty() {
-            return Err(ModelError::InvalidResponse);
+            // OpenAI stream_options.include_usage：[DONE] 前会有空 choices + usage 尾帧。
+            tracing::debug!(
+                event = "l3b_usage_or_empty_choices",
+                has_usage = payload.get("usage").is_some(),
+                "忽略空 choices 的 Chat Completions 尾帧"
+            );
+            return Ok(());
         }
 
         for choice in choices {
-            let choice = choice.as_object().ok_or(ModelError::InvalidResponse)?;
-            let terminal_finish_reason = match choice.get("finish_reason") {
-                None | Some(Value::Null) => false,
-                Some(Value::String(reason)) if matches!(reason.as_str(), "stop" | "tool_calls") => {
-                    true
+            let choice = choice
+                .as_object()
+                .ok_or_else(|| model_contract_error("choice_not_object", data))?;
+            let terminal_finish_reason =
+                finish_reason_is_terminal(choice.get("finish_reason"), data)?;
+            let delta = match choice.get("delta") {
+                None | Some(Value::Null) if terminal_finish_reason => continue,
+                Some(Value::Object(delta)) => delta,
+                other => {
+                    return Err(model_contract_error(
+                        "missing_delta",
+                        &format!("delta={other:?}; frame={data}"),
+                    ));
                 }
-                Some(_) => return Err(ModelError::InvalidResponse),
             };
-            let delta = choice
-                .get("delta")
-                .and_then(Value::as_object)
-                .ok_or(ModelError::InvalidResponse)?;
-            let mut recognized = false;
-            for key in delta.keys() {
-                if !matches!(key.as_str(), "role" | "content" | "tool_calls") {
-                    return Err(ModelError::InvalidResponse);
-                }
+            let ignored_keys: Vec<&str> = delta
+                .keys()
+                .map(String::as_str)
+                .filter(|key| !CONSUMED_DELTA_KEYS.contains(key))
+                .collect();
+            if !ignored_keys.is_empty() {
+                tracing::debug!(
+                    event = "l3b_delta_ignored_keys",
+                    keys = ?ignored_keys,
+                    "忽略 Chat Completions 扩展 delta 键"
+                );
             }
 
-            if let Some(role) = delta.get("role") {
-                if role.as_str().is_none() {
-                    return Err(ModelError::InvalidResponse);
-                }
-                recognized = true;
+            if let Some(role) = delta.get("role")
+                && !role.is_null()
+                && role.as_str().is_none()
+            {
+                return Err(model_contract_error(
+                    "invalid_delta_role",
+                    &format!("role={role}; frame={data}"),
+                ));
             }
-            if let Some(content) = delta.get("content") {
-                match content {
-                    Value::Null => {}
-                    Value::String(text) => {
-                        if !text.is_empty() {
-                            self.queued.push_back(ModelDelta::Text(text.clone()));
-                        }
-                    }
-                    _ => return Err(ModelError::InvalidResponse),
-                }
-                recognized = true;
+            // 先排队推理，再排队正文，UI 先展示 thinking。
+            if let Some(thought) = first_delta_text(
+                delta
+                    .get("reasoning_content")
+                    .or_else(|| delta.get("reasoning")),
+                "reasoning_content",
+                data,
+            )? {
+                self.queued.push_back(ModelDelta::Thought(thought));
+            }
+            if let Some(text) = first_delta_text(delta.get("content"), "content", data)? {
+                self.queued.push_back(ModelDelta::Text(text));
+            }
+            if let Some(text) = first_delta_text(delta.get("refusal"), "refusal", data)? {
+                self.queued.push_back(ModelDelta::Text(text));
             }
             if let Some(tool_calls) = delta.get("tool_calls") {
-                let tool_calls = tool_calls.as_array().ok_or(ModelError::InvalidResponse)?;
-                for tool_call in tool_calls {
-                    self.merge_tool_call(parse_tool_call(tool_call)?)?;
+                match tool_calls {
+                    Value::Null => {}
+                    Value::Array(tool_calls) => {
+                        for tool_call in tool_calls {
+                            if let Some(part) = parse_tool_call(tool_call)? {
+                                self.merge_tool_call(part)?;
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(model_contract_error(
+                            "tool_calls_not_array",
+                            &format!("tool_calls={other}; frame={data}"),
+                        ));
+                    }
                 }
-                recognized = true;
-            }
-            // 标准终止 chunk 只提示 finish_reason；真正完成仍由 [DONE] 产生。
-            if !recognized && !terminal_finish_reason {
-                return Err(ModelError::InvalidResponse);
             }
         }
         Ok(())
@@ -794,13 +1073,19 @@ impl ModelStream {
         let call = self.tool_calls.entry(part.index).or_default();
         if let Some(id) = part.id {
             if call.id.as_ref().is_some_and(|old| old != &id) {
-                return Err(ModelError::InvalidResponse);
+                return Err(model_contract_error(
+                    "conflicting_tool_call_id",
+                    &format!("index={}; old={:?}; new={id}", part.index, call.id),
+                ));
             }
             call.id = Some(id);
         }
         if let Some(name) = part.name {
             if call.name.as_ref().is_some_and(|old| old != &name) {
-                return Err(ModelError::InvalidResponse);
+                return Err(model_contract_error(
+                    "conflicting_tool_call_name",
+                    &format!("index={}; old={:?}; new={name}", part.index, call.name),
+                ));
             }
             call.name = Some(name);
         }
@@ -832,54 +1117,137 @@ impl ModelStream {
     }
 }
 
-/// 解析一个工具调用片段的闭集字段。
-fn parse_tool_call(value: &Value) -> Result<ParsedToolCall, ModelError> {
-    let object = value.as_object().ok_or(ModelError::InvalidResponse)?;
-    for key in object.keys() {
-        if !matches!(key.as_str(), "index" | "id" | "type" | "function") {
-            return Err(ModelError::InvalidResponse);
+/// 任意字符串 finish_reason 都只是终止提示；真正完成仍由 [DONE] 产生。
+fn finish_reason_is_terminal(value: Option<&Value>, data: &str) -> Result<bool, ModelError> {
+    match value {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::String(_)) => Ok(true),
+        Some(reason) => Err(model_contract_error(
+            "invalid_finish_reason",
+            &format!("finish_reason={reason}; frame={data}"),
+        )),
+    }
+}
+
+/// 解析可选文本增量：null/空串忽略；字符串或文本数组取出非空正文。
+fn first_delta_text(
+    value: Option<&Value>,
+    field: &'static str,
+    data: &str,
+) -> Result<Option<String>, ModelError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value {
+        Value::Null => Ok(None),
+        Value::String(text) if text.is_empty() => Ok(None),
+        Value::String(text) => Ok(Some(text.clone())),
+        Value::Array(parts) => {
+            let mut text = String::new();
+            for part in parts {
+                match part {
+                    Value::String(piece) => text.push_str(piece),
+                    Value::Object(object) => {
+                        if let Some(Value::String(piece)) = object.get("text") {
+                            text.push_str(piece);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if text.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(text))
+            }
         }
+        other => Err(model_contract_error(
+            "invalid_delta_text",
+            &format!("{field}={other}; frame={data}"),
+        )),
+    }
+}
+
+/// 解析一个工具调用片段；非 function 类型忽略，扩展键忽略。
+fn parse_tool_call(value: &Value) -> Result<Option<ParsedToolCall>, ModelError> {
+    let detail = value.to_string();
+    let object = value
+        .as_object()
+        .ok_or_else(|| model_contract_error("tool_call_not_object", &detail))?;
+    if let Some(kind) = object.get("type")
+        && !kind.is_null()
+        && kind.as_str() != Some("function")
+    {
+        tracing::debug!(
+            event = "l3b_tool_call_ignored",
+            tool_type = %kind,
+            "忽略非 function 的 Chat Completions tool_call；执行层只跑 App 审核工具"
+        );
+        return Ok(None);
     }
     let index = match object.get("index") {
         Some(Value::Number(number)) => number
             .as_u64()
             .and_then(|value| u32::try_from(value).ok())
-            .ok_or(ModelError::InvalidResponse)?,
-        None | Some(_) => return Err(ModelError::InvalidResponse),
-    };
-    if let Some(kind) = object.get("type")
-        && kind.as_str() != Some("function")
-    {
-        return Err(ModelError::InvalidResponse);
-    }
-    let function = object
-        .get("function")
-        .and_then(Value::as_object)
-        .ok_or(ModelError::InvalidResponse)?;
-    for key in function.keys() {
-        if !matches!(key.as_str(), "name" | "arguments") {
-            return Err(ModelError::InvalidResponse);
+            .ok_or_else(|| model_contract_error("invalid_tool_call_index", &detail))?,
+        None | Some(_) => {
+            return Err(model_contract_error("missing_tool_call_index", &detail));
         }
-    }
-    let id = match object.get("id") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(id)) => Some(id.clone()),
-        Some(_) => return Err(ModelError::InvalidResponse),
     };
+    let function = match object.get("function") {
+        None | Some(Value::Null) => {
+            return Ok(Some(ParsedToolCall {
+                index,
+                id: parse_optional_id(object.get("id"), &detail)?,
+                name: None,
+                arguments: String::new(),
+            }));
+        }
+        Some(Value::Object(function)) => function,
+        Some(other) => {
+            return Err(model_contract_error(
+                "missing_function",
+                &format!("function={other}; tool_call={detail}"),
+            ));
+        }
+    };
+    let id = parse_optional_id(object.get("id"), &detail)?;
     let name = match function.get("name") {
         None | Some(Value::Null) => None,
         Some(Value::String(name)) => Some(name.clone()),
-        Some(_) => return Err(ModelError::InvalidResponse),
+        Some(name) => {
+            return Err(model_contract_error(
+                "invalid_tool_call_name",
+                &format!("name={name}; tool_call={detail}"),
+            ));
+        }
     };
     let arguments = match function.get("arguments") {
         None | Some(Value::Null) => String::new(),
         Some(Value::String(arguments)) => arguments.clone(),
-        Some(_) => return Err(ModelError::InvalidResponse),
+        Some(arguments) => {
+            return Err(model_contract_error(
+                "invalid_tool_call_arguments",
+                &format!("arguments={arguments}; tool_call={detail}"),
+            ));
+        }
     };
-    Ok(ParsedToolCall {
+    Ok(Some(ParsedToolCall {
         index,
         id,
         name,
         arguments,
-    })
+    }))
+}
+
+/// 解析可选 tool call id。
+fn parse_optional_id(value: Option<&Value>, detail: &str) -> Result<Option<String>, ModelError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(id)) => Ok(Some(id.clone())),
+        Some(id) => Err(model_contract_error(
+            "invalid_tool_call_id",
+            &format!("id={id}; tool_call={detail}"),
+        )),
+    }
 }

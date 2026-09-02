@@ -7,13 +7,15 @@ use std::{
     cell::{Cell, RefCell},
     future::Future,
     io,
+    pin::Pin,
     rc::Rc,
+    task::{Context, Poll},
     time::Duration,
 };
 
 use agent_client_protocol as acp;
 use anyhow::Result;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use xai_acp_lib::{
@@ -179,6 +181,46 @@ fn transport_failure(kind: Option<AcpTransportErrorKind>) -> anyhow::Error {
     }
 }
 
+/// 包装 Tokio stdout，按 JSON-RPC 行把 sidecar→Host 消息记入 DEBUG。
+struct LoggingStdout {
+    inner: tokio::io::Stdout,
+    pending: Vec<u8>,
+}
+
+impl LoggingStdout {
+    fn new() -> Self {
+        Self {
+            inner: tokio::io::stdout(),
+            pending: Vec::new(),
+        }
+    }
+}
+
+impl AsyncWrite for LoggingStdout {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = result
+            && n > 0
+        {
+            self.pending.extend_from_slice(&buf[..n]);
+            observability::drain_acp_stdout_lines(&mut self.pending);
+        }
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// 在 current-thread `LocalSet` 中运行最小 ACP agent，直到 stdio EOF 或 I/O 失败。
 pub async fn run_acp(sidecar: SidecarConfig) -> Result<()> {
     observability::runtime_started();
@@ -216,6 +258,7 @@ pub async fn run_acp(sidecar: SidecarConfig) -> Result<()> {
         while let Some(event) = line_rx.recv().await {
             match event {
                 Ok(line) => {
+                    observability::log_acp_wire_bytes("host_to_sidecar", &line);
                     if bridge_writer.write_all(&line).await.is_err() {
                         let failure = StdinBridgeFailure::Write;
                         bridge_state.fail(bridge_failure_kind(failure));
@@ -246,7 +289,7 @@ pub async fn run_acp(sidecar: SidecarConfig) -> Result<()> {
     );
     // stdout 句柄只交给 ACP connection，且包装为单一可观测 writer。
     let outgoing =
-        AcpTransportWriter::new(tokio::io::stdout().compat_write(), transport_state.clone());
+        AcpTransportWriter::new(LoggingStdout::new().compat_write(), transport_state.clone());
 
     // ACP connection 负责标准请求分发；自定义 spawn wrapper 记录 dispatcher、queued 与 active handler。
     let tracker = HandlerTracker::new();

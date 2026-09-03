@@ -230,6 +230,7 @@ fn write_valid_runtime_config(path: &Path, session_cwd: &Path, mode: u32) {
         },
         approved_mcp: ApprovedMcpConfig::default(),
         expected_tools: BTreeSet::new(),
+        system_prompt: String::new(),
     };
     let rendered = render_runtime_config_v1(&config).expect("生成合法 runtime config");
     fs::write(path, rendered).expect("写入 runtime config");

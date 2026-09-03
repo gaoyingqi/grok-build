@@ -44,4 +44,6 @@ pub struct HostRuntimeConfig {
     pub idle_after: Duration,
     /// L3b 回环监听与用户上游连接配置。
     pub l3b: L3bRuntimeConfig,
+    /// 产品注入的系统提示词；空字符串表示 sidecar 使用内置最小提示词。
+    pub system_prompt: String,
 }

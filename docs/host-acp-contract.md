@@ -207,6 +207,7 @@ RuntimeConfigV1 字段为闭集（`deny_unknown_fields`）：
 | `model.token_env` | 固定 `EFFLAB_L3B_BIND` |
 | `approved_mcp.servers.*` | 只允许字面量 loopback HTTP `url`（显式非零端口 + 非空 path，无 `?` / `#`）；能够解析为 `McpServerSpec::Stdio` 的条目为 `stdio_mcp_unavailable`，malformed config 为 `runtime_config_invalid` |
 | `expected_tools` | 字典序 qualified 工具名集合；loader 与 `approved_mcp_revision` 复用同一 qualified-name 语法，空集合法；tool segment 的长名与 sidecar 记录上限分开处理 |
+| `system_prompt` | Host 注入的产品系统提示词；缺省或空字符串表示 sidecar 使用内置最小提示词；≤32768 字节、禁止 NUL；参与 `runtime_revision` 摘要。产品不得把密钥写入该字段 |
 
 `runtime_revision` 是防篡改摘要：字段顺序固定、不含自身字段、不包含任何秘密或 command/args；`load_runtime_config_v1_from_str` 在 schema / stdio / revision 全部通过后才返回配置。缺失、非法或 revision 不匹配的配置文件以启动拒绝失败（退出码 `2`），运行时错误退出码 `1`。
 

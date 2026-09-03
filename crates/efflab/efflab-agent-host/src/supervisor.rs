@@ -613,7 +613,13 @@ impl Supervisor {
         paths: ScopePaths,
     ) -> Result<SidecarProcessInfo, SupervisorError> {
         prepare_scope_directories(&paths)?;
-        let rendered = render_runtime_config(&paths, model_id, loopback, approved_mcp)?;
+        let rendered = render_runtime_config(
+            &paths,
+            model_id,
+            loopback,
+            approved_mcp,
+            &self.config.system_prompt,
+        )?;
         let runtime_config_path = paths.home.join(RUNTIME_CONFIG_FILENAME);
         write_authoritative_config(&runtime_config_path, rendered.as_bytes())?;
 
@@ -1141,6 +1147,7 @@ fn render_runtime_config(
     model_id: &str,
     loopback: &L3bLoopback,
     approved_mcp: &ApprovedMcpSpecV1,
+    system_prompt: &str,
 ) -> Result<String, SupervisorError> {
     let session_cwd = paths
         .workspace
@@ -1160,7 +1167,14 @@ fn render_runtime_config(
         },
         approved_mcp: approved_mcp.servers().clone(),
         expected_tools: approved_mcp.expected_tools().clone(),
+        system_prompt: system_prompt.to_owned(),
     };
+    tracing::debug!(
+        event = "runtime_config_system_prompt",
+        host_configured = !system_prompt.trim().is_empty(),
+        prompt_bytes = system_prompt.len(),
+        "Host 正在渲染 sidecar 系统提示词"
+    );
     render_runtime_config_v1(&config).map_err(|_| {
         tracing::error!("RuntimeConfigV1 渲染失败，拒绝启动 sidecar");
         SupervisorError::ConfigRenderFailed
@@ -2292,6 +2306,7 @@ mod config_write_tests {
             mcp_exec_root: temporary.path().join("mcp"),
             idle_after: Duration::from_secs(60),
             l3b: L3bRuntimeConfig::default(),
+            system_prompt: String::new(),
         };
         let error = Supervisor::new(runtime_config, "app")
             .err()
@@ -2328,6 +2343,7 @@ mod config_write_tests {
                 mcp_exec_root: temporary.path().join("mcp"),
                 idle_after: Duration::from_secs(60),
                 l3b: L3bRuntimeConfig::default(),
+                system_prompt: String::new(),
             },
             "app",
         )
@@ -2370,6 +2386,7 @@ mod config_write_tests {
                 mcp_exec_root: temporary.path().join("mcp"),
                 idle_after: Duration::from_secs(60),
                 l3b: L3bRuntimeConfig::default(),
+                system_prompt: String::new(),
             },
             "app",
         )
@@ -2408,6 +2425,7 @@ mod config_write_tests {
                 mcp_exec_root: temporary.path().join("mcp"),
                 idle_after: Duration::from_secs(60),
                 l3b: L3bRuntimeConfig::default(),
+                system_prompt: String::new(),
             },
             "app",
         )

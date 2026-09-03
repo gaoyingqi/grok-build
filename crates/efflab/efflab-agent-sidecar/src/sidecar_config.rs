@@ -331,6 +331,7 @@ mod tests {
             },
             approved_mcp: ApprovedMcpConfig::default(),
             expected_tools: BTreeSet::new(),
+            system_prompt: String::new(),
         };
         fs::write(
             &runtime_config_path,

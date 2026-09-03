@@ -201,6 +201,8 @@ pub struct TurnLoop {
     gateway: AcpGatewaySender<acp::AgentSide>,
     expected_tools: BTreeSet<String>,
     ready_tools: BTreeSet<String>,
+    /// 已解析的系统提示词，作为每轮模型请求的第一条 system 消息。
+    system_prompt: String,
     /// debug 构建中的测试执行 spy；release 构建不携带测试接缝。
     #[cfg(debug_assertions)]
     test_seam: Option<TestSeam>,
@@ -215,6 +217,7 @@ impl TurnLoop {
         gateway: AcpGatewaySender<acp::AgentSide>,
         expected_tools: BTreeSet<String>,
         ready_tools: BTreeSet<String>,
+        system_prompt: String,
     ) -> Self {
         Self {
             repository,
@@ -223,6 +226,7 @@ impl TurnLoop {
             gateway,
             expected_tools,
             ready_tools,
+            system_prompt,
             #[cfg(debug_assertions)]
             test_seam: None,
         }
@@ -291,7 +295,7 @@ impl TurnLoop {
 
         let mut records = session.records;
         records.push(user_record);
-        let mut messages = transcript_messages(&records);
+        let mut messages = transcript_messages(&records, &self.system_prompt);
         let tool_definitions = self.tool_definitions();
         let mut assistant_text = String::new();
         let mut tool_rounds = 0_usize;
@@ -1237,10 +1241,10 @@ pub(crate) fn is_safe_transcript_tool_name(name: &str) -> bool {
 }
 
 /// 将已持久化的白名单 records 转成模型上下文，并按 round 恢复成对消息。
-fn transcript_messages(records: &[SessionRecord]) -> Vec<Value> {
+fn transcript_messages(records: &[SessionRecord], system_prompt: &str) -> Vec<Value> {
     let mut messages = vec![json!({
         "role": "system",
-        "content": crate::MINIMAL_SYSTEM_PROMPT
+        "content": system_prompt
     })];
     let mut groups: Vec<(&SessionRecord, Vec<&SessionRecord>)> = Vec::new();
 
@@ -1573,7 +1577,7 @@ mod tests {
             ),
         ];
 
-        let messages = transcript_messages(&records);
+        let messages = transcript_messages(&records, crate::MINIMAL_SYSTEM_PROMPT);
         assert_eq!(
             messages
                 .iter()
@@ -1612,7 +1616,7 @@ mod tests {
             ),
         ];
 
-        let messages = transcript_messages(&records);
+        let messages = transcript_messages(&records, crate::MINIMAL_SYSTEM_PROMPT);
         assert!(
             messages
                 .iter()
@@ -1670,7 +1674,7 @@ mod tests {
             ),
         ];
 
-        let messages = transcript_messages(&records);
+        let messages = transcript_messages(&records, crate::MINIMAL_SYSTEM_PROMPT);
         assert!(messages.iter().any(|message| {
             message["role"] == "assistant" && message["content"] == "independent follow-up"
         }));
@@ -1718,7 +1722,7 @@ mod tests {
             ),
         ];
 
-        let messages = transcript_messages(&records);
+        let messages = transcript_messages(&records, crate::MINIMAL_SYSTEM_PROMPT);
         assert!(messages.iter().any(|message| {
             message["role"] == "assistant" && message["content"] == "legacy follow-up"
         }));
@@ -1769,7 +1773,7 @@ mod tests {
             ),
         ];
 
-        let messages = transcript_messages(&records);
+        let messages = transcript_messages(&records, crate::MINIMAL_SYSTEM_PROMPT);
         let assistant = messages
             .iter()
             .find(|message| message["role"] == "assistant")
@@ -1831,7 +1835,7 @@ mod tests {
             SessionRecord::turn_terminal(6, "prompt-mixed", "completed"),
         ];
 
-        let messages = transcript_messages(&records);
+        let messages = transcript_messages(&records, crate::MINIMAL_SYSTEM_PROMPT);
         assert_eq!(
             messages
                 .iter()
@@ -1900,7 +1904,7 @@ mod tests {
             SessionRecord::turn_terminal(6, "prompt-mixed", "completed"),
         ];
 
-        let messages = transcript_messages(&records);
+        let messages = transcript_messages(&records, crate::MINIMAL_SYSTEM_PROMPT);
         let tool_call_index = messages
             .iter()
             .position(|message| message["role"] == "assistant" && message["tool_calls"].is_array())
@@ -1918,5 +1922,16 @@ mod tests {
             messages[tool_call_index]["tool_calls"][0]["function"]["arguments"],
             "{}"
         );
+    }
+
+    /// Host 注入的产品提示词必须成为模型上下文的第一条 system 消息。
+    #[test]
+    fn transcript_uses_configured_system_prompt_instead_of_compile_time_default() {
+        let records = vec![SessionRecord::user(1, "prompt-product", "hello")];
+        let product_prompt = "You are AIMO's music assistant.";
+        let messages = transcript_messages(&records, product_prompt);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], product_prompt);
+        assert_ne!(messages[0]["content"], crate::MINIMAL_SYSTEM_PROMPT);
     }
 }

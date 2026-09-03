@@ -465,6 +465,7 @@ impl Harness {
             mcp_exec_root: root.join("mcp"),
             idle_after,
             l3b: Default::default(),
+            system_prompt: String::new(),
         };
         let runtime = match (catalog_timeout, load_timeout) {
             (Some(catalog_timeout), None) => HostRuntime::new_for_test_with_mcp_catalog_timeout(
@@ -527,6 +528,7 @@ impl Harness {
                 mcp_exec_root: temporary.path().join("mcp"),
                 idle_after: Duration::from_secs(60),
                 l3b: Default::default(),
+                system_prompt: String::new(),
             },
         ));
         (runtime, temporary, home_root)
@@ -1505,6 +1507,7 @@ fn launch_handshake_new_session_skips_empty_mcp_catalog_and_keeps_stdio_wired() 
     assert!(config.contains("schema_version = 1"));
     assert!(config.contains("backend = \"chat_completions\""));
     assert!(config.contains("token_env = \"EFFLAB_L3B_BIND\""));
+    assert!(config.contains("system_prompt = \"\""));
 
     let expected_session_cwd = fs::canonicalize(harness._temporary.path())
         .expect("测试临时根必须能 canonicalize")
@@ -2500,7 +2503,12 @@ fn delete_session_waits_for_acp_close_and_drops_active_session() {
             session_id: session_id.clone(),
         })
         .expect("DeleteSession 必须等待 sidecar result");
-    assert_eq!(reply, KitReply::DeleteSession { session_id: session_id.clone() });
+    assert_eq!(
+        reply,
+        KitReply::DeleteSession {
+            session_id: session_id.clone()
+        }
+    );
 
     let close_wire = harness
         .captured_requests("session/close")

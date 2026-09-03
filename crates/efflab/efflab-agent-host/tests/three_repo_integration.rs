@@ -241,6 +241,7 @@ impl Harness {
             mcp_exec_root: root.join("mcp"),
             idle_after: Duration::from_secs(60),
             l3b: Default::default(),
+            system_prompt: String::new(),
         };
         let runtime = HostRuntime::new(FakeApp::new(approved_mcp), sink, config);
 

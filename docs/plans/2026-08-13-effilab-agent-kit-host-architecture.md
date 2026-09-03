@@ -550,7 +550,7 @@ M1 不弹窗。自动批只读工具 ≠ `HostAppConfirm`，不把原始 ACP 甩
 
 **禁止**放进 host crate：产品 schema / 写回 / 商店验签 / React / Music MCP 实现。
 
-RuntimeConfigV1 必须由 Host 通过 `render_runtime_config_v1` 原子写入 `<home>/runtime-config.v1.toml`，并由 sidecar 通过 `--runtime-config` 只读加载；缺失、malformed、未知字段或 revision 不匹配均拒绝启动。配置只允许固定的模型 loopback、Host 审批的 HTTP MCP 与 `expected_tools`，不包含用户凭据、command/args 或旧 shell 配置；stdio 条目统一返回 `stdio_mcp_unavailable`。
+RuntimeConfigV1 必须由 Host 通过 `render_runtime_config_v1` 原子写入 `<home>/runtime-config.v1.toml`，并由 sidecar 通过 `--runtime-config` 只读加载；缺失、malformed、未知字段或 revision 不匹配均拒绝启动。配置只允许固定的模型 loopback、Host 审批的 HTTP MCP、`expected_tools` 与可选 `system_prompt`（空值回退 sidecar 内置最小提示词），不包含用户凭据、command/args 或旧 shell 配置；stdio 条目统一返回 `stdio_mcp_unavailable`。
 
 ## 7. LLM Channel
 
@@ -578,7 +578,7 @@ sidecar RuntimeConfigV1（磁盘，无私密）
 ```
 
 - 两通道都强制 `chat_completions`。Host 是 `runtime-config.v1.toml` 的唯一写盘 owner；sidecar 缺文件或校验失败以退出码 2 拒绝，不得自补默认模型。
-- RuntimeConfigV1 的 `[model]`、`[approved_mcp]` 与 `expected_tools` 均为闭集字段；空 `expected_tools` 合法。Host 写入的 runtime config 不含用户 Key/Relay token，也不含 command/args。
+- RuntimeConfigV1 的 `[model]`、`[approved_mcp]`、`expected_tools` 与 `system_prompt` 均为闭集字段；空 `expected_tools` 与空 `system_prompt` 合法。Host 写入的 runtime config 不含用户 Key/Relay token，也不含 command/args。
 - 空通道：不写模型配置，且 **不得 spawn 后允许 prompt**。
 - 文档用词：**产品套餐** vs **Relay 额度**，不要都叫「订阅」。
 - 通道是**产品全局**，`SetLlmChannel` / `persist_llm_channel` 不带 `scope_id`。M1 启用 Byok；Relay **类型第一天进** `LlmChannel`，`enabled=false`。切到 Relay = 改 Channel + 使全部旧 binding token 失效 + drain/重启所有存活 scope；sidecar 仍打同一个 L3b，Host 换出站目标。web / ACP / HostApp 形状不变。

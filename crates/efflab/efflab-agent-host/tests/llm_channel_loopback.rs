@@ -1033,6 +1033,7 @@ fn channel_change_keeps_committed_view_when_live_scope_restart_fails() {
             mcp_exec_root: temporary.path().join("mcp"),
             idle_after: Duration::from_secs(60),
             l3b: L3bRuntimeConfig::default(),
+            system_prompt: String::new(),
         },
     )
     .expect("已配置 BYOK 的 service 必须可构造");
@@ -1074,6 +1075,7 @@ fn unconfigured_channel_neither_listens_nor_spawns() {
             mcp_exec_root: temporary.path().join("mcp"),
             idle_after: Duration::from_secs(60),
             l3b: L3bRuntimeConfig::default(),
+            system_prompt: String::new(),
         },
     )
     .expect("未配置 Channel 的 service 仍必须可构造以返回设置页 view");
@@ -1246,6 +1248,7 @@ while IFS= read -r _; do :; done
         mcp_exec_root: temporary.path().join("mcp"),
         idle_after: Duration::from_secs(60),
         l3b: L3bRuntimeConfig::default(),
+        system_prompt: "You are the launch-test product agent.".to_owned(),
     };
     let service =
         LlmChannelService::new(app, runtime_config).expect("已配置 BYOK 的 Host 服务必须可构造");
@@ -1340,6 +1343,10 @@ while IFS= read -r _; do :; done
         config.expected_tools == BTreeSet::from(["demo__search".to_string()]),
         "runtime config 必须保留已审核工具名"
     );
+    assert_eq!(
+        config.system_prompt, "You are the launch-test product agent.",
+        "runtime config 必须写入 Host 注入的产品系统提示词"
+    );
 
     assert_sidecar_environment_names(&captured_env);
     let inherited_variables: BTreeSet<_> = captured_env
@@ -1405,6 +1412,7 @@ fn real_launch_writes_sidecar_stderr_to_injected_log_file() {
             mcp_exec_root: temporary.path().join("mcp"),
             idle_after: Duration::from_secs(60),
             l3b: L3bRuntimeConfig::default(),
+            system_prompt: String::new(),
         },
     )
     .expect("已配置 BYOK 的 service 必须可构造");

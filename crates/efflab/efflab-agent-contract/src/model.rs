@@ -42,6 +42,9 @@ pub struct RuntimeConfigV1 {
     pub approved_mcp: ApprovedMcpConfig,
     /// sidecar 可期待的、按字典序稳定化的工具名集合。
     pub expected_tools: BTreeSet<String>,
+    /// Host 注入的产品系统提示词；缺省或空字符串表示 sidecar 使用内置最小提示词。
+    #[serde(default)]
+    pub system_prompt: String,
 }
 
 /// 只允许连接 Host L3b 的回环模型描述；不承载用户密钥。

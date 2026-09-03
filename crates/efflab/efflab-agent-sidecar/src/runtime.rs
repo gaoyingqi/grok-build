@@ -238,12 +238,20 @@ pub async fn run_acp(sidecar: SidecarConfig) -> Result<()> {
     )
     .await
     .map_err(|error| anyhow::anyhow!("sidecar mcp runtime unavailable: {}", error.code()))?;
+    let system_prompt = crate::resolve_system_prompt(&sidecar.runtime_config.system_prompt);
+    tracing::debug!(
+        event = "system_prompt_resolved",
+        host_configured = !sidecar.runtime_config.system_prompt.trim().is_empty(),
+        prompt_bytes = system_prompt.len(),
+        "已解析 sidecar 系统提示词"
+    );
     let agent = MinimalAgent::with_runtime_and_mcp(
         sidecar.session_cwd.clone(),
         repository,
         model,
         sidecar.runtime_config.expected_tools.clone(),
         mcp.clone(),
+        sidecar.runtime_config.system_prompt.clone(),
     );
     #[cfg(debug_assertions)]
     let test_seam = sidecar.test_seam_dir.clone().map(TestSeam::new);

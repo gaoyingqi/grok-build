@@ -21,5 +21,31 @@ pub mod sidecar_config;
 pub(crate) mod test_seam;
 pub mod turn_loop;
 
-/// 当前最小 ACP turn loop 使用的编译期系统提示词。
+/// 当前最小 ACP turn loop 使用的编译期系统提示词；Host 未注入产品提示词时回退到此文本。
 pub const MINIMAL_SYSTEM_PROMPT: &str = include_str!("../assets/efflab-minimal-system-prompt.md");
+
+/// 解析本轮系统提示词：Host 注入优先，空白回退到编译期最小提示词。
+pub fn resolve_system_prompt(configured: &str) -> &str {
+    if configured.trim().is_empty() {
+        MINIMAL_SYSTEM_PROMPT
+    } else {
+        configured
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MINIMAL_SYSTEM_PROMPT, resolve_system_prompt};
+
+    #[test]
+    fn resolve_system_prompt_falls_back_when_host_leaves_it_blank() {
+        assert_eq!(resolve_system_prompt(""), MINIMAL_SYSTEM_PROMPT);
+        assert_eq!(resolve_system_prompt("   \n"), MINIMAL_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn resolve_system_prompt_keeps_host_product_text() {
+        let prompt = "You are AIMO's music assistant.";
+        assert_eq!(resolve_system_prompt(prompt), prompt);
+    }
+}

@@ -90,6 +90,8 @@ struct RuntimeState {
     next_admission_epoch: u64,
     shutting_down: bool,
     active_changed: Rc<Notify>,
+    /// 已解析的系统提示词；空 Host 配置在构造时已回退到内置最小文本。
+    system_prompt: String,
     /// debug 构建中用于控制异步窗口并记录执行点的测试 seam。
     #[cfg(debug_assertions)]
     test_seam: Option<TestSeam>,
@@ -103,6 +105,7 @@ struct RuntimeDependencies {
     gateway: Option<AcpGatewaySender<acp::AgentSide>>,
     expected_tools: BTreeSet<String>,
     ready_tools: BTreeSet<String>,
+    system_prompt: String,
 }
 
 /// 在 ACP current-thread LocalSet 中运行的最小 Agent。
@@ -139,6 +142,7 @@ impl MinimalAgent {
                 next_admission_epoch: 1,
                 shutting_down: false,
                 active_changed: Rc::new(Notify::new()),
+                system_prompt: crate::MINIMAL_SYSTEM_PROMPT.to_owned(),
                 #[cfg(debug_assertions)]
                 test_seam: None,
             })),
@@ -158,6 +162,7 @@ impl MinimalAgent {
             model,
             expected_tools,
             McpRuntime::empty(),
+            String::new(),
         )
     }
 
@@ -168,6 +173,7 @@ impl MinimalAgent {
         model: HttpModelClient,
         expected_tools: BTreeSet<String>,
         mcp: McpRuntime,
+        system_prompt: String,
     ) -> Self {
         // runtime config 的 expected_tools 只描述 Host 批准的 MCP；内置 noop 是固定批准成员。
         let mut approved_tools = expected_tools;
@@ -196,6 +202,7 @@ impl MinimalAgent {
                 next_admission_epoch: 1,
                 shutting_down: false,
                 active_changed: Rc::new(Notify::new()),
+                system_prompt: crate::resolve_system_prompt(&system_prompt).to_owned(),
                 #[cfg(debug_assertions)]
                 test_seam: None,
             })),
@@ -391,6 +398,7 @@ impl MinimalAgent {
             gateway: state.gateway.clone(),
             expected_tools: state.expected_tools.clone(),
             ready_tools: state.ready_tools.clone(),
+            system_prompt: state.system_prompt.clone(),
         })
     }
 
@@ -942,8 +950,8 @@ impl acp::Agent for MinimalAgent {
             return Err(rejected_params("session_close_meta_not_allowed"));
         }
         let session_id = args.session_id.0.as_ref().to_owned();
-        let known = self.has_confirmed_session(&session_id)
-            || self.has_memory_session(&args.session_id);
+        let known =
+            self.has_confirmed_session(&session_id) || self.has_memory_session(&args.session_id);
         self.forget_session(&session_id);
         if let Some(dependencies) = self.runtime_dependencies() {
             match dependencies.repository.delete(&session_id).await {
@@ -1005,6 +1013,7 @@ impl acp::Agent for MinimalAgent {
                         gateway,
                         dependencies.expected_tools,
                         dependencies.ready_tools,
+                        dependencies.system_prompt,
                     );
                     #[cfg(debug_assertions)]
                     let loop_runner = loop_runner.with_test_seam(self.test_seam());

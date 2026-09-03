@@ -2118,13 +2118,8 @@ impl ScopeActor {
             .request_validated("session/close", params, &self.policy)
         {
             Ok(id) => {
-                self.pending.insert(
-                    id,
-                    PendingRpc::DeleteSession {
-                        session_id,
-                        reply,
-                    },
-                );
+                self.pending
+                    .insert(id, PendingRpc::DeleteSession { session_id, reply });
             }
             Err(_) => {
                 let _ = reply.send(Err(sidecar_unavailable("无法写入 session/close")));
@@ -4256,6 +4251,7 @@ done
             mcp_exec_root: temporary.path().join("mcp"),
             idle_after: Duration::from_millis(1),
             l3b: L3bRuntimeConfig::default(),
+            system_prompt: String::new(),
         };
         let runtime = HostRuntime::new(LifecycleTestApp, NoopSink, config);
         let service = runtime
@@ -4359,6 +4355,7 @@ done
                 mcp_exec_root: temporary.path().join("mcp"),
                 idle_after: Duration::from_secs(60),
                 l3b: L3bRuntimeConfig::default(),
+                system_prompt: String::new(),
             },
         );
 
@@ -4480,6 +4477,7 @@ done
             mcp_exec_root: temporary.path().join("mcp"),
             idle_after: Duration::from_millis(1),
             l3b: L3bRuntimeConfig::default(),
+            system_prompt: String::new(),
         };
         let runtime = HostRuntime::new(LifecycleTestApp, NoopSink, config);
         let service = runtime
@@ -4606,6 +4604,7 @@ done
             mcp_exec_root: temporary.path().join("mcp"),
             idle_after: Duration::from_millis(1),
             l3b: L3bRuntimeConfig::default(),
+            system_prompt: String::new(),
         };
         let runtime = HostRuntime::new(LifecycleTestApp, NoopSink, config);
         let service = runtime
@@ -4688,6 +4687,7 @@ done
             mcp_exec_root: temporary.path().join("mcp"),
             idle_after: Duration::from_secs(60),
             l3b: L3bRuntimeConfig::default(),
+            system_prompt: String::new(),
         };
         let runtime = HostRuntime::new(LifecycleTestApp, NoopSink, config);
         let service = runtime
@@ -4788,6 +4788,7 @@ done
             mcp_exec_root: temporary.path().join("mcp"),
             idle_after: Duration::from_secs(60),
             l3b: L3bRuntimeConfig::default(),
+            system_prompt: String::new(),
         };
         let runtime = HostRuntime::new(LifecycleTestApp, NoopSink, config);
         let service = runtime
@@ -5018,6 +5019,7 @@ done
                     mcp_exec_root: temporary.path().join("mcp"),
                     idle_after: Duration::from_secs(60),
                     l3b: L3bRuntimeConfig::default(),
+                    system_prompt: String::new(),
                 },
             )
             .channel_service()
@@ -5084,6 +5086,7 @@ done
                     mcp_exec_root: temporary.path().join("mcp"),
                     idle_after: Duration::from_secs(60),
                     l3b: L3bRuntimeConfig::default(),
+                    system_prompt: String::new(),
                 },
             )
             .channel_service()
@@ -5151,6 +5154,7 @@ done
             mcp_exec_root: temporary.path().join("mcp"),
             idle_after: Duration::from_secs(60),
             l3b: L3bRuntimeConfig::default(),
+            system_prompt: String::new(),
         };
         let runtime = HostRuntime::new(LifecycleTestApp, NoopSink, config);
         let service = runtime
@@ -5258,6 +5262,7 @@ done
             mcp_exec_root: temporary.path().join("mcp"),
             idle_after: Duration::from_millis(1),
             l3b: L3bRuntimeConfig::default(),
+            system_prompt: String::new(),
         };
         let runtime = HostRuntime::new(LifecycleTestApp, NoopSink, config);
         let service = runtime
@@ -5373,6 +5378,7 @@ done
             mcp_exec_root: temporary.path().join("mcp"),
             idle_after: Duration::from_secs(60),
             l3b: L3bRuntimeConfig::default(),
+            system_prompt: String::new(),
         };
         let runtime = HostRuntime::new(LifecycleTestApp, NoopSink, config);
         let service = runtime
@@ -5444,6 +5450,7 @@ done
             mcp_exec_root: temporary.path().join("mcp"),
             idle_after: Duration::from_secs(60),
             l3b: L3bRuntimeConfig::default(),
+            system_prompt: String::new(),
         };
         let runtime = HostRuntime::new(LifecycleTestApp, NoopSink, config);
         let service = runtime
@@ -5777,6 +5784,7 @@ done
             mcp_exec_root: temporary.path().join("mcp"),
             idle_after: Duration::from_secs(60),
             l3b: L3bRuntimeConfig::default(),
+            system_prompt: String::new(),
         };
         let runtime = HostRuntime::new(LifecycleTestApp, NoopSink, config);
         let service = runtime

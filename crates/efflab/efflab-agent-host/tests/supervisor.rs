@@ -34,6 +34,7 @@ fn config(home_root: PathBuf) -> HostRuntimeConfig {
         home_root,
         idle_after: Duration::from_secs(60),
         l3b: efflab_agent_host::L3bRuntimeConfig::default(),
+        system_prompt: String::new(),
     }
 }
 
@@ -514,6 +515,7 @@ fn supervisor_passes_v1_config_and_never_passes_secret_or_user_endpoint() {
             mcp_exec_root: temporary.path().join("mcp"),
             idle_after: Duration::from_secs(60),
             l3b: efflab_agent_host::L3bRuntimeConfig::default(),
+            system_prompt: String::new(),
         },
     )
     .expect("Task19 测试 Channel 必须可构造");
@@ -615,6 +617,7 @@ fn host_runtime_dispatches_non_empty_mcp_through_real_v1_launch() {
             mcp_exec_root: temporary.path().join("mcp"),
             idle_after: Duration::from_secs(60),
             l3b: efflab_agent_host::L3bRuntimeConfig::default(),
+            system_prompt: String::new(),
         },
     );
 
@@ -734,6 +737,7 @@ fn host_runtime_dispatches_non_empty_mcp_through_real_v1_launch() {
     assert!(mcp_params.get("_meta").is_none());
 
     assert!(runtime_config.contains("expected_tools = [\"demo__search\"]"));
+    assert!(runtime_config.contains("system_prompt = \"\""));
     assert!(runtime_config.contains("[approved_mcp.servers.demo]"));
     assert!(runtime_config.contains("url = \"http://127.0.0.1:4313/mcp\""));
     assert!(child_env.lines().any(|name| name == "EFFLAB_L3B_BIND"));

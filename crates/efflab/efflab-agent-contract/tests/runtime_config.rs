@@ -224,6 +224,7 @@ fn runtime_config_v1_round_trips_empty_and_http() {
     let rendered_empty = render_runtime_config_v1(&empty).expect("empty config 必须可渲染");
     assert!(!rendered_empty.contains("[approved_mcp.servers]"));
     assert!(rendered_empty.contains("expected_tools = []"));
+    assert!(rendered_empty.contains("system_prompt = \"\""));
     assert_eq!(
         rendered_empty,
         fs::read_to_string(&empty_fixture.path).unwrap()
@@ -239,6 +240,37 @@ fn runtime_config_v1_round_trips_empty_and_http() {
     );
     let (_round_trip_dir, round_trip_path) = write_config(&http);
     assert_eq!(load_runtime_config_v1(&round_trip_path).unwrap(), http);
+}
+
+#[test]
+fn system_prompt_is_optional_and_round_trips_product_text() {
+    let missing = materialize_fixture_source("runtime_config_v1_empty.toml")
+        .replace("system_prompt = \"\"\n", "");
+    let missing = with_independent_revision(&missing);
+    let loaded =
+        load_runtime_config_v1_from_str(&missing).expect("缺省 system_prompt 必须按空字符串加载");
+    assert!(loaded.system_prompt.is_empty());
+
+    let mut config = loaded;
+    config.system_prompt =
+        "You are AIMO's music assistant.\nOperate only through Host tools.".to_owned();
+    let rendered = render_runtime_config_v1(&config).expect("产品提示词必须可渲染");
+    assert!(rendered.contains("You are AIMO's music assistant."));
+    let round_trip = load_runtime_config_v1_from_str(&rendered).expect("产品提示词必须可回读");
+    assert_eq!(round_trip.system_prompt, config.system_prompt);
+}
+
+#[test]
+fn system_prompt_rejects_nul_and_oversized_text() {
+    let empty = materialize_fixture_source("runtime_config_v1_empty.toml");
+    let mut config: RuntimeConfigV1 = toml::from_str(&empty).expect("fixture 必须可解析");
+    config.system_prompt = "bad\0prompt".to_owned();
+    let error = render_runtime_config_v1(&config).expect_err("含 NUL 的提示词必须拒绝");
+    assert!(format!("{error:#}").contains("system_prompt"));
+
+    config.system_prompt = "x".repeat(32_769);
+    let error = render_runtime_config_v1(&config).expect_err("超长提示词必须拒绝");
+    assert!(format!("{error:#}").contains("32768"));
 }
 
 #[test]
@@ -647,6 +679,13 @@ fn runtime_revision_is_stable_for_sorted_sets_and_changes_for_participating_fiel
         independent_revision(&config),
         independent_revision(&changed)
     );
+
+    let mut changed = config.clone();
+    changed.system_prompt = "You are the product-specific agent.".to_owned();
+    assert_ne!(
+        independent_revision(&config),
+        independent_revision(&changed)
+    );
 }
 
 #[test]
@@ -670,6 +709,7 @@ fn runtime_config_v1_serializes_only_the_frozen_root_keys() {
             "schema_version",
             "session_cwd",
             "session_store_version",
+            "system_prompt",
         ]
     );
     assert_eq!(value["approved_mcp"]["servers"], serde_json::json!({}));
@@ -705,6 +745,7 @@ fn runtime_config_v1_types_are_constructible_for_future_host_spawn() {
         },
         approved_mcp: ApprovedMcpConfig::default(),
         expected_tools: Default::default(),
+        system_prompt: String::new(),
     };
     assert_eq!(config.model.base_url, "http://[::1]:4312/v1");
 }
@@ -717,6 +758,7 @@ struct TestRevisionPayload<'a> {
     model: TestModelPayload<'a>,
     approved_mcp: TestApprovedMcpPayload<'a>,
     expected_tools: &'a BTreeSet<String>,
+    system_prompt: &'a str,
 }
 
 #[derive(Serialize)]
@@ -762,6 +804,7 @@ fn canonical_revision_json(config: &RuntimeConfigV1) -> String {
         },
         approved_mcp: TestApprovedMcpPayload { servers },
         expected_tools: &config.expected_tools,
+        system_prompt: &config.system_prompt,
     };
     serde_json::to_string(&payload).expect("测试 canonical JSON 必须可序列化")
 }
@@ -862,16 +905,16 @@ const GOLDEN_CWD: &str = "/var/empty";
 const GOLDEN_CWD: &str = r"C:\efflab\session";
 
 #[cfg(not(windows))]
-const GOLDEN_CANONICAL_JSON: &str = r#"{"schema_version":1,"session_store_version":1,"session_cwd":"/var/empty","model":{"model_id":"golden-model","base_url":"http://127.0.0.1:4312/v1","backend":"chat_completions","token_env":"EFFLAB_L3B_BIND"},"approved_mcp":{"servers":{"alpha":{"url":"http://[::1]:4314/mcp"},"zeta":{"url":"http://127.0.0.1:4313/"}}},"expected_tools":["alpha__search","zeta__search"]}"#;
+const GOLDEN_CANONICAL_JSON: &str = r#"{"schema_version":1,"session_store_version":1,"session_cwd":"/var/empty","model":{"model_id":"golden-model","base_url":"http://127.0.0.1:4312/v1","backend":"chat_completions","token_env":"EFFLAB_L3B_BIND"},"approved_mcp":{"servers":{"alpha":{"url":"http://[::1]:4314/mcp"},"zeta":{"url":"http://127.0.0.1:4313/"}}},"expected_tools":["alpha__search","zeta__search"],"system_prompt":""}"#;
 #[cfg(windows)]
-const GOLDEN_CANONICAL_JSON: &str = r#"{"schema_version":1,"session_store_version":1,"session_cwd":"C:\\efflab\\session","model":{"model_id":"golden-model","base_url":"http://127.0.0.1:4312/v1","backend":"chat_completions","token_env":"EFFLAB_L3B_BIND"},"approved_mcp":{"servers":{"alpha":{"url":"http://[::1]:4314/mcp"},"zeta":{"url":"http://127.0.0.1:4313/"}}},"expected_tools":["alpha__search","zeta__search"]}"#;
+const GOLDEN_CANONICAL_JSON: &str = r#"{"schema_version":1,"session_store_version":1,"session_cwd":"C:\\efflab\\session","model":{"model_id":"golden-model","base_url":"http://127.0.0.1:4312/v1","backend":"chat_completions","token_env":"EFFLAB_L3B_BIND"},"approved_mcp":{"servers":{"alpha":{"url":"http://[::1]:4314/mcp"},"zeta":{"url":"http://127.0.0.1:4313/"}}},"expected_tools":["alpha__search","zeta__search"],"system_prompt":""}"#;
 
 #[cfg(not(windows))]
 const GOLDEN_REVISION: &str =
-    "sha256:eeef744f761ed4520e67976be8e9af0aee93238e9ce4787fef04907b2e330f73";
+    "sha256:8bc2b4db94c3ec2fb03c506c129635f96edef871f1d73fc5a15741cd889dd5e9";
 #[cfg(windows)]
 const GOLDEN_REVISION: &str =
-    "sha256:8c5b5c3e8ce795f4d73086977e1739aadc401d555c9fdf35ef54161ac646aedb";
+    "sha256:c4ddd5a6249b3185ff9833910b7858cd506fba7bbd02471d38db9d03682c1dc6";
 
 fn golden_config() -> RuntimeConfigV1 {
     RuntimeConfigV1 {
@@ -902,6 +945,7 @@ fn golden_config() -> RuntimeConfigV1 {
             ]),
         },
         expected_tools: BTreeSet::from(["zeta__search".to_owned(), "alpha__search".to_owned()]),
+        system_prompt: String::new(),
     }
 }
 

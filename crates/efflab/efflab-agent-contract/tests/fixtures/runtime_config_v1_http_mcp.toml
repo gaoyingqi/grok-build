@@ -3,6 +3,7 @@ runtime_revision = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef01234
 session_store_version = 1
 session_cwd = "<canonical-session-cwd>"
 expected_tools = ["demo__search"]
+system_prompt = ""
 
 [model]
 model_id = "byok-user-model"

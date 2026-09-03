@@ -95,6 +95,7 @@ mod task13 {
                 },
                 approved_mcp,
                 expected_tools: expected_tools.into_iter().collect(),
+                system_prompt: String::new(),
             };
             let rendered = render_runtime_config_v1(&config).expect("生成 v1 runtime config");
             let runtime_config = home.join("runtime-config.v1.toml");
@@ -1294,10 +1295,7 @@ mod task13 {
             serde_json::json!({ "sessionId": created_id }),
             REQUEST_TIMEOUT,
         );
-        assert!(
-            missing.is_err(),
-            "重复 close 未知 session 必须失败"
-        );
+        assert!(missing.is_err(), "重复 close 未知 session 必须失败");
         assert_jsonrpc_lines(&client.raw_lines());
         process.finish(&mut client, "session/close");
     }

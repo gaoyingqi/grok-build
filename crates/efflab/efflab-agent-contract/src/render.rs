@@ -23,6 +23,8 @@ const RUNTIME_BACKEND: &str = "chat_completions";
 const RUNTIME_TOKEN_ENV: &str = "EFFLAB_L3B_BIND";
 const MAX_RUNTIME_PATH_BYTES: usize = 4096;
 const MAX_RUNTIME_MODEL_ID_CHARS: usize = 128;
+/// 产品系统提示词的字节上限，避免把无界文本写入 sidecar 启动配置。
+const MAX_SYSTEM_PROMPT_BYTES: usize = 32_768;
 
 /// 物化 AgentDefinition 与权威配置中使用的固定 agent 名称。
 const DEFAULT_AGENT_NAME: &str = "efflab-default";
@@ -60,6 +62,8 @@ pub fn render_runtime_config_v1(config: &RuntimeConfigV1) -> Result<String> {
     rendered.push_str(&runtime_toml_string(&materialized.session_cwd));
     rendered.push_str("\nexpected_tools = ");
     rendered.push_str(&runtime_toml_string_array(&materialized.expected_tools));
+    rendered.push_str("\nsystem_prompt = ");
+    rendered.push_str(&runtime_toml_string(&materialized.system_prompt));
     rendered.push_str("\n\n[model]\nmodel_id = ");
     rendered.push_str(&runtime_toml_string(&materialized.model.model_id));
     rendered.push_str("\nbase_url = ");
@@ -191,6 +195,7 @@ fn validate_runtime_config_v1(config: &RuntimeConfigV1) -> Result<()> {
             bail!("expected_tools 包含非法 MCP qualified tool 名称");
         }
     }
+    validate_system_prompt(&config.system_prompt)?;
 
     let model_id = &config.model.model_id;
     if model_id.is_empty() {
@@ -233,6 +238,17 @@ fn validate_runtime_config_v1(config: &RuntimeConfigV1) -> Result<()> {
     Ok(())
 }
 
+/// 校验 Host 注入的系统提示词：允许空值回退，但拒绝 NUL 和无界文本。
+fn validate_system_prompt(value: &str) -> Result<()> {
+    if value.len() > MAX_SYSTEM_PROMPT_BYTES {
+        bail!("system_prompt 长度不能超过 {MAX_SYSTEM_PROMPT_BYTES} 字节");
+    }
+    if value.as_bytes().contains(&0) {
+        bail!("system_prompt 不允许包含 NUL");
+    }
+    Ok(())
+}
+
 /// 生成 revision 使用的字段顺序固定、且不包含 runtime_revision 的 JSON 投影。
 #[derive(Serialize)]
 struct RuntimeRevisionPayload<'a> {
@@ -242,6 +258,7 @@ struct RuntimeRevisionPayload<'a> {
     model: &'a LoopbackModelSpec,
     approved_mcp: RuntimeRevisionMcp<'a>,
     expected_tools: &'a BTreeSet<String>,
+    system_prompt: &'a str,
 }
 
 /// revision 专用 MCP 视图只包含 HTTP URL，避免 command/args 进入摘要。
@@ -275,6 +292,7 @@ fn calculate_runtime_revision(config: &RuntimeConfigV1) -> Result<String> {
         model: &config.model,
         approved_mcp: RuntimeRevisionMcp { servers },
         expected_tools: &config.expected_tools,
+        system_prompt: &config.system_prompt,
     };
     let canonical_json =
         serde_json::to_vec(&payload).context("规范化 RuntimeConfigV1 JSON 失败")?;

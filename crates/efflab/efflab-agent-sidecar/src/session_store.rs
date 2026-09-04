@@ -245,6 +245,17 @@ pub enum SessionRecord {
         /// `completed` 或 `cancelled` 等公开状态。
         status: String,
     },
+    /// 模型上下文压缩摘要；旧记录仍保留给 UI replay，不删除。
+    CompactSummary {
+        /// journal sequence。
+        sequence: u64,
+        /// 触发压缩的 prompt id。
+        prompt_id: String,
+        /// 被摘要前缀的最后一条 journal sequence（含）。
+        covered_until_sequence: u64,
+        /// 已截取的摘要正文。
+        text: String,
+    },
 }
 
 impl fmt::Debug for SessionRecord {
@@ -292,6 +303,14 @@ impl fmt::Debug for SessionRecord {
             }
             Self::TurnTerminal { status, .. } => {
                 debug.field("status", status);
+            }
+            Self::CompactSummary {
+                covered_until_sequence,
+                text,
+                ..
+            } => {
+                debug.field("covered_until_sequence", covered_until_sequence);
+                debug.field("text_bytes", &text.len());
             }
         }
         debug.finish()
@@ -391,6 +410,34 @@ impl SessionRecord {
         }
     }
 
+    /// 构造模型上下文压缩摘要；调用方必须先截断正文。
+    pub fn compact_summary(
+        sequence: u64,
+        prompt_id: impl Into<String>,
+        covered_until_sequence: u64,
+        text: impl Into<String>,
+    ) -> Self {
+        Self::CompactSummary {
+            sequence,
+            prompt_id: prompt_id.into(),
+            covered_until_sequence,
+            text: text.into(),
+        }
+    }
+
+    /// 覆盖 journal sequence；只允许 store 在 append 时调用。
+    fn with_sequence(mut self, sequence: u64) -> Self {
+        match &mut self {
+            Self::User { sequence: slot, .. }
+            | Self::AssistantSnapshot { sequence: slot, .. }
+            | Self::AssistantToolCalls { sequence: slot, .. }
+            | Self::Tool { sequence: slot, .. }
+            | Self::TurnTerminal { sequence: slot, .. }
+            | Self::CompactSummary { sequence: slot, .. } => *slot = sequence,
+        }
+        self
+    }
+
     /// 返回与当前记录绑定的 prompt id；所有 v1 记录都必须有值。
     pub fn prompt_id(&self) -> Option<&str> {
         match self {
@@ -398,7 +445,8 @@ impl SessionRecord {
             | Self::AssistantSnapshot { prompt_id, .. }
             | Self::AssistantToolCalls { prompt_id, .. }
             | Self::Tool { prompt_id, .. }
-            | Self::TurnTerminal { prompt_id, .. } => Some(prompt_id),
+            | Self::TurnTerminal { prompt_id, .. }
+            | Self::CompactSummary { prompt_id, .. } => Some(prompt_id),
         }
     }
 
@@ -409,7 +457,8 @@ impl SessionRecord {
             | Self::AssistantSnapshot { sequence, .. }
             | Self::AssistantToolCalls { sequence, .. }
             | Self::Tool { sequence, .. }
-            | Self::TurnTerminal { sequence, .. } => *sequence,
+            | Self::TurnTerminal { sequence, .. }
+            | Self::CompactSummary { sequence, .. } => *sequence,
         }
     }
 
@@ -421,6 +470,7 @@ impl SessionRecord {
             Self::AssistantToolCalls { .. } => "AssistantToolCalls",
             Self::Tool { .. } => "Tool",
             Self::TurnTerminal { .. } => "TurnTerminal",
+            Self::CompactSummary { .. } => "CompactSummary",
         }
     }
 }
@@ -826,21 +876,19 @@ impl SessionRepository {
             return Err(SessionError::InvalidRecord);
         }
 
-        let mut next_sequence = session.records.last().map(SessionRecord::sequence);
+        // sequence 由 store 盖章；调用方传入的值只作占位，避免 turn loop 预分配撞号。
+        let mut next_sequence = match session.records.last().map(SessionRecord::sequence) {
+            Some(previous) => previous
+                .checked_add(1)
+                .ok_or(SessionError::InvalidRecord)?,
+            None => 0,
+        };
         let mut encoded = Vec::with_capacity(records.len());
         for record in records {
-            validate_record(record)?;
-            if let Some(previous) = next_sequence
-                && record.sequence() <= previous
-            {
-                tracing::debug!(
-                    event = "session_append_sequence_invalid",
-                    "拒绝非单调 sequence"
-                );
-                return Err(SessionError::InvalidRecord);
-            }
+            let stamped = record.clone().with_sequence(next_sequence);
+            validate_record(&stamped)?;
             let wire =
-                PersistedRecord::try_from(record).map_err(|_| SessionError::InvalidRecord)?;
+                PersistedRecord::try_from(&stamped).map_err(|_| SessionError::InvalidRecord)?;
             let line = serde_json::to_vec(&wire).map_err(|_| SessionError::InvalidRecord)?;
             if line.len() > MAX_LINE_BYTES {
                 tracing::debug!(
@@ -851,7 +899,9 @@ impl SessionRepository {
             }
             encoded.extend_from_slice(&line);
             encoded.push(b'\n');
-            next_sequence = Some(record.sequence());
+            next_sequence = next_sequence
+                .checked_add(1)
+                .ok_or(SessionError::InvalidRecord)?;
         }
         if records.is_empty() {
             return Ok(());
@@ -1589,6 +1639,12 @@ fn validate_record(record: &SessionRecord) -> Result<(), SessionError> {
             validate_text_size(detail)
         }
         SessionRecord::TurnTerminal { status, .. } => validate_identifier(status),
+        SessionRecord::CompactSummary { text, .. } => {
+            if text.trim().is_empty() {
+                return Err(SessionError::InvalidRecord);
+            }
+            validate_text_size(text)
+        }
     }
 }
 
@@ -2881,6 +2937,14 @@ enum PersistedRecord {
         prompt_id: String,
         status: String,
     },
+    /// 模型上下文压缩摘要 wire。
+    CompactSummary {
+        schema_version: u32,
+        sequence: u64,
+        prompt_id: String,
+        covered_until_sequence: u64,
+        text: String,
+    },
 }
 
 impl TryFrom<&SessionRecord> for PersistedRecord {
@@ -2960,6 +3024,18 @@ impl TryFrom<&SessionRecord> for PersistedRecord {
                 sequence: *sequence,
                 prompt_id: prompt_id.clone(),
                 status: status.clone(),
+            },
+            SessionRecord::CompactSummary {
+                sequence,
+                prompt_id,
+                covered_until_sequence,
+                text,
+            } => Self::CompactSummary {
+                schema_version: SCHEMA_VERSION,
+                sequence: *sequence,
+                prompt_id: prompt_id.clone(),
+                covered_until_sequence: *covered_until_sequence,
+                text: text.clone(),
             },
         })
     }
@@ -3065,6 +3141,23 @@ impl TryFrom<PersistedRecord> for SessionRecord {
                     sequence,
                     prompt_id,
                     status,
+                }
+            }
+            PersistedRecord::CompactSummary {
+                schema_version,
+                sequence,
+                prompt_id,
+                covered_until_sequence,
+                text,
+            } => {
+                if schema_version != SCHEMA_VERSION {
+                    return Err(SessionError::Corrupt);
+                }
+                Self::CompactSummary {
+                    sequence,
+                    prompt_id,
+                    covered_until_sequence,
+                    text,
                 }
             }
         };

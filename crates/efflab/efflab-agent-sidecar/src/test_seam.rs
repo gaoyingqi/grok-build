@@ -62,6 +62,15 @@ impl TestSeam {
         }
     }
 
+    /// 测试用压缩阈值（token）。生产路径不读此文件，也不走环境变量。
+    pub(crate) fn compact_threshold_tokens(&self) -> Option<u64> {
+        let path = self.path("compact_threshold_tokens", "txt")?;
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|tokens| *tokens > 0)
+    }
+
     /// 记录一次已经通过 permission 的 noop 执行点调用。
     pub(crate) fn record_execution(&self) {
         let path = self.root.join("execution-count");

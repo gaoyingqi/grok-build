@@ -25,6 +25,9 @@ use crate::session_store::{
 #[cfg(debug_assertions)]
 use crate::test_seam::TestSeam;
 
+/// 调用方不填写真实 journal sequence；append 时由 store 盖章。
+const UNASSIGNED_SEQUENCE: u64 = 0;
+
 /// 单个 prompt 允许的最大工具回合数；达到上限后不再执行新工具。
 pub const MAX_TOOL_ROUNDS: usize = 8;
 
@@ -270,13 +273,7 @@ impl TurnLoop {
             return Err(TurnLoopError::ReadOnly);
         }
 
-        let mut next_sequence = session
-            .records
-            .last()
-            .map(SessionRecord::sequence)
-            .unwrap_or(0);
-        let user_sequence = allocate_sequence(&mut next_sequence)?;
-        let user_record = SessionRecord::user(user_sequence, prompt_id, user_text);
+        let user_record = SessionRecord::user(UNASSIGNED_SEQUENCE, prompt_id, user_text);
 
         // 持久化成功是 user update 的前置条件，避免 Host 看到不可恢复的半个 prompt。
         self.repository
@@ -289,12 +286,28 @@ impl TurnLoop {
         {
             tracing::debug!(event = "turn_user_update_failed", "user update 入队失败");
             return self
-                .finish_failed(session_id, prompt_id, &mut next_sequence, &control, error)
+                .finish_failed(session_id, prompt_id, &control, error)
                 .await;
         }
 
+        // 重新加载以取得 store 盖章后的 sequence，供 compact 切分前缀。
+        let session = self
+            .repository
+            .load_with_tool_policy(session_id, &self.expected_tools, &self.ready_tools)
+            .await
+            .map_err(TurnLoopError::from)?;
         let mut records = session.records;
-        records.push(user_record);
+        match self
+            .maybe_compact(session_id, prompt_id, &mut records, &cancellation)
+            .await
+        {
+            CompactOutcome::Cancelled => {
+                return self
+                    .finish_cancelled(session_id, prompt_id, &control)
+                    .await;
+            }
+            CompactOutcome::Applied | CompactOutcome::Skipped => {}
+        }
         let mut messages = transcript_messages(&records, &self.system_prompt);
         let tool_definitions = self.tool_definitions();
         let mut assistant_text = String::new();
@@ -303,7 +316,7 @@ impl TurnLoop {
         loop {
             if cancellation.is_cancelled() {
                 return self
-                    .finish_cancelled(session_id, prompt_id, &mut next_sequence, &control)
+                    .finish_cancelled(session_id, prompt_id, &control)
                     .await;
             }
 
@@ -318,7 +331,7 @@ impl TurnLoop {
                 Ok(stream) => stream,
                 Err(ModelError::Cancelled) if cancellation.is_cancelled() => {
                     return self
-                        .finish_cancelled(session_id, prompt_id, &mut next_sequence, &control)
+                        .finish_cancelled(session_id, prompt_id, &control)
                         .await;
                 }
                 Err(error) => {
@@ -332,7 +345,6 @@ impl TurnLoop {
                         .finish_failed(
                             session_id,
                             prompt_id,
-                            &mut next_sequence,
                             &control,
                             TurnLoopError::Model,
                         )
@@ -351,16 +363,14 @@ impl TurnLoop {
                                 .finish_failed(
                                     session_id,
                                     prompt_id,
-                                    &mut next_sequence,
                                     &control,
                                     TurnLoopError::Model,
                                 )
                                 .await;
                         }
                         model_text.push_str(&delta);
-                        let sequence = allocate_sequence(&mut next_sequence)?;
                         let snapshot = SessionRecord::assistant_snapshot(
-                            sequence,
+                            UNASSIGNED_SEQUENCE,
                             prompt_id,
                             "assistant-text",
                             &assistant_text,
@@ -375,7 +385,6 @@ impl TurnLoop {
                                 .finish_failed(
                                     session_id,
                                     prompt_id,
-                                    &mut next_sequence,
                                     &control,
                                     TurnLoopError::from(error),
                                 )
@@ -389,7 +398,6 @@ impl TurnLoop {
                                 .finish_failed(
                                     session_id,
                                     prompt_id,
-                                    &mut next_sequence,
                                     &control,
                                     error,
                                 )
@@ -403,7 +411,6 @@ impl TurnLoop {
                                 .finish_failed(
                                     session_id,
                                     prompt_id,
-                                    &mut next_sequence,
                                     &control,
                                     TurnLoopError::Model,
                                 )
@@ -416,7 +423,6 @@ impl TurnLoop {
                                 .finish_failed(
                                     session_id,
                                     prompt_id,
-                                    &mut next_sequence,
                                     &control,
                                     error,
                                 )
@@ -433,7 +439,7 @@ impl TurnLoop {
                     }
                     Err(ModelError::Cancelled) if cancellation.is_cancelled() => {
                         return self
-                            .finish_cancelled(session_id, prompt_id, &mut next_sequence, &control)
+                            .finish_cancelled(session_id, prompt_id, &control)
                             .await;
                     }
                     Err(error) => {
@@ -451,7 +457,6 @@ impl TurnLoop {
                             .finish_failed(
                                 session_id,
                                 prompt_id,
-                                &mut next_sequence,
                                 &control,
                                 TurnLoopError::Model,
                             )
@@ -470,7 +475,6 @@ impl TurnLoop {
                     .finish_completed(
                         session_id,
                         prompt_id,
-                        &mut next_sequence,
                         &control,
                         &assistant_text,
                     )
@@ -486,7 +490,6 @@ impl TurnLoop {
                     .finish_terminal(
                         session_id,
                         prompt_id,
-                        &mut next_sequence,
                         &control,
                         TerminalKind::MaxTurnRequests,
                     )
@@ -503,7 +506,6 @@ impl TurnLoop {
                     &model_text,
                     &tool_calls,
                     &cancellation,
-                    &mut next_sequence,
                 )
                 .await;
             match tool_result {
@@ -519,7 +521,7 @@ impl TurnLoop {
                 }
                 Ok(ToolRoundResult::Cancelled) => {
                     return self
-                        .finish_cancelled(session_id, prompt_id, &mut next_sequence, &control)
+                        .finish_cancelled(session_id, prompt_id, &control)
                         .await;
                 }
                 Ok(ToolRoundResult::Refused) => {
@@ -527,7 +529,6 @@ impl TurnLoop {
                         .finish_terminal(
                             session_id,
                             prompt_id,
-                            &mut next_sequence,
                             &control,
                             TerminalKind::Refused,
                         )
@@ -536,7 +537,7 @@ impl TurnLoop {
                 }
                 Err(error) => {
                     return self
-                        .finish_failed(session_id, prompt_id, &mut next_sequence, &control, error)
+                        .finish_failed(session_id, prompt_id, &control, error)
                         .await;
                 }
             }
@@ -646,7 +647,208 @@ impl TurnLoop {
         result.map_err(|_| TurnLoopError::Transport)
     }
 
-    /// 执行一个有限工具回合，所有执行前均先通过当前 ACP permission request。
+    /// 生产固定 200k 窗口阈值；debug 测试可通过 seam 文件压低，不走环境变量。
+    fn compact_threshold_tokens_for_turn(&self) -> u64 {
+        #[cfg(debug_assertions)]
+        if let Some(tokens) = self
+            .test_seam
+            .as_ref()
+            .and_then(TestSeam::compact_threshold_tokens)
+        {
+            return tokens;
+        }
+        crate::compact::compact_threshold_tokens()
+    }
+
+    /// 在首轮模型调用前按固定 200k 窗口粗估 token；超阈值则摘要更早回合。
+    async fn maybe_compact(
+        &self,
+        session_id: &str,
+        prompt_id: &str,
+        records: &mut Vec<SessionRecord>,
+        cancellation: &CancellationToken,
+    ) -> CompactOutcome {
+        let Some((prefix_end, covered_until)) = crate::compact::compact_prefix_end(records) else {
+            return CompactOutcome::Skipped;
+        };
+        let current_messages = transcript_messages(records, &self.system_prompt);
+        let estimated = crate::compact::estimate_messages_tokens(&current_messages);
+        let threshold = self.compact_threshold_tokens_for_turn();
+        if estimated < threshold {
+            tracing::debug!(
+                event = "turn_compact_skipped",
+                estimated_tokens = estimated,
+                threshold_tokens = threshold,
+                "上下文未到压缩阈值"
+            );
+            return CompactOutcome::Skipped;
+        }
+
+        let mut compact_messages =
+            transcript_messages(&records[..=prefix_end], &self.system_prompt);
+        compact_messages.push(json!({
+            "role": "user",
+            "content": crate::compact::COMPACT_REQUEST_PROMPT
+        }));
+        tracing::debug!(
+            event = "turn_compact_started",
+            estimated_tokens = estimated,
+            threshold_tokens = threshold,
+            prefix_end,
+            covered_until,
+            "开始一次上下文压缩"
+        );
+
+        let request = ModelTurnRequest::new(compact_messages);
+        let mut stream = match self.model.stream_turn(request, cancellation.clone()).await {
+            Ok(stream) => stream,
+            Err(ModelError::Cancelled) => return CompactOutcome::Cancelled,
+            Err(error) => {
+                tracing::debug!(
+                    event = "turn_compact_failed",
+                    error = %error,
+                    "压缩模型请求失败，本轮继续使用完整上下文"
+                );
+                return CompactOutcome::Skipped;
+            }
+        };
+
+        let mut summary = String::new();
+        let mut saw_tool_call = false;
+        loop {
+            match stream.recv().await {
+                Ok(Some(ModelDelta::Text(delta))) => {
+                    if !append_bounded(&mut summary, &delta) {
+                        break;
+                    }
+                }
+                Ok(Some(ModelDelta::Thought(_))) => {}
+                Ok(Some(ModelDelta::ToolCall(_))) => {
+                    saw_tool_call = true;
+                }
+                Ok(Some(ModelDelta::Done)) | Ok(None) => break,
+                Err(ModelError::Cancelled) => return CompactOutcome::Cancelled,
+                Err(error) => {
+                    tracing::debug!(
+                        event = "turn_compact_failed",
+                        error = %error,
+                        "压缩模型流失败，本轮继续使用完整上下文"
+                    );
+                    return CompactOutcome::Skipped;
+                }
+            }
+        }
+        if saw_tool_call {
+            tracing::debug!(
+                event = "turn_compact_skipped",
+                "压缩模型返回了工具调用，丢弃本次摘要"
+            );
+            return CompactOutcome::Skipped;
+        }
+        let summary = crate::compact::truncate_summary(&summary);
+        if summary.is_empty() {
+            tracing::debug!(event = "turn_compact_skipped", "压缩摘要为空，跳过落盘");
+            return CompactOutcome::Skipped;
+        }
+
+        let record = SessionRecord::compact_summary(
+            UNASSIGNED_SEQUENCE,
+            prompt_id,
+            covered_until,
+            summary,
+        );
+        if let Err(error) = self
+            .repository
+            .append(session_id, std::slice::from_ref(&record))
+            .await
+        {
+            tracing::debug!(
+                event = "turn_compact_failed",
+                error = %error,
+                "压缩摘要落盘失败，本轮继续使用完整上下文"
+            );
+            return CompactOutcome::Skipped;
+        }
+        match self
+            .repository
+            .load_with_tool_policy(session_id, &self.expected_tools, &self.ready_tools)
+            .await
+        {
+            Ok(session) => *records = session.records,
+            Err(error) => {
+                tracing::debug!(
+                    event = "turn_compact_failed",
+                    error = %error,
+                    "压缩后重新加载失败，使用未盖章的内存摘要"
+                );
+                records.push(record);
+            }
+        }
+        tracing::debug!(event = "turn_compact_applied", "上下文压缩摘要已写入 journal");
+        CompactOutcome::Applied
+    }
+
+    /// 写入一条工具 journal；sequence 由 store 在 append 时盖章。
+    async fn persist_tool_record(
+        &self,
+        session_id: &str,
+        prompt_id: &str,
+        round: u32,
+        tool_call_id: &str,
+        name: &str,
+        detail: &str,
+        status: &str,
+    ) -> Result<(), TurnLoopError> {
+        let record = SessionRecord::tool_in_round(
+            UNASSIGNED_SEQUENCE,
+            prompt_id,
+            round,
+            tool_call_id,
+            name,
+            detail,
+            status,
+        );
+        self.repository
+            .append(session_id, std::slice::from_ref(&record))
+            .await
+            .map_err(TurnLoopError::from)
+    }
+
+    /// 将已批准但尚未执行的剩余工具标为 cancelled，保持 journal 成对。
+    async fn cancel_remaining_tools(
+        &self,
+        session_id: &str,
+        prompt_id: &str,
+        round: u32,
+        remaining: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<(), TurnLoopError> {
+        for (wire_call_id, name) in remaining {
+            self.send_tool_status(
+                session_id,
+                prompt_id,
+                &wire_call_id,
+                &name,
+                acp::ToolCallStatus::Failed,
+            )
+            .await?;
+            self.persist_tool_record(
+                session_id,
+                prompt_id,
+                round,
+                &wire_call_id,
+                &name,
+                MCP_TOOL_CANCELLED,
+                TERMINAL_CANCELLED,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// 先对本 round 全部工具做 permission，再串行执行已批准调用。
+    ///
+    /// ACP `toolCallId` 使用模型 `call.id`；不并行执行 MCP。拒绝或取消后，
+    /// 已批准的工具仍会执行，其余调用只补 cancelled journal。
     async fn execute_tool_round(
         &self,
         session_id: &str,
@@ -655,13 +857,12 @@ impl TurnLoop {
         model_text: &str,
         calls: &[ModelToolCall],
         cancellation: &CancellationToken,
-        next_sequence: &mut u64,
     ) -> Result<ToolRoundResult, TurnLoopError> {
         let allowed_tools = self.allowed_tools();
 
         // 先完整校验工具名、参数和调用 id，避免非法调用留下半个 round。
-        let assistant_sequence = allocate_sequence(next_sequence)?;
         let mut planned = Vec::with_capacity(calls.len());
+        let mut seen_ids = BTreeSet::new();
         for call in calls {
             let Some(name) = call.name.as_deref() else {
                 return Err(TurnLoopError::ToolRejected);
@@ -708,19 +909,33 @@ impl TurnLoop {
                 }
                 Some(parsed)
             };
-            if call.id.is_none() {
+            let Some(model_call_id) = call.id.as_deref() else {
                 tracing::debug!(
                     event = "turn_tool_arguments_rejected",
                     error_code = "turn_tool_call_id_missing",
                     "拒绝缺少调用 id 的工具请求"
                 );
                 return Err(TurnLoopError::ToolRejected);
+            };
+            if !is_safe_transcript_tool_id(model_call_id) {
+                tracing::debug!(
+                    event = "turn_tool_arguments_rejected",
+                    error_code = "turn_tool_call_id_invalid",
+                    "拒绝非法工具调用 id"
+                );
+                return Err(TurnLoopError::ToolRejected);
             }
-            let pending_sequence = allocate_sequence(next_sequence)?;
+            if !seen_ids.insert(model_call_id.to_owned()) {
+                tracing::debug!(
+                    event = "turn_tool_arguments_rejected",
+                    error_code = "turn_tool_call_id_duplicate",
+                    "拒绝同一 round 重复的工具调用 id"
+                );
+                return Err(TurnLoopError::ToolRejected);
+            }
             planned.push((
                 call,
-                format!("tool-{pending_sequence}"),
-                pending_sequence,
+                model_call_id.to_owned(),
                 name.to_owned(),
                 mcp_arguments,
             ));
@@ -729,10 +944,10 @@ impl TurnLoop {
         // assistant tool_calls 只保存受控 name/id；原始 arguments 只进入后续模型请求。
         let safe_calls = planned
             .iter()
-            .map(|(_, wire_call_id, _, name, _)| (wire_call_id.clone(), name.clone()))
+            .map(|(_, wire_call_id, name, _)| (wire_call_id.clone(), name.clone()))
             .collect::<Vec<_>>();
         let assistant = SessionRecord::assistant_tool_calls(
-            assistant_sequence,
+            UNASSIGNED_SEQUENCE,
             prompt_id,
             round,
             safe_calls,
@@ -743,21 +958,40 @@ impl TurnLoop {
             .await
             .map_err(TurnLoopError::from)?;
 
-        let mut tool_messages = Vec::with_capacity(planned.len());
-        for (call, wire_call_id, pending_sequence, name, mcp_arguments) in planned {
-            let pending = SessionRecord::tool_in_round(
-                pending_sequence,
+        tracing::debug!(
+            event = "turn_tool_round_permission_phase",
+            tool_count = planned.len(),
+            "开始对本 round 全部工具请求 permission"
+        );
+
+        // 阶段 1：全部 permission 完成后再执行；已 halt 的剩余调用只补 cancelled journal。
+        let mut halt = None;
+        let mut approved = Vec::new();
+        for (call, wire_call_id, name, mcp_arguments) in planned {
+            if halt.is_some() {
+                self.persist_tool_record(
+                    session_id,
+                    prompt_id,
+                    round,
+                    &wire_call_id,
+                    &name,
+                    MCP_TOOL_CANCELLED,
+                    TERMINAL_CANCELLED,
+                )
+                .await?;
+                continue;
+            }
+
+            self.persist_tool_record(
+                session_id,
                 prompt_id,
                 round,
                 &wire_call_id,
                 &name,
                 "permission pending",
                 "pending",
-            );
-            self.repository
-                .append(session_id, std::slice::from_ref(&pending))
-                .await
-                .map_err(TurnLoopError::from)?;
+            )
+            .await?;
             self.send_tool_call(session_id, prompt_id, &wire_call_id, &name)
                 .await?;
 
@@ -775,21 +1009,18 @@ impl TurnLoop {
                     acp::ToolCallStatus::Failed,
                 )
                 .await?;
-                let sequence = allocate_sequence(next_sequence)?;
-                let record = SessionRecord::tool_in_round(
-                    sequence,
+                self.persist_tool_record(
+                    session_id,
                     prompt_id,
                     round,
                     &wire_call_id,
                     &name,
                     MCP_TOOL_CANCELLED,
-                    "cancelled",
-                );
-                self.repository
-                    .append(session_id, std::slice::from_ref(&record))
-                    .await
-                    .map_err(TurnLoopError::from)?;
-                return Ok(ToolRoundResult::Cancelled);
+                    TERMINAL_CANCELLED,
+                )
+                .await?;
+                halt = Some(ToolRoundHalt::Cancelled);
+                continue;
             }
             if matches!(decision, PermissionDecision::Rejected) {
                 self.send_tool_status(
@@ -800,21 +1031,60 @@ impl TurnLoop {
                     acp::ToolCallStatus::Failed,
                 )
                 .await?;
-                let sequence = allocate_sequence(next_sequence)?;
-                let record = SessionRecord::tool_in_round(
-                    sequence,
+                self.persist_tool_record(
+                    session_id,
                     prompt_id,
                     round,
                     &wire_call_id,
                     &name,
                     "permission rejected",
                     "rejected",
-                );
-                self.repository
-                    .append(session_id, std::slice::from_ref(&record))
-                    .await
-                    .map_err(TurnLoopError::from)?;
-                return Ok(ToolRoundResult::Refused);
+                )
+                .await?;
+                halt = Some(ToolRoundHalt::Refused);
+                continue;
+            }
+            approved.push((call, wire_call_id, name, mcp_arguments));
+        }
+
+        tracing::debug!(
+            event = "turn_tool_round_execute_phase",
+            approved_count = approved.len(),
+            halted = halt.is_some(),
+            "开始串行执行已批准工具"
+        );
+
+        // 阶段 2：串行执行已批准工具；取消时给尚未执行的 approved 补 cancelled。
+        let mut tool_messages = Vec::with_capacity(approved.len());
+        let mut remaining = approved.into_iter();
+        while let Some((call, wire_call_id, name, mcp_arguments)) = remaining.next() {
+            if cancellation.is_cancelled() {
+                self.send_tool_status(
+                    session_id,
+                    prompt_id,
+                    &wire_call_id,
+                    &name,
+                    acp::ToolCallStatus::Failed,
+                )
+                .await?;
+                self.persist_tool_record(
+                    session_id,
+                    prompt_id,
+                    round,
+                    &wire_call_id,
+                    &name,
+                    MCP_TOOL_CANCELLED,
+                    TERMINAL_CANCELLED,
+                )
+                .await?;
+                self.cancel_remaining_tools(
+                    session_id,
+                    prompt_id,
+                    round,
+                    remaining.map(|(_, id, name, _)| (id, name)),
+                )
+                .await?;
+                return Ok(ToolRoundResult::Cancelled);
             }
 
             self.send_tool_status(
@@ -853,20 +1123,23 @@ impl TurnLoop {
                             acp::ToolCallStatus::Failed,
                         )
                         .await?;
-                        let sequence = allocate_sequence(next_sequence)?;
-                        let record = SessionRecord::tool_in_round(
-                            sequence,
+                        self.persist_tool_record(
+                            session_id,
                             prompt_id,
                             round,
                             &wire_call_id,
                             &name,
                             MCP_TOOL_CANCELLED,
-                            "cancelled",
-                        );
-                        self.repository
-                            .append(session_id, std::slice::from_ref(&record))
-                            .await
-                            .map_err(TurnLoopError::from)?;
+                            TERMINAL_CANCELLED,
+                        )
+                        .await?;
+                        self.cancel_remaining_tools(
+                            session_id,
+                            prompt_id,
+                            round,
+                            remaining.map(|(_, id, name, _)| (id, name)),
+                        )
+                        .await?;
                         return Ok(ToolRoundResult::Cancelled);
                     }
                     Err(error) => {
@@ -881,20 +1154,16 @@ impl TurnLoop {
             };
 
             // journal 只保存固定摘要；MCP 的真实结果仅进入当前模型回合。
-            let completed_sequence = allocate_sequence(next_sequence)?;
-            let completed = SessionRecord::tool_in_round(
-                completed_sequence,
+            self.persist_tool_record(
+                session_id,
                 prompt_id,
                 round,
                 &wire_call_id,
                 &name,
                 journal_detail,
-                "completed",
-            );
-            self.repository
-                .append(session_id, std::slice::from_ref(&completed))
-                .await
-                .map_err(TurnLoopError::from)?;
+                TERMINAL_COMPLETED,
+            )
+            .await?;
             self.send_tool_status(
                 session_id,
                 prompt_id,
@@ -912,7 +1181,11 @@ impl TurnLoop {
             }));
         }
 
-        Ok(ToolRoundResult::Continue(tool_messages))
+        match halt {
+            Some(ToolRoundHalt::Cancelled) => Ok(ToolRoundResult::Cancelled),
+            Some(ToolRoundHalt::Refused) => Ok(ToolRoundResult::Refused),
+            None => Ok(ToolRoundResult::Continue(tool_messages)),
+        }
     }
 
     /// 将 sidecar cancellation 转发为 MCP token，并等待 call 完成清理。
@@ -1049,14 +1322,12 @@ impl TurnLoop {
         &self,
         session_id: &str,
         prompt_id: &str,
-        next_sequence: &mut u64,
         control: &TurnControl,
         assistant_text: &str,
     ) -> Result<acp::PromptResponse, TurnLoopError> {
         if !assistant_text.is_empty() {
-            let sequence = allocate_sequence(next_sequence)?;
             let snapshot = SessionRecord::assistant_snapshot(
-                sequence,
+                UNASSIGNED_SEQUENCE,
                 prompt_id,
                 "assistant-text",
                 assistant_text,
@@ -1068,25 +1339,13 @@ impl TurnLoop {
                 .await
             {
                 return self
-                    .finish_failed(
-                        session_id,
-                        prompt_id,
-                        next_sequence,
-                        control,
-                        TurnLoopError::from(error),
-                    )
+                    .finish_failed(session_id, prompt_id, control, TurnLoopError::from(error))
                     .await;
             }
         }
-        self.finish_terminal(
-            session_id,
-            prompt_id,
-            next_sequence,
-            control,
-            TerminalKind::Completed,
-        )
-        .await
-        .map(|(response, _)| response)
+        self.finish_terminal(session_id, prompt_id, control, TerminalKind::Completed)
+            .await
+            .map(|(response, _)| response)
     }
 
     /// 所有终态先取得唯一提交权并写 TurnTerminal，再把 PromptResponse 交给 ACP dispatcher。
@@ -1094,15 +1353,13 @@ impl TurnLoop {
         &self,
         session_id: &str,
         prompt_id: &str,
-        next_sequence: &mut u64,
         control: &TurnControl,
         requested: TerminalKind,
     ) -> Result<(acp::PromptResponse, TerminalKind), TurnLoopError> {
         let claim = control.claim_terminal(requested);
         if claim.should_persist {
-            let sequence = allocate_sequence(next_sequence)?;
             let (status, stop_reason) = terminal_wire_values(claim.kind);
-            let terminal = SessionRecord::turn_terminal(sequence, prompt_id, status);
+            let terminal = SessionRecord::turn_terminal(UNASSIGNED_SEQUENCE, prompt_id, status);
             self.repository
                 .append(session_id, std::slice::from_ref(&terminal))
                 .await
@@ -1129,18 +1386,11 @@ impl TurnLoop {
         &self,
         session_id: &str,
         prompt_id: &str,
-        next_sequence: &mut u64,
         control: &TurnControl,
         cause: TurnLoopError,
     ) -> Result<acp::PromptResponse, TurnLoopError> {
         match self
-            .finish_terminal(
-                session_id,
-                prompt_id,
-                next_sequence,
-                control,
-                TerminalKind::Failed,
-            )
+            .finish_terminal(session_id, prompt_id, control, TerminalKind::Failed)
             .await
         {
             Ok((response, TerminalKind::Cancelled)) => Ok(response),
@@ -1154,25 +1404,32 @@ impl TurnLoop {
         &self,
         session_id: &str,
         prompt_id: &str,
-        next_sequence: &mut u64,
         control: &TurnControl,
     ) -> Result<acp::PromptResponse, TurnLoopError> {
         tracing::debug!(event = "turn_cancelled", "turn 收到取消信号");
-        self.finish_terminal(
-            session_id,
-            prompt_id,
-            next_sequence,
-            control,
-            TerminalKind::Cancelled,
-        )
-        .await
-        .map(|(response, _)| response)
+        self.finish_terminal(session_id, prompt_id, control, TerminalKind::Cancelled)
+            .await
+            .map(|(response, _)| response)
     }
 }
 
-/// 工具回合的安全结果；Rejected 不会继续调用模型，也不会执行工具。
+/// 工具回合的安全结果；Refused 不再续模型，但阶段 1 已批准的工具仍会执行。
 enum ToolRoundResult {
     Continue(Vec<Value>),
+    Cancelled,
+    Refused,
+}
+
+/// 压缩尝试的内部结果；失败时跳过压缩，不把 prompt 打成 session 错误。
+enum CompactOutcome {
+    Applied,
+    Skipped,
+    Cancelled,
+}
+
+/// permission 阶段的提前结束原因；已批准工具仍会在执行阶段跑完。
+#[derive(Clone, Copy)]
+enum ToolRoundHalt {
     Cancelled,
     Refused,
 }
@@ -1190,13 +1447,6 @@ fn prompt_meta(prompt_id: &str) -> acp::Meta {
     let mut meta = acp::Meta::new();
     meta.insert("promptId".to_owned(), Value::String(prompt_id.to_owned()));
     meta
-}
-
-/// 单调分配 journal sequence，溢出时 fail-closed。
-fn allocate_sequence(next_sequence: &mut u64) -> Result<u64, TurnLoopError> {
-    let sequence = next_sequence.checked_add(1).ok_or(TurnLoopError::Session)?;
-    *next_sequence = sequence;
-    Ok(sequence)
 }
 
 /// 限制 assistant 累积快照大小，避免模型正文穿透 journal line 上限。
@@ -1246,10 +1496,21 @@ fn transcript_messages(records: &[SessionRecord], system_prompt: &str) -> Vec<Va
         "role": "system",
         "content": system_prompt
     })];
+    let compact = crate::compact::latest_compact(records);
+    if let Some((summary, _)) = compact {
+        messages.extend(crate::compact::summary_messages(summary));
+    }
+    let covered_until = compact.map(|(_, sequence)| sequence);
     let mut groups: Vec<(&SessionRecord, Vec<&SessionRecord>)> = Vec::new();
 
     // User 记录是 turn 边界；每个边界内独立恢复 assistant/tool 消息，避免跨 prompt 聚合。
     for record in records {
+        if matches!(record, SessionRecord::CompactSummary { .. }) {
+            continue;
+        }
+        if covered_until.is_some_and(|cut| record.sequence() <= cut) {
+            continue;
+        }
         if matches!(record, SessionRecord::User { .. }) {
             groups.push((record, Vec::new()));
         } else if let Some((_, events)) = groups.last_mut() {
@@ -1331,7 +1592,9 @@ fn transcript_messages(records: &[SessionRecord], system_prompt: &str) -> Vec<Va
                 SessionRecord::AssistantSnapshot { text, .. } => {
                     pending_snapshot_text = Some(text.clone());
                 }
-                SessionRecord::User { .. } | SessionRecord::TurnTerminal { .. } => {}
+                SessionRecord::User { .. }
+                | SessionRecord::TurnTerminal { .. }
+                | SessionRecord::CompactSummary { .. } => {}
             }
         }
         let final_text = pending_snapshot_text;
@@ -1933,5 +2196,39 @@ mod tests {
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[0]["content"], product_prompt);
         assert_ne!(messages[0]["content"], crate::MINIMAL_SYSTEM_PROMPT);
+    }
+
+    /// 最新 compact_summary 必须替换被覆盖前缀，并保留最近的 user 回合原文。
+    #[test]
+    fn transcript_recovery_applies_latest_compact_summary() {
+        let records = vec![
+            SessionRecord::user(0, "prompt-a", "old user"),
+            SessionRecord::assistant_snapshot(1, "prompt-a", "assistant-text", "old assistant", false),
+            SessionRecord::turn_terminal(2, "prompt-a", "completed"),
+            SessionRecord::compact_summary(3, "prompt-b", 2, "kept facts"),
+            SessionRecord::user(4, "prompt-b", "new user"),
+            SessionRecord::assistant_snapshot(5, "prompt-b", "assistant-text", "new assistant", false),
+        ];
+        let messages = transcript_messages(&records, "system");
+        assert_eq!(messages[0]["content"], "system");
+        assert_eq!(messages[1]["role"], "user");
+        assert!(
+            messages[1]["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("kept facts")),
+            "必须注入 compact 摘要: {messages:?}"
+        );
+        assert_eq!(messages[2]["content"], crate::compact::COMPACT_ACK);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message["role"] == "user" && message["content"] == "new user")
+        );
+        assert!(
+            messages.iter().all(|message| {
+                message["content"] != "old user" && message["content"] != "old assistant"
+            }),
+            "被覆盖前缀不得进入模型上下文: {messages:?}"
+        );
     }
 }

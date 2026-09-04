@@ -8,6 +8,7 @@
 //! `host_contract` 保留共享 Host 合同的 re-export。
 
 pub mod acp_agent;
+pub(crate) mod compact;
 pub mod hardening;
 /// 复用无 grok runtime 的 Host 合同模块路径。
 pub mod host_contract;

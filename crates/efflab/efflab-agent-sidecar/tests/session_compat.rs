@@ -488,25 +488,55 @@ async fn generated_create_rejects_a_shared_sessions_directory() {
 }
 
 #[tokio::test]
-async fn invalid_sequence_does_not_change_atomic_journal() {
+async fn append_stamps_monotonic_sequence_ignoring_caller_values() {
     let test = test_store();
     let session = test.repository.create_with_id("sequence").await.unwrap();
     test.repository
         .append(&session.id, &[user_record("p", 0)])
         .await
         .unwrap();
-    let before = std::fs::read(records_path(&test, &session.id)).expect("读取 journal");
-
-    let error = test
-        .repository
+    test.repository
         .append(&session.id, &[assistant_record("p", 0)])
         .await
-        .unwrap_err();
-    assert!(matches!(error, SessionError::InvalidRecord));
+        .unwrap();
+    let loaded = test.repository.load(&session.id).await.unwrap();
     assert_eq!(
-        std::fs::read(records_path(&test, &session.id)).expect("再次读取 journal"),
-        before
+        loaded.records,
+        [user_record("p", 0), assistant_record("p", 1)]
     );
+}
+
+#[tokio::test]
+async fn compact_summary_round_trips_without_rewriting_earlier_records() {
+    let test = test_store();
+    let session = test.repository.create_with_id("compact").await.unwrap();
+    test.repository
+        .append(&session.id, &[user_record("p1", 0), assistant_record("p1", 1)])
+        .await
+        .unwrap();
+    test.repository
+        .append(
+            &session.id,
+            &[SessionRecord::compact_summary(0, "p2", 1, "summary text")],
+        )
+        .await
+        .unwrap();
+    let loaded = test.repository.load(&session.id).await.unwrap();
+    assert_eq!(loaded.records.len(), 3);
+    match &loaded.records[2] {
+        SessionRecord::CompactSummary {
+            sequence,
+            covered_until_sequence,
+            text,
+            ..
+        } => {
+            assert_eq!(*sequence, 2);
+            assert_eq!(*covered_until_sequence, 1);
+            assert_eq!(text, "summary text");
+        }
+        other => panic!("第三条必须是 compact_summary: {other:?}"),
+    }
+    assert!(matches!(loaded.records[0], SessionRecord::User { .. }));
 }
 
 #[tokio::test]

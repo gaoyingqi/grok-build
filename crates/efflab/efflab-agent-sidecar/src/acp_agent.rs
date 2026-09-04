@@ -717,7 +717,8 @@ impl MinimalAgent {
                 }
                 SessionRecord::User { .. }
                 | SessionRecord::AssistantToolCalls { .. }
-                | SessionRecord::TurnTerminal { .. } => {}
+                | SessionRecord::TurnTerminal { .. }
+                | SessionRecord::CompactSummary { .. } => {}
             }
         }
 
@@ -777,7 +778,8 @@ impl MinimalAgent {
                 SessionRecord::AssistantSnapshot { .. }
                 | SessionRecord::AssistantToolCalls { .. }
                 | SessionRecord::Tool { .. }
-                | SessionRecord::TurnTerminal { .. } => None,
+                | SessionRecord::TurnTerminal { .. }
+                | SessionRecord::CompactSummary { .. } => None,
             };
             if let Some(notification) = notification {
                 // completion receiver 与 live update 共用 AgentSideConnection writer；load

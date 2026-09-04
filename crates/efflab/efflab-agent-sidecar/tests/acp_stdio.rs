@@ -14,7 +14,7 @@ mod task13 {
     use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
     use std::sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver},
     };
     use std::thread::{self, JoinHandle};
@@ -117,6 +117,23 @@ mod task13 {
             fs::create_dir(&seam).expect("创建测试 seam 目录");
             self.test_seam = Some(seam);
             self
+        }
+
+        /// 仅用于压缩黑盒测试：经 TestSeam 文件压低阈值。
+        ///
+        /// 不能走环境变量：sidecar 启动会 `sanitize_env`，测试 env 进不了进程。
+        fn with_compact_threshold(self, tokens: u64) -> Self {
+            let fixture = self.with_test_seam();
+            let seam = fixture
+                .test_seam
+                .as_ref()
+                .expect("test seam should exist after with_test_seam");
+            fs::write(
+                seam.join("compact_threshold_tokens.txt"),
+                tokens.to_string(),
+            )
+            .expect("write compact threshold seam");
+            fixture
         }
 
         /// 构造清空父环境后的 sidecar 命令，避免代理/遥测变量进入子进程。
@@ -236,6 +253,8 @@ mod task13 {
             name: String,
             arguments: String,
         },
+        /// 同一模型回合并行返回多个 function tool call，用于 journal sequence 回归。
+        ToolCalls(Vec<(String, String)>),
         ReasoningAndText {
             reasoning: String,
             text: String,
@@ -282,6 +301,18 @@ mod task13 {
             }
         }
 
+        /// 构造同一 Chat Completions 回合并行返回多个 function tool call 的 SSE 响应。
+        fn tool_calls(
+            calls: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+        ) -> Self {
+            Self::ToolCalls(
+                calls
+                    .into_iter()
+                    .map(|(name, arguments)| (name.into(), arguments.into()))
+                    .collect(),
+            )
+        }
+
         /// 构造 MiMo 风格首帧 + 推理 + 正文的 SSE 响应。
         fn reasoning_and_text(reasoning: impl Into<String>, text: impl Into<String>) -> Self {
             Self::ReasoningAndText {
@@ -314,6 +345,8 @@ mod task13 {
             let request_count_for_thread = Arc::clone(&request_count);
             let request_bodies = Arc::new(Mutex::new(Vec::new()));
             let request_bodies_for_thread = Arc::clone(&request_bodies);
+            let next_call_id = Arc::new(AtomicU64::new(1));
+            let next_call_id_for_thread = Arc::clone(&next_call_id);
             let stop = Arc::new(AtomicBool::new(false));
             let stop_for_thread = Arc::clone(&stop);
             let mut responses = responses.into_iter().collect::<VecDeque<_>>();
@@ -332,6 +365,7 @@ mod task13 {
                                     response,
                                     &request_count_for_thread,
                                     &request_bodies_for_thread,
+                                    &next_call_id_for_thread,
                                     &stop_for_thread,
                                 );
                             }
@@ -694,12 +728,37 @@ mod task13 {
         Ok(bytes[header_end..header_end + content_length].to_vec())
     }
 
+    /// 把并行 tool call 编成 Chat Completions SSE 可用的 JSON 数组。
+    /// 每个 function call 的 id 全局递增，保证跨 prompt 的 ACP toolCallId 不碰撞。
+    fn encode_scripted_tool_calls(
+        calls: &[(String, String)],
+        next_call_id: &AtomicU64,
+    ) -> String {
+        let encoded = calls
+            .iter()
+            .enumerate()
+            .map(|(index, (name, arguments))| {
+                let call_id = next_call_id.fetch_add(1, Ordering::AcqRel);
+                let encoded_name =
+                    serde_json::to_string(name).expect("测试 tool name 必须可序列化");
+                let encoded_arguments =
+                    serde_json::to_string(arguments).expect("测试 tool arguments 必须可序列化");
+                format!(
+                    "{{\"index\":{index},\"id\":\"call-{call_id}\",\"type\":\"function\",\"function\":{{\"name\":{encoded_name},\"arguments\":{encoded_arguments}}}}}"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("[{encoded}]")
+    }
+
     /// 按计划写回完整或阻塞的 Chat Completions SSE 响应。
     fn serve_response(
         stream: &mut std::net::TcpStream,
         response: ScriptedResponse,
         request_count: &AtomicUsize,
         request_bodies: &Mutex<Vec<Value>>,
+        next_call_id: &AtomicU64,
         stop: &AtomicBool,
     ) {
         let request_body = match consume_request(stream) {
@@ -725,8 +784,15 @@ mod task13 {
                     serde_json::to_string(name).expect("测试 tool name 必须可序列化");
                 let encoded_arguments =
                     serde_json::to_string(arguments).expect("测试 tool arguments 必须可序列化");
+                let call_id = next_call_id.fetch_add(1, Ordering::AcqRel);
                 format!(
-                    "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{{\"name\":{encoded_name},\"arguments\":{encoded_arguments}}}}}]}}}}]}}\n\n"
+                    "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call-{call_id}\",\"type\":\"function\",\"function\":{{\"name\":{encoded_name},\"arguments\":{encoded_arguments}}}}}]}}}}]}}\n\n"
+                )
+            }
+            ScriptedResponse::ToolCalls(calls) => {
+                let encoded_calls = encode_scripted_tool_calls(calls, next_call_id);
+                format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":{encoded_calls}}}}}]}}\n\n"
                 )
             }
             ScriptedResponse::ReasoningAndText { .. } => {
@@ -746,7 +812,9 @@ mod task13 {
         }
 
         match response {
-            ScriptedResponse::Text(_) | ScriptedResponse::ToolCall { .. } => {
+            ScriptedResponse::Text(_)
+            | ScriptedResponse::ToolCall { .. }
+            | ScriptedResponse::ToolCalls(_) => {
                 let _ = stream.write_all(b"data: [DONE]\n\n");
                 let _ = stream.flush();
             }
@@ -762,8 +830,9 @@ mod task13 {
                     serde_json::to_string(&name).expect("测试 tool name 必须可序列化");
                 let encoded_arguments =
                     serde_json::to_string(&arguments).expect("测试 tool arguments 必须可序列化");
+                let call_id = next_call_id.fetch_add(1, Ordering::AcqRel);
                 let tool_delta = format!(
-                    "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{{\"name\":{encoded_name},\"arguments\":{encoded_arguments}}}}}]}}}}]}}\n\n"
+                    "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call-{call_id}\",\"type\":\"function\",\"function\":{{\"name\":{encoded_name},\"arguments\":{encoded_arguments}}}}}]}}}}]}}\n\n"
                 );
                 if stream
                     .write_all(tool_delta.as_bytes())
@@ -2246,6 +2315,37 @@ mod task13 {
             .collect()
     }
 
+    /// 判断一条 ACP update 是否把工具推进到执行中。
+    fn is_in_progress_update(value: &Value) -> bool {
+        value["method"] == "session/update"
+            && (value["params"]["update"]["status"] == "in_progress"
+                || value["params"]["update"]["update"]["status"] == "in_progress")
+    }
+
+    /// 返回某个 prompt 发出的 permission reverse request 次数。
+    fn permission_request_count(lines: &[String], prompt_id: &str) -> usize {
+        lines
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|value| {
+                (value["method"] == "session/request_permission"
+                    || value["method"] == "_x.ai/session/request_permission")
+                    && value["params"]["_meta"]["promptId"] == prompt_id
+            })
+            .count()
+    }
+
+    /// 取出模型请求里所有 user 消息正文，供 compact 断言使用。
+    fn user_message_contents(body: &Value) -> Vec<String> {
+        body["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|message| message["role"] == "user")
+            .filter_map(|message| message["content"].as_str().map(str::to_owned))
+            .collect()
+    }
+
     /// 断言指定 prompt 的所有 live session/update 都已在 JSON-RPC response 前送达。
     fn assert_updates_before_response(lines: &[String], response_id: u64, start: usize) {
         let values = lines
@@ -2807,6 +2907,245 @@ mod task13 {
         }));
         assert_jsonrpc_lines(&client.raw_lines);
         process.finish_raw(&mut client, "tool transcript recovery");
+    }
+
+    /// 同一 round 多个工具必须先完成全部 permission，再串行执行；journal sequence 由 store 盖章。
+    #[test]
+    fn one_round_parallel_tools_keep_monotonic_journal() {
+        let server = ScriptedL3b::new([
+            ScriptedResponse::tool_calls([
+                ("GrokBuild:efflab_noop", "{}"),
+                ("GrokBuild:efflab_noop", "{}"),
+            ]),
+            ScriptedResponse::text("both tools done"),
+        ]);
+        let fixture = Fixture::with_model_url(server.base_url().to_owned());
+        let (mut process, mut client) = fixture.spawn_raw();
+        let _ = client.request("initialize", initialize_params());
+        let session = session_id(&client.request(
+            "session/new",
+            json!({ "cwd": fixture.session_cwd, "mcpServers": [] }),
+        ));
+        let prompt_rpc_id = client.send_request(
+            "session/prompt",
+            prompt_params(
+                &session,
+                json!([{ "type": "text", "text": "run two tools" }]),
+                Some(json!({ "promptId": "prompt-parallel-tools" })),
+            ),
+        );
+        server.wait_for_requests(1);
+        for _ in 0..2 {
+            let permission = loop {
+                let message = client.read_message();
+                assert!(
+                    !is_in_progress_update(&message),
+                    "全部 permission 完成前不得进入 in_progress: {message}"
+                );
+                if message["method"] == "session/request_permission"
+                    || message["method"] == "_x.ai/session/request_permission"
+                {
+                    break message;
+                }
+                assert_ne!(
+                    message["id"].as_u64(),
+                    Some(prompt_rpc_id),
+                    "并行工具应在 prompt response 前完成 permission: {message}"
+                );
+            };
+            let permission_id = permission["id"]
+                .as_u64()
+                .expect("permission reverse request 必须带数字 id");
+            client.send_response(
+                permission_id,
+                json!({ "outcome": { "outcome": "selected", "optionId": "allow-once" } }),
+            );
+        }
+        let response = client.read_response(prompt_rpc_id);
+        assert_eq!(response["result"]["stopReason"], "end_turn");
+        let ids = tool_call_ids(&client.raw_lines, "prompt-parallel-tools");
+        assert_eq!(ids.len(), 2, "同一 round 必须发出两个 tool call: {ids:?}");
+        assert_ne!(ids[0], ids[1], "并行工具 wire id 不得碰撞");
+        assert!(
+            ids.iter().all(|id| id.starts_with("call-")),
+            "ACP toolCallId 必须使用模型 call.id: {ids:?}"
+        );
+        assert_jsonrpc_lines(&client.raw_lines);
+        process.finish_raw(&mut client, "parallel tool journal");
+    }
+
+    /// 拒绝本 round 第一个工具后，剩余工具不得再走 permission/执行，prompt 以 refusal 结束。
+    #[test]
+    fn first_of_two_tools_rejected_cancels_sibling_without_execute() {
+        let server = ScriptedL3b::new([ScriptedResponse::tool_calls([
+            ("GrokBuild:efflab_noop", "{}"),
+            ("GrokBuild:efflab_noop", "{}"),
+        ])]);
+        let fixture = Fixture::with_model_url(server.base_url().to_owned()).with_test_seam();
+        let seam = fixture.test_seam.as_deref().expect("测试 seam 必须存在");
+        let (mut process, mut client) = fixture.spawn_raw();
+        let _ = client.request("initialize", initialize_params());
+        let session = session_id(&client.request(
+            "session/new",
+            json!({ "cwd": fixture.session_cwd, "mcpServers": [] }),
+        ));
+        let prompt_rpc_id = client.send_request(
+            "session/prompt",
+            prompt_params(
+                &session,
+                json!([{ "type": "text", "text": "reject first of two" }]),
+                Some(json!({ "promptId": "prompt-reject-sibling" })),
+            ),
+        );
+        server.wait_for_requests(1);
+        let permission = loop {
+            let message = client.read_message();
+            if message["method"] == "session/request_permission"
+                || message["method"] == "_x.ai/session/request_permission"
+            {
+                break message;
+            }
+            assert_ne!(
+                message["id"].as_u64(),
+                Some(prompt_rpc_id),
+                "reject sibling 测试应先观察到 permission reverse request: {message}"
+            );
+        };
+        let permission_id = permission["id"]
+            .as_u64()
+            .expect("permission reverse request 必须带数字 id");
+        assert_eq!(execution_count(seam), 0, "拒绝前执行点计数必须为零");
+        client.send_response(
+            permission_id,
+            json!({ "outcome": { "outcome": "selected", "optionId": "reject-once" } }),
+        );
+        let response = client.read_response(prompt_rpc_id);
+        assert_eq!(response["result"]["stopReason"], "refusal");
+        assert_eq!(
+            server.model_call_count(),
+            1,
+            "拒绝后不得发起第二次模型调用"
+        );
+        assert_eq!(
+            execution_count(seam),
+            0,
+            "Host reject 后不得进入 noop 执行点"
+        );
+        assert_eq!(
+            permission_request_count(&client.raw_lines, "prompt-reject-sibling"),
+            1,
+            "拒绝第一个工具后不得再为 sibling 请求 permission: {:?}",
+            client.raw_lines
+        );
+        process.finish_raw(&mut client, "rejected first of two tools");
+        client.drain_stdout_after_process_exit();
+        assert_eq!(
+            persisted_terminal(&fixture.home, &session, "prompt-reject-sibling").as_deref(),
+            Some("refused")
+        );
+        let tool_statuses =
+            persisted_tool_statuses(&fixture.home, &session, "prompt-reject-sibling");
+        assert!(
+            tool_statuses.iter().any(|status| status == "rejected"),
+            "第一个工具必须落 rejected: {tool_statuses:?}"
+        );
+        assert!(
+            tool_statuses.iter().any(|status| status == "cancelled"),
+            "未授权的 sibling 必须落 cancelled: {tool_statuses:?}"
+        );
+        assert!(
+            tool_statuses.iter().all(|status| status != "completed"),
+            "reject 后不得落 completed 工具记录: {tool_statuses:?}"
+        );
+        assert_jsonrpc_lines(&client.raw_lines);
+    }
+
+    /// 超过阈值后，更早的 user 回合必须被 compact_summary 替换，且不得把 prompt 打成错误。
+    #[test]
+    fn compact_replaces_old_turns_in_later_model_request() {
+        let server = ScriptedL3b::new([
+            ScriptedResponse::text("first done"),
+            ScriptedResponse::text("second done"),
+            ScriptedResponse::text("SUM-ALPHA"),
+            ScriptedResponse::text("third done"),
+        ]);
+        let fixture =
+            Fixture::with_model_url(server.base_url().to_owned()).with_compact_threshold(1);
+        let (mut process, mut client) = fixture.spawn_raw();
+        let _ = client.request("initialize", initialize_params());
+        let session = session_id(&client.request(
+            "session/new",
+            json!({ "cwd": fixture.session_cwd, "mcpServers": [] }),
+        ));
+        for (prompt_id, text) in [
+            ("prompt-c1", "compact-alpha"),
+            ("prompt-c2", "compact-beta"),
+            ("prompt-c3", "compact-gamma"),
+        ] {
+            let prompt_rpc_id = client.send_request(
+                "session/prompt",
+                prompt_params(
+                    &session,
+                    json!([{ "type": "text", "text": text }]),
+                    Some(json!({ "promptId": prompt_id })),
+                ),
+            );
+            let response = client.read_response(prompt_rpc_id);
+            assert_eq!(
+                response["result"]["stopReason"],
+                "end_turn",
+                "压缩不得把 prompt 打成错误: {prompt_id} {response}"
+            );
+        }
+        server.wait_for_requests(4);
+        assert_eq!(server.model_call_count(), 4, "第三次 prompt 应先 compact 再回答");
+        let bodies = server.request_bodies();
+        let compact_users = user_message_contents(&bodies[2]);
+        assert!(
+            compact_users
+                .iter()
+                .any(|text| text.contains("Summarize the conversation")),
+            "第三次 prompt 的第一次模型调用必须是压缩请求: {compact_users:?}"
+        );
+        assert!(
+            compact_users.iter().any(|text| text.contains("compact-alpha")),
+            "压缩请求必须看得到被摘要的旧回合: {compact_users:?}"
+        );
+        let turn_users = user_message_contents(&bodies[3]);
+        assert!(
+            turn_users
+                .iter()
+                .any(|text| text.contains("SUM-ALPHA") && text.contains("conversation_summary")),
+            "压缩后的模型请求必须带上摘要: {turn_users:?}"
+        );
+        assert!(
+            turn_users.iter().any(|text| text == "compact-beta"),
+            "最近两轮原文必须保留 compact-beta: {turn_users:?}"
+        );
+        assert!(
+            turn_users.iter().any(|text| text == "compact-gamma"),
+            "最近两轮原文必须保留 compact-gamma: {turn_users:?}"
+        );
+        assert!(
+            turn_users.iter().all(|text| text != "compact-alpha"),
+            "被覆盖的旧 user 原文不得再进入模型请求: {turn_users:?}"
+        );
+        process.finish_raw(&mut client, "compact transcript");
+        client.drain_stdout_after_process_exit();
+        let records = fs::read_to_string(
+            fixture
+                .home
+                .join("efflab-sessions")
+                .join("v1")
+                .join(&session)
+                .join("records.jsonl"),
+        )
+        .expect("读取 compact journal");
+        assert!(
+            records.contains("\"kind\":\"compact_summary\""),
+            "journal 必须落下 compact_summary: {records}"
+        );
+        assert_jsonrpc_lines(&client.raw_lines);
     }
 
     /// 已存在但 idle 的 session 收到 cancel 时不得污染下一次合法 prompt。
